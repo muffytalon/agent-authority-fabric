@@ -31,6 +31,13 @@ pub const MAX_LABEL_ENTRIES_PER_EPISODE: usize = 4096;
 pub const MAX_INDEX_DEPTH: usize = 8;
 /// Shortest string (in NFC UTF-8 bytes) that is content-indexed.
 pub const MIN_CONTENT_STRING_BYTES: usize = 16;
+/// Total RFC 6901 pointer bytes one recorded result may produce. Long keys nested deeply would
+/// otherwise cost O(bytes × depth) memory.
+pub const MAX_RESULT_POINTER_BYTES: usize = 4_194_304;
+/// `_meta` namespace reserved for members the PEP itself adds or verifies.
+pub const RESERVED_META_PREFIX: &str = "dev.pep-sidecar/";
+/// The only reserved `_meta` member an agent may send: the Episode Token (SPEC §3.3).
+pub const EPISODE_META_KEY: &str = "dev.pep-sidecar/episode";
 
 const ULID_LEN: usize = 26;
 const CROCKFORD: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
@@ -102,6 +109,9 @@ pub enum PolicyError {
     /// No lookup or trusted input exists for the payment entity.
     #[error("provenance missing")]
     ProvenanceMissing,
+    /// The latest lookup or trusted input for the entity already funds a payment.
+    #[error("provenance already consumed")]
+    ProvenanceConsumed,
     /// A payment tool has no entity argument or more than one.
     #[error("wrong number of entity arguments")]
     EntityArity,
@@ -167,6 +177,9 @@ pub enum ConfigError {
     /// A trusted pointer does not point into `structuredContent`.
     #[error("invalid trusted field")]
     InvalidTrustedField,
+    /// A tool is pinned under a key other than its name, or under a reserved name.
+    #[error("invalid tool name")]
+    InvalidToolName,
 }
 
 /// Errors from the label store.
@@ -300,9 +313,10 @@ pub struct StoreKey {
 impl StoreKey {
     /// Normalizes and validates a location against the pinned stores.
     ///
-    /// The scheme and authority are lower-cased. Keys with `%`, leading or trailing
-    /// whitespace, `\`, control characters, or `.`/`..` segments are rejected, and keys of
-    /// case-insensitive stores are lower-cased.
+    /// The scheme and authority are lower-cased. Keys with `%`, `?`, `#`, `;`, `\`, leading
+    /// or trailing whitespace, control characters, or empty, `.` or `..` segments are rejected,
+    /// because a backend could resolve them to another key's record (`INV-1/` or `INV-1?x` to
+    /// `INV-1`). Keys of case-insensitive stores are lower-cased.
     ///
     /// # Errors
     ///
@@ -345,12 +359,12 @@ fn clean_text(text: &str) -> bool {
         && text.trim() == text
         && !text
             .chars()
-            .any(|c| c == '%' || c == '\\' || c.is_control())
+            .any(|c| matches!(c, '%' | '?' | '#' | ';' | '\\') || c.is_control())
 }
 
 fn clean_segments(text: &str) -> bool {
     text.split('/')
-        .all(|segment| segment != "." && segment != "..")
+        .all(|segment| !matches!(segment, "" | "." | ".."))
 }
 
 fn normalize_store_uri(uri: &str) -> Option<String> {
