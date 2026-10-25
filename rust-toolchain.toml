@@ -1,0 +1,7 @@
+[toolchain]
+# Pinned per SPEC; note a 1.97.1 point release exists (2026-07-16).
+channel = "1.97.0"
+profile = "minimal"
+components = ["clippy", "rustfmt"]
+# macOS cross-lint of peercred from Linux.
+targets = ["aarch64-apple-darwin"]

@@ -1,0 +1,54 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cargo fmt*)",
+      "Bash(cargo clippy*)",
+      "Bash(cargo test*)",
+      "Bash(cargo check*)",
+      "Bash(cargo build*)",
+      "Bash(rustc --version)",
+      "Bash(git status*)",
+      "Bash(git diff*)",
+      "Bash(git log*)",
+      "PowerShell(wsl.exe -l -q)",
+      "PowerShell(wsl.exe -d Ubuntu -e bash -lc \"export CARGO_TARGET_DIR=~/.cargo-target/pep-sidecar RUSTFLAGS='-D warnings'; cargo fmt*)",
+      "PowerShell(wsl.exe -d Ubuntu -e bash -lc \"export CARGO_TARGET_DIR=~/.cargo-target/pep-sidecar RUSTFLAGS='-D warnings'; cargo clippy*)",
+      "PowerShell(wsl.exe -d Ubuntu -e bash -lc \"export CARGO_TARGET_DIR=~/.cargo-target/pep-sidecar RUSTFLAGS='-D warnings'; cargo test*)",
+      "PowerShell(wsl.exe -d Ubuntu -e bash -lc \"export CARGO_TARGET_DIR=~/.cargo-target/pep-sidecar RUSTFLAGS='-D warnings'; cargo check*)"
+    ],
+    "deny": [
+      "Bash(rm -rf *)",
+      "Bash(sudo *)",
+      "Bash(curl *)",
+      "Bash(wget *)",
+      "Bash(cargo publish*)"
+    ]
+  },
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "wsl.exe",
+            "args": [
+              "-d",
+              "Ubuntu",
+              "-e",
+              "bash",
+              "-lc",
+              "export CARGO_TARGET_DIR=~/.cargo-target/pep-sidecar RUSTFLAGS='-D warnings'; test -f Cargo.toml || exit 0; cargo check --all-targets --quiet"
+            ],
+            "timeout": 300,
+            "statusMessage": "cargo check (WSL)"
+          }
+        ]
+      }
+    ]
+  },
+  "env": {
+    "RUSTFLAGS": "-D warnings",
+    "CARGO_TERM_COLOR": "always"
+  }
+}

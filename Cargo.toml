@@ -1,0 +1,60 @@
+[package]
+name = "pep-sidecar"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+publish = false
+description = "OS-isolated, stateful OAuth-native Policy Enforcement Point sidecar for AI agent payments and tool execution"
+
+[features]
+default = []
+# Request profile accepts RFC 8785 fractions/exponents; magnitudes are still capped at 2^53 - 1.
+lenient-numbers = []
+
+# Versions verified on crates.io 2026-10-24.
+[dependencies]
+base64 = { version = "=0.23.1", default-features = false, features = ["alloc"] } # 2026-08-04
+ryu-js = { version = "=1.0.3", default-features = false }                        # 2026-07-10
+sha2 = { version = "=0.11.1", default-features = false }                         # 2026-10-12, MSRV 1.88
+thiserror = "=2.0.21"                                                            # 2026-09-23
+unicode-normalization = "=0.1.26"                                                # 2026-10-16
+
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+nix = { version = "=0.31.3", default-features = false, features = ["socket", "user"] } # 2026-05-11
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+missing_debug_implementations = "warn"
+unreachable_pub = "warn"
+unused_qualifications = "warn"
+trivial_casts = "warn"
+trivial_numeric_casts = "warn"
+let_underscore_drop = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+# Mandated by CLAUDE.md §3.
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+indexing_slicing = "deny"
+arithmetic_side_effects = "deny"
+# Extra hardening.
+as_conversions = "deny"
+string_slice = "deny"
+unreachable = "deny"
+unwrap_in_result = "deny"
+float_arithmetic = "deny"
+dbg_macro = "deny"
+print_stdout = "deny"
+print_stderr = "deny"
+exit = "deny"
+mem_forget = "deny"
+# Approved pedantic opt-outs: jcs::JcsValue, peercred::PeerError; long guard/parser fns.
+module_name_repetitions = "allow"
+too_many_lines = "allow"
