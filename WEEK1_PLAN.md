@@ -1,6 +1,6 @@
 # WEEK1_PLAN.md: pep-sidecar Week 1
 
-Status: approved 2026-10-24. Updated 2026-10-28 to match the code after the 27 Oct review fixes (`claude/pep-sidecar-week1-code-review.md`) and the 27 Oct crate re-verification. Revised 2026-10-28 to match the code after the review fixes.
+Status: approved 2026-10-24. Updated 2026-10-28 to match the code after the 27 Oct review fixes (`claude/pep-sidecar-week1-code-review.md`) and the 27 Oct crate re-verification. Closed 2026-10-28: every deliverable below is in the code, the CLAUDE.md §2 loop passes on rustc 1.97.1, and the §6 vectors are copied into SPEC.md §2.
 
 ## Context
 Week 1 delivers a single crate, `pep-sidecar`, with four library modules: `lib`, `jcs`, `engine` and `peercred`. They must pass all six commands of the CLAUDE.md §2 loop (the fifth is the macOS cross-lint, the sixth `cargo deny check`).
@@ -190,10 +190,8 @@ On any error from steps 1–8, `context_conf` is raised to `call_max_conf`. Muta
   4. Bind under the canonical path, then `chmod 0660`, then re-check the socket's owner, mode and group. It must get the parent's group, so the parent must be setgid `2750` (SPEC §1). Any failure after the bind removes the socket.
 - It avoids TOCTOU races because no non-root principal can change the parent directory's entries. Two gaps remain until Week 2's `Flock` lock file: two same-user instances starting at once on one stale socket can both bind, and on macOS a live socket with a full backlog looks stale.
 
-- Two gaps remain, documented on `socket_is_live`. On macOS a full backlog is refused at once, so a busy live socket looks stale. And the probe and the unlink are not atomic, so two instances of the same user starting on one stale socket can orphan a listener. An exclusive `nix::fcntl::Flock` on a sibling lock file, held for the listener's lifetime, would close both; it needs nix's `fs` feature.
-
 ## 6. Known-answer vectors
-Computed on 2026-10-24 with .NET and independently in Python. Tests assert these as fixed constants.
+Computed on 2026-10-24 with .NET and independently in Python. Tests assert these as fixed constants. Recomputed on 2026-10-28 from the SPEC rules in Python 3.14.4 (`unicodedata` 16.0.0): every value matches, including the canonical bytes of the two sorting vectors. SPEC.md §2 now carries them as its conformance vectors.
 | Vector | Expected |
 |---|---|
 | `digest({})` (SPEC §2) | `sha-256:RBNvo1WzZ4oRRq0W9-hknpT7T8If536DEMBg9hyq_4o` |

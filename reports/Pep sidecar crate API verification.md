@@ -302,9 +302,9 @@ The file was read through the summarising fetch tool, so two consistency checks 
 ### Still open
 
 - **Week 2 facts**: the minimum kernel for `SO_PEERPIDFD` and its failure mode on older kernels, the non-blocking `FlockArg` variant, and how to read a PID from a pidfd.
-- **The Unicode version of the Python `unicodedata`** used for the conformance vectors.
-
 Closed after this section was first written:
+
+- **Unicode version of the Python cross-check.** The conformance vectors were recomputed in Python 3.14.4 (`unicodedata` 16.0.0) and all match. They use no character newer than U+1F600, so the 16.0/18.0 difference cannot affect them. SPEC.md §2 now lists them.
 
 - **MSRV.** The untested `rust-version = "1.88"` is dropped. `rust-version` is now 1.97.1, the pinned toolchain, so every command checks it. Transitive MSRVs only matter if a dependency needs a newer compiler, and then the build fails.
 - **Root-only `peercred` tests.** All three ignored tests passed in one run (above).

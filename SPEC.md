@@ -16,14 +16,25 @@
   - Duplicate keys rejected after NFC.
   - Integers within `±(2^53 - 1)` (`[-9007199254740991, 9007199254740991]`); `-0` becomes `0`.
   - Key order differs from the RFC 8785 `U+FB33` example because of NFC (`U+FB33` decomposes to `U+05D3 U+05BC` before UTF-16 sorting).
-  - Conformance vectors: copy `WEEK1_PLAN.md` §6 in as conformance vectors (each recomputed independently in Python and all match).
+  - Conformance vectors: see **Conformance Vectors** below.
 - **`origin_hash` Inputs & `episode_id`:**
   - `cid`: the JCS serialization of the JSON-RPC `id`, kept as a string, so `1` and `"1"` differ.
   - `qd`: the `action_digest` of the call that produced the value.
   - `ptr`: an RFC 6901 pointer into the JSON-RPC `result`.
   - `episode_id`: a ULID matching `^[0-9A-HJKMNP-TV-Z]{26}$`, first character at most `7`; F-07 hashes its 128-bit value big-endian.
-- **Known-Answer Test Vector:**
-  - `digest(b"{}") == "sha-256:RBNvo1WzZ4oRRq0W9-hknpT7T8If536DEMBg9hyq_4o"`
+- **Conformance Vectors:** the unit tests assert each value. All were recomputed independently on 2026-10-28 from the rules above, in Python 3.14.4 (whose `unicodedata` implements Unicode 16.0.0), and all match. No vector uses a character newer than U+1F600 (Unicode 6.1), so they hold unchanged under Unicode 18.0.0.
+
+  | Vector | Expected |
+  |---|---|
+  | `digest(b"{}")` (known-answer test) | `sha-256:RBNvo1WzZ4oRRq0W9-hknpT7T8If536DEMBg9hyq_4o` |
+  | `action_digest("pay_invoice", {"amount":5000,"currency":"USD","recipient_id":"rcpt_123"})` | `sha-256:j3XfycsYi2G8jSVocXUTiPN2JWbcwQfOK1L4pLAdI1E` |
+  | `action_digest("get_invoice", {"invoice_id":"inv_42"})`, the `qd` of the next row | `sha-256:bdmNQo66RS-48sR_0n8pP5jmbo0a0Sh00gUWv8nEDNU` |
+  | `origin_hash` with `cid` `"7"`, `tool` `get_invoice`, that `qd`, `ptr` `/total_minor`, `val` `5000` | `sha-256:2pEVfWny8jku05UQCRDDarGnSs_F2tZB7_YtsC-7SYU` |
+  | F-07 key: `episode_id` `0x0192d4e07c3a7b2e9f103c4d5e6f7a8b`, `rid` 1, the `pay_invoice` `action_digest` (75 hashed bytes) | `pep-UhReNoSbXP-SykKxyF9adQ4g5F1oTTAKAJPlYrbk9V0` |
+  | The same with `rid` 2 | `pep-xi_53ViTWcbekOTZepC96vxdqaHXZyIGrok6uJGrvPA` |
+  | The RFC 8785 §3.2.3 sorting object (keys U+20AC, CR, U+FB33, `1`, U+1F600, U+0080, U+00F6), NFC-adjusted, 181 canonical bytes | `sha-256:mgPbgbBjohAvazT5LBgyJA_w6YmlxvrHDvBHwIx3EZ8` |
+  | UTF-16 versus code-point order: keys U+E000, U+1F600, U+20AC, which sort as U+20AC, U+1F600, U+E000 | `sha-256:jNh0WYS4ffXX2aXqkhvL-ODli8yRoW9Hl5cJkVcLwgU` |
+  | `episode_id` as a ULID: 0 / 1 / 2^128 − 1 / the F-07 `episode_id` | `00000000000000000000000000` / `00000000000000000000000001` / `7ZZZZZZZZZZZZZZZZZZZZZZZZZ` / `01JBAE0Z1TFCQ9Y41W9NF6YYMB` |
 
 ## 3. Standard OAuth, WIMSE, MCP & Payment Artifacts
 1. **RFC 9396 RAR `authorization_details` (`type: "https://schemas.pep-sidecar.dev/rar/agent-payment-intent/v1"`):**
@@ -49,7 +60,7 @@
    - Stripe metadata keys (<= 40 chars, values <= 500 chars): `pep_v`, `pep_eid`, `pep_ad`, `pep_int`, `pep_rel`, `pep_rcpt`, `pep_tlog`, `pep_ap2tx`, `pep_prov`.
 
 ## 4. Six-Week Roadmap & Go/Kill Gates
-- **Week 1 (In Progress):** `src/jcs.rs`, `src/engine.rs`, `src/peercred.rs`, `src/lib.rs`, strict Clippy verification.
+- **Week 1 (Complete, 2026-10-28):** `src/jcs.rs`, `src/engine.rs`, `src/peercred.rs`, `src/lib.rs`, strict Clippy verification.
 - **Week 2 (Gate 1):** `SO_PEERPIDFD` upgrade, `src/lockfile.rs` (`PinnedToolLockfile` v1 DSSE verifier & MCP `2026-07-28` drift quarantine; per-tool lockfile fields include `trusted_fields`, `amount_binding`, and store URI/key policy; security-role signature required for payment tools, external sinks, and any read-only tool entry that can authorize payment amounts via `Trusted` output, `trusted_fields`, or `amount_binding`), `src/tokens.rs` (Episode Token, Call Proof with `rid` for `Held` reservations only, bounded `ReplayCache`), Gate 1 containment suite.
   - *Gate 1 Criteria:* 0 bypasses across >=50 containment tests; 100% of 20 rug-pull mutations quarantined; 0/1,000 replays accepted; p99 added latency <= 25 ms.
 - **Week 3:** `src/automaton.rs` (Sapien Thompson NFA with `Shuffle` and `Defer(LookupSpec)` holes), `src/store.rs` (SQLite WAL persistence, single-writer Tokio `EpisodeActor`, and reconciliation of `NeedsReconcile` reservations).
