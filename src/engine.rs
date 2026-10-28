@@ -3,8 +3,9 @@
 //!
 //! Every guard is a pure function over a shared borrow of [`EpisodeState`], so the compiler
 //! rejects any guard that tries to change state. State changes only after guards 1-8 pass
-//! (F-06), and the fallible label-store writes run before the infallible budget updates, so no
-//! rollback is ever needed. `WEEK1_PLAN.md` §4 documents the design.
+//! (F-06), and the fallible label-store writes run before the infallible budget updates, so
+//! budgets never need rolling back. A store failure part-way through the writes can leave
+//! extra taint behind, which only ever fails closed. `WEEK1_PLAN.md` §4 documents the design.
 
 use core::fmt;
 use std::collections::{BTreeMap, BTreeSet};
@@ -31,14 +32,33 @@ pub const MAX_LABEL_ENTRIES_PER_EPISODE: usize = 4096;
 pub const MAX_INDEX_DEPTH: usize = 8;
 /// Shortest string (in NFC UTF-8 bytes) that is content-indexed.
 pub const MIN_CONTENT_STRING_BYTES: usize = 16;
-/// Total RFC 6901 pointer bytes one recorded result may produce. Long keys nested deeply would
-/// otherwise cost O(bytes × depth) memory.
+/// Total RFC 6901 pointer bytes one recorded result or trusted input may produce. Long keys
+/// nested deeply would otherwise cost O(bytes × depth) memory.
 pub const MAX_RESULT_POINTER_BYTES: usize = 4_194_304;
+/// Total RFC 6901 pointer bytes the recorded results and trusted inputs of one episode may
+/// produce.
+pub const MAX_EPISODE_POINTER_BYTES: usize = 16_777_216;
+/// Maximum number of allowed calls still awaiting their result. The host must record, abandon
+/// or abort every allowed call.
+pub const MAX_IN_FLIGHT: usize = 64;
+/// Maximum number of ids (allowed calls and trusted inputs) one episode may spend. Ids are
+/// never reused, so this also bounds the set of spent ids.
+pub const MAX_CALLS_PER_EPISODE: usize = 4096;
+/// Longest canonical JSON-RPC id accepted, in bytes.
+pub const MAX_CALL_ID_BYTES: usize = 128;
+/// Longest store key accepted, in NFC UTF-8 bytes. With [`MAX_STORE_KEY_SEGMENTS`] it bounds
+/// the nested-key taint entries a key produces: without it, a 1 MiB key of `a/a/…` segments
+/// would need hundreds of GiB of ancestor keys.
+pub const MAX_STORE_KEY_BYTES: usize = 1024;
+/// Most `/`-separated segments a store key may have.
+pub const MAX_STORE_KEY_SEGMENTS: usize = 32;
 /// `_meta` namespace reserved for members the PEP itself adds or verifies.
 pub const RESERVED_META_PREFIX: &str = "dev.pep-sidecar/";
 /// The only reserved `_meta` member an agent may send: the Episode Token (SPEC §3.3).
 pub const EPISODE_META_KEY: &str = "dev.pep-sidecar/episode";
 
+/// Tool-name namespace reserved for records the PEP creates itself (see [`TRUSTED_INPUT_TOOL`]).
+const RESERVED_TOOL_PREFIX: &str = "pep/";
 const ULID_LEN: usize = 26;
 const CROCKFORD: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 
@@ -91,6 +111,10 @@ pub enum PolicyError {
     /// `params._meta` is not an object.
     #[error("_meta is not an object")]
     MetaNotObject,
+    /// `params._meta` has a member in the PEP's reserved namespace other than the Episode
+    /// Token.
+    #[error("reserved _meta member")]
+    ReservedMetaMember,
     /// An argument that the tool policy does not declare.
     #[error("undeclared argument")]
     UndeclaredArgument,
@@ -151,6 +175,12 @@ pub enum PolicyError {
     /// The write would exceed the episode's label-store quota.
     #[error("label quota exceeded")]
     LabelQuotaExceeded,
+    /// Too many allowed calls are still awaiting their result.
+    #[error("too many calls in flight")]
+    InFlightLimitExceeded,
+    /// The episode has spent its quota of call ids.
+    #[error("episode call limit exceeded")]
+    CallLimitExceeded,
     /// The inputs are more confidential than the destination allows.
     #[error("confidentiality violation")]
     ConfidentialityViolation,
@@ -180,6 +210,14 @@ pub enum ConfigError {
     /// A tool is pinned under a key other than its name, or under a reserved name.
     #[error("invalid tool name")]
     InvalidToolName,
+    /// A mutating-internal tool declares no store location, so its writes could not be
+    /// tainted (F-08).
+    #[error("mutating tool has no store location")]
+    MissingLocation,
+    /// Two pinned stores overlap (one is a path inside the other, or they differ only by a
+    /// trailing `/`), so one record could be tainted under one name and read under the other.
+    #[error("pinned stores overlap")]
+    OverlappingStores,
 }
 
 /// Errors from the label store.
@@ -299,7 +337,8 @@ impl Label {
 /// How a store compares keys.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KeyPolicy {
-    /// Whether the backend treats keys case-insensitively (keys are then lower-cased).
+    /// Whether the backend treats keys case-insensitively (keys must then be ASCII, and are
+    /// lower-cased).
     pub case_insensitive: bool,
 }
 
@@ -314,9 +353,16 @@ impl StoreKey {
     /// Normalizes and validates a location against the pinned stores.
     ///
     /// The scheme and authority are lower-cased. Keys with `%`, `?`, `#`, `;`, `\`, leading
-    /// or trailing whitespace, control characters, or empty, `.` or `..` segments are rejected,
-    /// because a backend could resolve them to another key's record (`INV-1/` or `INV-1?x` to
-    /// `INV-1`). Keys of case-insensitive stores are lower-cased.
+    /// or trailing whitespace, control characters, invisible (default-ignorable) characters, or
+    /// empty, `.` or `..` segments are rejected, because a backend could resolve them to another
+    /// key's record (`INV-1/` or `INV-1?x` to `INV-1`; UCA collations, case-sensitive ones
+    /// included, give `INV-1` followed by U+200B ZERO WIDTH SPACE no extra weight). Keys of
+    /// case-insensitive stores must be ASCII and are lower-cased: such a backend's collation may
+    /// also fold accents, width or ligatures (`MySQL`'s default `utf8mb4_0900_ai_ci` matches
+    /// `ÍNV-1` and `ＩNV-1` to `INV-1`), which the PEP cannot reproduce, so a non-ASCII key could
+    /// reach a tainted record under an untainted name. Keys longer than [`MAX_STORE_KEY_BYTES`]
+    /// or with more than [`MAX_STORE_KEY_SEGMENTS`] segments are rejected, which keeps the
+    /// nested-key taint of [`StoreKey::ancestors`] small.
     ///
     /// # Errors
     ///
@@ -330,11 +376,18 @@ impl StoreKey {
         let uri = normalize_store_uri(uri).ok_or(invalid)?;
         let policy = stores.get(&uri).ok_or(invalid)?;
         let key = jcs::JcsString::new(key).into_string();
-        if !clean_text(&key) || !clean_segments(&key) {
+        if key.len() > MAX_STORE_KEY_BYTES
+            || key.split('/').count() > MAX_STORE_KEY_SEGMENTS
+            || !clean_text(&key)
+            || !clean_segments(&key)
+        {
             return Err(invalid);
         }
         let key = if policy.case_insensitive {
-            key.to_lowercase()
+            if !key.is_ascii() {
+                return Err(invalid);
+            }
+            key.to_ascii_lowercase()
         } else {
             key
         };
@@ -352,14 +405,53 @@ impl StoreKey {
     pub fn key(&self) -> &str {
         &self.key
     }
+
+    /// The locations strictly above this one in the same store, outermost first: `a` and `a/b`
+    /// for the key `a/b/c`. Keys may name nested records, so a write to `a/b/c` can change what
+    /// a read of `a` returns, and a write to `a` replaces `a/b/c`.
+    pub fn ancestors(&self) -> impl Iterator<Item = Self> + '_ {
+        self.key.match_indices('/').filter_map(|(end, _)| {
+            self.key.get(..end).map(|prefix| Self {
+                uri: self.uri.clone(),
+                key: prefix.to_owned(),
+            })
+        })
+    }
 }
 
 fn clean_text(text: &str) -> bool {
     !text.is_empty()
         && text.trim() == text
-        && !text
-            .chars()
-            .any(|c| matches!(c, '%' | '?' | '#' | ';' | '\\') || c.is_control())
+        && !text.chars().any(|c| {
+            matches!(c, '%' | '?' | '#' | ';' | '\\') || c.is_control() || is_default_ignorable(c)
+        })
+}
+
+/// Unicode `Default_Ignorable_Code_Point` as listed in `DerivedCoreProperties-18.0.0.txt`
+/// (the `default_ignorable_matches_unicode_18_0_0` test checks every scalar value against it):
+/// invisible characters such as U+00AD SOFT HYPHEN, U+200B ZERO WIDTH SPACE, the bidi controls
+/// and the variation selectors. Collations ignore them, so they must never distinguish two keys.
+const fn is_default_ignorable(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00AD}'
+            | '\u{034F}'
+            | '\u{061C}'
+            | '\u{115F}'..='\u{1160}'
+            | '\u{17B4}'..='\u{17B5}'
+            | '\u{180B}'..='\u{180F}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{206F}'
+            | '\u{3164}'
+            | '\u{FE00}'..='\u{FE0F}'
+            | '\u{FEFF}'
+            | '\u{FFA0}'
+            | '\u{FFF0}'..='\u{FFF8}'
+            | '\u{1BCA0}'..='\u{1BCA3}'
+            | '\u{1D173}'..='\u{1D17A}'
+            | '\u{E0000}'..='\u{E0FFF}'
+    )
 }
 
 fn clean_segments(text: &str) -> bool {
@@ -431,10 +523,31 @@ impl ContentDigest {
 /// A key in the label store.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum TaintIndex {
-    /// A store location; matches values of any type.
+    /// A store location that was written; matches values of any type read from it or from any
+    /// location below it.
     Location(StoreKey),
+    /// A store location with a written location somewhere strictly below it (`a/b` was
+    /// written, so a read of `a` may return changed data).
+    Below(StoreKey),
     /// A content digest; matches only content-indexable values.
     Content(ContentDigest),
+}
+
+/// The taint of everything a read of `key` can return: writes to `key` itself or to any
+/// location above it (which replace it), and writes anywhere below it (which change it).
+/// Siblings do not taint each other.
+///
+/// # Errors
+///
+/// Returns a [`StoreError`] if the store is poisoned or unreachable.
+fn location_label(labels: &dyn LabelStore, key: &StoreKey) -> Result<Option<Label>, StoreError> {
+    let mut label = labels.lookup(&TaintIndex::Below(key.clone()))?;
+    for scope in key.ancestors().chain(core::iter::once(key.clone())) {
+        if let Some(found) = labels.lookup(&TaintIndex::Location(scope))? {
+            label = Some(label.map_or(found, |current| current.join(found)));
+        }
+    }
+    Ok(label)
 }
 
 /// One label written to the store, with the episode that wrote it.
@@ -579,7 +692,8 @@ pub struct ArgSpec {
     pub role: ArgRole,
 }
 
-/// Binds a payment's amount to the latest lookup of the same entity.
+/// Binds a payment's amount to the latest lookup of the same entity. [`PepEngine::new`] requires
+/// the lookup tool to be read-only, Trusted, and keyed (its `StoreKey` argument) by the entity.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AmountBinding {
     /// The pinned lookup tool, for example `get_invoice`.
@@ -767,6 +881,9 @@ pub struct Reservation {
     pub entity: String,
     /// `action_digest` of the payment call.
     pub action_digest: String,
+    /// `seq` of the lookup or trusted input that funds the payment. Until the reservation is
+    /// `Released`, that record cannot fund another payment.
+    pub witness_seq: u64,
     /// Current state.
     pub state: ResState,
 }
@@ -824,7 +941,8 @@ pub struct Recorded {
     pub query_digest: String,
     /// Canonical arguments of the producing call (`null` for trusted inputs).
     pub arguments: JcsValue,
-    /// Whether the result had `isError: true`.
+    /// Whether the result counts as an error (`isError` present and not `false`). An error
+    /// result has no trusted fields.
     pub is_error: bool,
     /// Labelled scalars.
     pub leaves: Vec<RecordedLeaf>,
@@ -873,7 +991,8 @@ pub struct EpisodeState {
     pub next_seq: u64,
     /// Recorded leaves keyed by canonical bytes (for the Week 2 `prov` claim).
     pub leaf_index: BTreeMap<Vec<u8>, Vec<LeafRef>>,
-    /// Ids of recorded calls and trusted inputs.
+    /// Every call id the episode has allowed, and every trusted-input id. Ids are never reused,
+    /// so a late result cannot be attributed to a different call.
     pub recorded_call_ids: BTreeSet<String>,
     /// Allowed calls awaiting their result.
     pub in_flight: BTreeMap<String, InFlight>,
@@ -885,6 +1004,8 @@ pub struct EpisodeState {
     pub result_nodes_remaining: usize,
     /// Label-store entries the episode may still write.
     pub label_quota_remaining: usize,
+    /// Pointer bytes the episode's recorded results and trusted inputs may still produce.
+    pub pointer_bytes_remaining: usize,
 }
 
 impl EpisodeState {
@@ -902,6 +1023,7 @@ impl EpisodeState {
             next_reservation_id: 1,
             result_nodes_remaining: MAX_EPISODE_RESULT_NODES,
             label_quota_remaining: MAX_LABEL_ENTRIES_PER_EPISODE,
+            pointer_bytes_remaining: MAX_EPISODE_POINTER_BYTES,
         }
     }
 }
@@ -982,8 +1104,10 @@ pub enum Decision {
     StepUpRequired(PendingApproval),
 }
 
-/// Capability for host-only operations. It cannot be copied, cloned or forged, and the process
-/// can obtain it only once.
+/// Capability for host-only operations: recording trusted input, approving a step-up and
+/// aborting a reservation. Each of them acts on a claim the agent must never be able to make
+/// (what the user typed, that a human approved, that a payment did not run). It cannot be
+/// copied, cloned or forged, and the process can obtain it only once.
 ///
 /// ```compile_fail
 /// let forged = pep_sidecar::engine::HostAuthority { _sealed: () };
@@ -1033,12 +1157,18 @@ pub trait Engine {
     /// Returns [`PepError::InvalidTransition`] unless the reservation is `Held`.
     fn commit(&mut self, reservation_id: u64) -> Result<(), PepError>;
 
-    /// Aborts a `Held` or `AwaitingStepUp` reservation.
+    /// Aborts a `Held` or `AwaitingStepUp` reservation. Releasing a reservation re-opens budget,
+    /// so only host code holding the [`HostAuthority`] may report the outcome.
     ///
     /// # Errors
     ///
     /// Returns [`PepError::InvalidTransition`] for any other state.
-    fn abort(&mut self, reservation_id: u64, outcome: AbortOutcome) -> Result<(), PepError>;
+    fn abort(
+        &mut self,
+        host: &HostAuthority,
+        reservation_id: u64,
+        outcome: AbortOutcome,
+    ) -> Result<(), PepError>;
 }
 
 /// The policy enforcement engine for one episode.
@@ -1080,11 +1210,19 @@ impl<'a> Witness<'a> {
     }
 }
 
+struct PaymentInputs {
+    amount: u64,
+    entity: String,
+    new_entity_uses: u32,
+    witness_seq: u64,
+}
+
 struct PaymentPlan {
     reservation_id: u64,
     next_reservation_id: u64,
     amount: u64,
     entity: String,
+    witness_seq: u64,
     new_reserved: u64,
     new_calls: u32,
     new_entity_uses: u32,
@@ -1119,7 +1257,9 @@ impl PepEngine {
     /// # Errors
     ///
     /// Returns [`PepError::InvalidConfig`] for inconsistent limits, an invalid currency, an
-    /// unknown store, a trusted pointer outside `structuredContent`, or a malformed binding.
+    /// unknown store, a trusted pointer outside `structuredContent`, a malformed binding, a tool
+    /// pinned under the wrong or a reserved name, a mutating-internal tool without a store
+    /// location, or overlapping pinned stores.
     pub fn new(
         mut intent: PepIntent,
         pins: ToolPins,
@@ -1153,7 +1293,7 @@ impl PepEngine {
     /// # Errors
     ///
     /// Returns [`PepError::UnknownCall`] if the call is not in flight,
-    /// [`StoreError::CapacityExceeded`] when a size or episode budget is exceeded,
+    /// [`StoreError::CapacityExceeded`] when a size, pointer or episode budget is exceeded,
     /// [`PepError::Malformed`] for invalid JSON, or a label-store error.
     pub fn record_result_raw(&mut self, call_id: &str, raw_result: &[u8]) -> Result<(), PepError> {
         let in_flight = self
@@ -1174,9 +1314,14 @@ impl PepEngine {
             tool.max_result_nodes.min(self.state.result_nodes_remaining),
         );
         let parsed = jcs::parse_with(raw_result, &options).map_err(result_parse_error)?;
-        let is_error = parsed.value.get("isError").and_then(JcsValue::as_bool) == Some(true);
+        // Fail closed: only an absent `isError` or a literal `false` marks a successful result.
+        // A malformed flag (`"true"`, `1`, `null`) must not keep the trusted fields trusted.
+        let is_error = parsed
+            .value
+            .get("isError")
+            .is_some_and(|flag| *flag != JcsValue::Bool(false));
         let location = match &in_flight.store_key {
-            Some(key) => self.labels.lookup(&TaintIndex::Location(key.clone()))?,
+            Some(key) => location_label(&*self.labels, key)?,
             None => None,
         };
         let ctx = LabelCtx {
@@ -1186,8 +1331,18 @@ impl PepEngine {
             content_taint: tool.output_label.integ != Integrity::Trusted,
             labels: &*self.labels,
         };
+        let budget = MAX_RESULT_POINTER_BYTES.min(self.state.pointer_bytes_remaining);
+        let mut remaining = budget;
         let mut leaves = Vec::new();
-        label_tree(&ctx, &parsed.value, "", 0, None, &mut leaves)?;
+        label_tree(
+            &ctx,
+            &parsed.value,
+            "",
+            0,
+            None,
+            &mut remaining,
+            &mut leaves,
+        )?;
         let seq = self.state.next_seq;
         let next_seq = seq.checked_add(1).ok_or(StoreError::CapacityExceeded)?;
         let ratchet = leaves
@@ -1211,6 +1366,7 @@ impl PepEngine {
             },
             next_seq,
             parsed.nodes,
+            budget.saturating_sub(remaining),
             ratchet,
         );
         Ok(())
@@ -1223,7 +1379,8 @@ impl PepEngine {
     /// # Errors
     ///
     /// Returns [`PepError::Malformed`] for invalid JSON, a duplicate-id denial if `input_id`
-    /// was already used, or [`StoreError::CapacityExceeded`] when the episode is full.
+    /// was already used, or [`StoreError::CapacityExceeded`] when the episode or its pointer
+    /// budget is full.
     pub fn record_trusted_input(
         &mut self,
         _host: &HostAuthority,
@@ -1240,15 +1397,10 @@ impl PepEngine {
         }
         let value = jcs::parse(raw)?;
         let label = Label::new(conf, Integrity::Trusted);
-        let leaves = value
-            .leaves()
-            .into_iter()
-            .map(|node| RecordedLeaf {
-                pointer: node.pointer,
-                value: node.value.clone(),
-                label,
-            })
-            .collect();
+        let budget = MAX_RESULT_POINTER_BYTES.min(self.state.pointer_bytes_remaining);
+        let mut remaining = budget;
+        let mut leaves = Vec::new();
+        trusted_leaves(&value, "", label, &mut remaining, &mut leaves)?;
         let seq = self.state.next_seq;
         let next_seq = seq.checked_add(1).ok_or(StoreError::CapacityExceeded)?;
         let query_digest = jcs::digest_value(&value);
@@ -1264,18 +1416,24 @@ impl PepEngine {
             },
             next_seq,
             0,
+            budget.saturating_sub(remaining),
             conf,
         );
         Ok(())
     }
 
-    /// Moves an `AwaitingStepUp` reservation to `Held` after human approval.
+    /// Moves an `AwaitingStepUp` reservation to `Held` after human approval. Only host code
+    /// holding the [`HostAuthority`] can approve.
     ///
     /// # Errors
     ///
     /// Returns [`PepError::UnknownReservation`] for an unknown id, or
     /// [`PepError::InvalidTransition`] unless the reservation is `AwaitingStepUp`.
-    pub fn approve_step_up(&mut self, reservation_id: u64) -> Result<(), PepError> {
+    pub fn approve_step_up(
+        &mut self,
+        _host: &HostAuthority,
+        reservation_id: u64,
+    ) -> Result<(), PepError> {
         let reservation = self
             .state
             .budget
@@ -1356,7 +1514,7 @@ impl PepEngine {
             return conf;
         };
         if let Ok(Some(key)) = tool_location(tool, &roles, &self.pins.stores)
-            && let Ok(Some(found)) = self.labels.lookup(&TaintIndex::Location(key))
+            && let Ok(Some(found)) = location_label(&*self.labels, &key)
         {
             conf = conf.max(found.conf);
         }
@@ -1404,7 +1562,8 @@ impl PepEngine {
         // 7. G_budget (computes the plan, applies nothing)
         let taint_writes =
             planned_writes(tool, canon.store_key.as_ref(), &canon.roles.store_writes);
-        let (payment, label_quota_after) = g_budget(state, amount, entity, taint_writes.len())?;
+        let payment = payment_inputs(tool, amount, entity, witness.as_ref())?;
+        let (payment, label_quota_after) = g_budget(state, payment, taint_writes.len())?;
 
         // 8. G_label
         let input = g_label(&*self.labels, state, tool, &canon, witness.as_ref())?;
@@ -1477,6 +1636,7 @@ impl PepEngine {
                         amount_minor: payment.amount,
                         entity: payment.entity,
                         action_digest: action_digest.clone(),
+                        witness_seq: payment.witness_seq,
                         state: reservation_state,
                     },
                 );
@@ -1514,6 +1674,9 @@ impl PepEngine {
                 prov,
             }),
         };
+        // The id is spent for good, so a late result for this call can never be recorded
+        // against a later call that reuses the id (abandon and abort drop `in_flight`).
+        state.recorded_call_ids.insert(call_id.clone());
         state.in_flight.insert(
             call_id,
             InFlight {
@@ -1532,6 +1695,7 @@ impl PepEngine {
         record: Recorded,
         next_seq: u64,
         nodes: usize,
+        pointer_bytes: usize,
         ratchet: Confidentiality,
     ) {
         let state = &mut self.state;
@@ -1547,6 +1711,7 @@ impl PepEngine {
         }
         state.context_conf = state.context_conf.max(ratchet);
         state.result_nodes_remaining = state.result_nodes_remaining.saturating_sub(nodes);
+        state.pointer_bytes_remaining = state.pointer_bytes_remaining.saturating_sub(pointer_bytes);
         state
             .recorded_call_ids
             .insert(record.source_call_id.clone());
@@ -1594,7 +1759,12 @@ impl Engine for PepEngine {
         Ok(())
     }
 
-    fn abort(&mut self, reservation_id: u64, outcome: AbortOutcome) -> Result<(), PepError> {
+    fn abort(
+        &mut self,
+        _host: &HostAuthority,
+        reservation_id: u64,
+        outcome: AbortOutcome,
+    ) -> Result<(), PepError> {
         let state = &mut self.state;
         let reservation = state
             .budget
@@ -1646,13 +1816,53 @@ fn validate_config(intent: &PepIntent, pins: &ToolPins) -> Result<(), ConfigErro
     if limits.currency.len() != 3 || !limits.currency.bytes().all(|b| b.is_ascii_uppercase()) {
         return Err(ConfigError::InvalidCurrency);
     }
-    for uri in pins.stores.keys() {
+    for (uri, policy) in &pins.stores {
         if normalize_store_uri(uri).as_deref() != Some(uri.as_str()) {
             return Err(ConfigError::UnknownStore);
         }
+        let overlaps = pins.stores.iter().any(|(other, other_policy)| {
+            let fold = policy.case_insensitive || other_policy.case_insensitive;
+            other != uri && stores_overlap(uri, other, fold)
+        });
+        if overlaps {
+            return Err(ConfigError::OverlappingStores);
+        }
     }
-    for tool in pins.tools.values() {
+    for (key, tool) in &pins.tools {
+        validate_tool_name(key, tool)?;
         validate_tool(tool, pins)?;
+    }
+    Ok(())
+}
+
+/// Whether two pinned store URIs overlap: one names a location inside the other
+/// (`notes://agent` and `notes://agent/proj`), or they differ only by a trailing `/`. Nested-key
+/// taint works within one store, so a record reachable under two stores could escape it. With
+/// `fold` (either store is case-insensitive) the paths are compared ignoring case, because
+/// `files://share/Finance` and `files://share/finance/2026` then reach the same records.
+fn stores_overlap(a: &str, b: &str, fold: bool) -> bool {
+    let (a, b) = if fold {
+        (a.to_lowercase(), b.to_lowercase())
+    } else {
+        (a.to_owned(), b.to_owned())
+    };
+    let (a, b) = (a.trim_end_matches('/'), b.trim_end_matches('/'));
+    let inside = |outer: &str, inner: &str| {
+        inner
+            .strip_prefix(outer)
+            .is_some_and(|rest| rest.starts_with('/'))
+    };
+    a == b || inside(a, b) || inside(b, a)
+}
+
+/// A tool must be pinned under its own name, which must be NFC (request names are, so any
+/// other key is unreachable while `action_digest` still uses `name`) and outside the `pep/`
+/// namespace (a tool named `pep/trusted-input` would have its results read as trusted input).
+fn validate_tool_name(key: &str, tool: &ToolPolicy) -> Result<(), ConfigError> {
+    let name = tool.name.as_str();
+    let is_nfc = jcs::JcsString::new(name).as_str() == name;
+    if key != name || name.is_empty() || !is_nfc || name.starts_with(RESERVED_TOOL_PREFIX) {
+        return Err(ConfigError::InvalidToolName);
     }
     Ok(())
 }
@@ -1666,6 +1876,9 @@ fn validate_tool(tool: &ToolPolicy, pins: &ToolPins) -> Result<(), ConfigError> 
     }
     if has_role(ArgRole::StoreKey) && tool.store_uri.is_none() && !has_role(ArgRole::StoreUri) {
         return Err(ConfigError::UnknownStore);
+    }
+    if tool.effect == EffectClass::MutatingInternal && !has_role(ArgRole::StoreKey) {
+        return Err(ConfigError::MissingLocation);
     }
     if tool
         .trusted_fields
@@ -1716,15 +1929,19 @@ fn validate_binding(
     let entity_arg = tool.args.iter().any(|spec| {
         spec.pointer == binding.entity_arg_pointer && matches!(spec.role, ArgRole::Entity(_))
     });
-    let lookup_has_location = lookup.store_uri.is_some()
-        && lookup
-            .args
-            .iter()
-            .any(|spec| spec.role == ArgRole::StoreKey);
+    // The lookup must be keyed by the entity itself: if the entity were any other argument,
+    // the lookup could read one record and be filed as the witness for another entity.
+    let lookup_keyed_by_entity = lookup.store_uri.is_some()
+        && lookup.args.iter().any(|spec| {
+            spec.role == ArgRole::StoreKey && spec.pointer == binding.lookup_entity_pointer
+        });
+    // The lookup must only read. A tool that creates or edits the record would hand back the
+    // agent's own amount as a Trusted witness, and an external mutation writes no taint.
     let valid = tool.effect == EffectClass::Payment
         && entity_arg
+        && lookup.effect == EffectClass::ReadOnly
         && lookup.output_label.integ == Integrity::Trusted
-        && lookup_has_location
+        && lookup_keyed_by_entity
         && lookup
             .trusted_fields
             .contains(&binding.result_amount_pointer)
@@ -1750,9 +1967,54 @@ fn canonical_call_id(id: &JcsValue) -> Option<String> {
     }
 }
 
-fn first_pointer_token(pointer: &str) -> Option<String> {
-    let token = pointer.strip_prefix('/')?.split('/').next()?;
-    Some(token.replace("~1", "/").replace("~0", "~"))
+/// The reference tokens of every declared argument pointer, NFC-normalized like the keys of a
+/// parsed request. A pointer that is not valid RFC 6901 declares nothing, and neither does the
+/// root pointer `""`.
+fn declared_paths(tool: &ToolPolicy) -> Vec<Vec<String>> {
+    tool.args
+        .iter()
+        .filter_map(|spec| {
+            spec.pointer
+                .strip_prefix('/')?
+                .split('/')
+                .map(|raw| {
+                    jcs::unescape_pointer_token(raw)
+                        .map(|token| jcs::JcsString::new(token).into_string())
+                })
+                .collect::<Option<Vec<_>>>()
+        })
+        .collect()
+}
+
+/// Whether every member below `value`, found at `path`, is a declared argument or a container on
+/// the way to one. A declared argument covers its whole value (a `Data` or `StoreWrite` value
+/// may itself be a container), so only containers on a declared path are searched, never the
+/// agent's own data, and the recursion is as deep as the longest declared pointer. A member on
+/// the way must really be a container: with only `/items/0` declared, `"items": "--delete-all"`
+/// is undeclared.
+fn only_declared(value: &JcsValue, path: &mut Vec<String>, declared: &[Vec<String>]) -> bool {
+    let mut covered = |token: String, child: &JcsValue| {
+        path.push(token);
+        let exact = declared.contains(path);
+        let on_the_way = declared
+            .iter()
+            .any(|tokens| tokens.len() > path.len() && tokens.starts_with(path));
+        let ok =
+            exact || (on_the_way && !child.is_scalar() && only_declared(child, path, declared));
+        path.pop();
+        ok
+    };
+    match value {
+        JcsValue::Object(object) => object
+            .entries()
+            .iter()
+            .all(|(key, child)| covered(key.as_str().to_owned(), child)),
+        JcsValue::Array(items) => items
+            .iter()
+            .enumerate()
+            .all(|(index, child)| covered(index.to_string(), child)),
+        JcsValue::Null | JcsValue::Bool(_) | JcsValue::Number(_) | JcsValue::String(_) => true,
+    }
 }
 
 fn resolve_roles<'a>(
@@ -1877,6 +2139,7 @@ fn g_canon<'a>(
     let call_id = request
         .get("id")
         .and_then(canonical_call_id)
+        .filter(|id| id.len() <= MAX_CALL_ID_BYTES)
         .ok_or_else(|| fail(PolicyError::InvalidCallId))?;
     let params = request
         .get("params")
@@ -1891,26 +2154,24 @@ fn g_canon<'a>(
     }
     let arguments = params
         .get("arguments")
+        .filter(|arguments| arguments.as_object().is_some())
         .ok_or_else(|| fail(PolicyError::ArgumentsNotObject))?;
-    let argument_object = arguments
-        .as_object()
-        .ok_or_else(|| fail(PolicyError::ArgumentsNotObject))?;
-    if params
-        .get("_meta")
-        .is_some_and(|meta| meta.as_object().is_none())
-    {
-        return Err(fail(PolicyError::MetaNotObject));
-    }
-    if tool.effect != EffectClass::ReadOnly {
-        for (key, _) in argument_object.entries() {
-            let declared = tool
-                .args
-                .iter()
-                .any(|spec| first_pointer_token(&spec.pointer).as_deref() == Some(key.as_str()));
-            if !declared {
-                return Err(fail(PolicyError::UndeclaredArgument));
-            }
+    if let Some(meta) = params.get("_meta") {
+        let meta = meta
+            .as_object()
+            .ok_or_else(|| fail(PolicyError::MetaNotObject))?;
+        if meta
+            .entries()
+            .iter()
+            .any(|(key, _)| is_reserved_meta(key.as_str()))
+        {
+            return Err(fail(PolicyError::ReservedMetaMember));
         }
+    }
+    // Every member must be declared, at every depth: checking only the top-level keys would let
+    // `{"to": {"recipient": ..., "override_account": ...}}` through next to `/to/recipient`.
+    if strict_arguments(tool) && !only_declared(arguments, &mut Vec::new(), &declared_paths(tool)) {
+        return Err(fail(PolicyError::UndeclaredArgument));
     }
     if state.in_flight.contains_key(&call_id) || state.recorded_call_ids.contains(&call_id) {
         return Err(fail(PolicyError::DuplicateCallId));
@@ -1927,6 +2188,35 @@ fn g_canon<'a>(
     })
 }
 
+/// Whether an agent may not send this `_meta` member: everything in the PEP's namespace except
+/// the Episode Token, so that no agent can forge a member the PEP adds or the broker verifies.
+fn is_reserved_meta(key: &str) -> bool {
+    key.starts_with(RESERVED_META_PREFIX) && key != EPISODE_META_KEY
+}
+
+/// Whether every argument of a call must be declared. Only a read-only tool whose output is
+/// never trusted, that is not a sink and whose declared arguments are all free `Data` may take
+/// extra arguments (an optional flag such as `verbose`): no guard looks at its arguments. For
+/// any other tool an undeclared argument could change what the call does, which record a
+/// trusted or taint-labelled read returns (`invoice_number` next to the declared `invoice_id`),
+/// slip past a checked argument (`recipient_id` next to the checked `recipient`), or redirect
+/// its data (a proxy or callback URL).
+fn strict_arguments(tool: &ToolPolicy) -> bool {
+    tool.effect != EffectClass::ReadOnly
+        || is_sink(tool)
+        || !tool.trusted_fields.is_empty()
+        || tool.args.iter().any(|spec| spec.role != ArgRole::Data)
+}
+
+/// Whether a tool can carry data to a destination cleared below `Secret`.
+fn is_sink(tool: &ToolPolicy) -> bool {
+    tool.sink_clearance < Confidentiality::Secret
+        || tool
+            .args
+            .iter()
+            .any(|spec| spec.role == ArgRole::SinkDestination)
+}
+
 fn g_prov<'s>(
     state: &'s EpisodeState,
     tool: &ToolPolicy,
@@ -1937,7 +2227,16 @@ fn g_prov<'s>(
     }
     let missing = deny(GuardId::Prov, PolicyError::ProvenanceMissing);
     let &(_, entity) = roles.entities.first().ok_or(missing)?;
-    latest_witness(state, tool, entity).map(Some).ok_or(missing)
+    let witness = latest_witness(state, tool, entity).ok_or(missing)?;
+    // One lookup or trusted input funds one payment. Only a `Released` payment (one that
+    // definitely did not run) gives its witness back; `NeedsReconcile` keeps it (fail closed).
+    let consumed = state.budget.reservations.values().any(|reservation| {
+        reservation.witness_seq == witness.record.seq && reservation.state != ResState::Released
+    });
+    if consumed {
+        return Err(deny(GuardId::Prov, PolicyError::ProvenanceConsumed));
+    }
+    Ok(Some(witness))
 }
 
 fn g_entity(
@@ -2045,30 +2344,70 @@ fn planned_writes(
         && let Some(key) = store_key
     {
         indexes.insert(TaintIndex::Location(key.clone()));
+        // A write to `a/b/c` can change what `a` and `a/b` return (see `location_label`).
+        for ancestor in key.ancestors() {
+            indexes.insert(TaintIndex::Below(ancestor));
+        }
     }
     for value in writes {
-        for node in value.nodes() {
-            let eligible = node.value.is_scalar() || node.depth <= MAX_INDEX_DEPTH;
-            if eligible && let Some(digest) = ContentDigest::of(node.value) {
+        // `walk`, not `nodes`: the agent controls this value, and building a pointer per node
+        // lets one long key over a large array allocate gigabytes.
+        value.walk(&mut |depth, node| {
+            let eligible = node.is_scalar() || depth <= MAX_INDEX_DEPTH;
+            if eligible && let Some(digest) = ContentDigest::of(node) {
                 indexes.insert(TaintIndex::Content(digest));
             }
-        }
+        });
     }
     indexes.into_iter().collect()
 }
 
-fn g_budget(
-    state: &EpisodeState,
+/// Bundles what guards 3-5 found for a payment. Those guards always find all of it for a payment
+/// tool; if any part were ever missing, the call is denied rather than planned as a payment
+/// without a reservation (fail closed).
+fn payment_inputs(
+    tool: &ToolPolicy,
     amount: Option<u64>,
     entity: Option<(String, u32)>,
+    witness: Option<&Witness<'_>>,
+) -> Result<Option<PaymentInputs>, PepError> {
+    if tool.effect != EffectClass::Payment {
+        return Ok(None);
+    }
+    match (amount, entity, witness) {
+        (Some(amount), Some((entity, new_entity_uses)), Some(witness)) => Ok(Some(PaymentInputs {
+            amount,
+            entity,
+            new_entity_uses,
+            witness_seq: witness.record.seq,
+        })),
+        _ => Err(deny(GuardId::Prov, PolicyError::ProvenanceMissing)),
+    }
+}
+
+fn g_budget(
+    state: &EpisodeState,
+    payment: Option<PaymentInputs>,
     writes: usize,
 ) -> Result<(Option<PaymentPlan>, usize), PepError> {
     let fail = |reason: PolicyError| deny(GuardId::Budget, reason);
+    if state.in_flight.len() >= MAX_IN_FLIGHT {
+        return Err(fail(PolicyError::InFlightLimitExceeded));
+    }
+    if state.recorded_call_ids.len() >= MAX_CALLS_PER_EPISODE {
+        return Err(fail(PolicyError::CallLimitExceeded));
+    }
     let quota_after = state
         .label_quota_remaining
         .checked_sub(writes)
         .ok_or_else(|| fail(PolicyError::LabelQuotaExceeded))?;
-    let (Some(amount), Some((entity, new_entity_uses))) = (amount, entity) else {
+    let Some(PaymentInputs {
+        amount,
+        entity,
+        new_entity_uses,
+        witness_seq,
+    }) = payment
+    else {
         return Ok((None, quota_after));
     };
     let limits = &state.intent.limits;
@@ -2098,6 +2437,7 @@ fn g_budget(
             next_reservation_id,
             amount,
             entity,
+            witness_seq,
             new_reserved,
             new_calls,
             new_entity_uses,
@@ -2139,7 +2479,7 @@ fn g_label(
     let fail = |reason: PolicyError| deny(GuardId::Label, reason);
     let mut input = Label::new(state.context_conf, Integrity::Trusted);
     if let Some(key) = &canon.store_key
-        && let Some(found) = labels.lookup(&TaintIndex::Location(key.clone()))?
+        && let Some(found) = location_label(labels, key)?
     {
         input = input.join(found);
     }
@@ -2194,12 +2534,66 @@ const fn result_parse_error(error: JcsError) -> PepError {
     }
 }
 
+/// `pointer + "/" + token`, after charging its length to `budget`. Every value's pointer is
+/// charged, containers included, so the budget bounds both the retained leaf pointers and the
+/// work of building them.
+fn child_pointer(pointer: &str, token: &str, budget: &mut usize) -> Result<String, StoreError> {
+    let len = pointer
+        .len()
+        .checked_add(token.len())
+        .and_then(|len| len.checked_add(1))
+        .ok_or(StoreError::CapacityExceeded)?;
+    *budget = budget
+        .checked_sub(len)
+        .ok_or(StoreError::CapacityExceeded)?;
+    let mut child = String::with_capacity(len);
+    child.push_str(pointer);
+    child.push('/');
+    child.push_str(token);
+    Ok(child)
+}
+
+/// Labels every scalar of a host-supplied trusted input with `label`, within the pointer
+/// `budget`.
+fn trusted_leaves(
+    value: &JcsValue,
+    pointer: &str,
+    label: Label,
+    budget: &mut usize,
+    out: &mut Vec<RecordedLeaf>,
+) -> Result<(), StoreError> {
+    match value {
+        JcsValue::Array(items) => {
+            for (index, item) in items.iter().enumerate() {
+                let child = child_pointer(pointer, &index.to_string(), budget)?;
+                trusted_leaves(item, &child, label, budget, out)?;
+            }
+        }
+        JcsValue::Object(object) => {
+            for (key, item) in object.entries() {
+                let token = jcs::escape_pointer_token(key.as_str());
+                let child = child_pointer(pointer, &token, budget)?;
+                trusted_leaves(item, &child, label, budget, out)?;
+            }
+        }
+        JcsValue::Null | JcsValue::Bool(_) | JcsValue::Number(_) | JcsValue::String(_) => {
+            out.push(RecordedLeaf {
+                pointer: pointer.to_owned(),
+                value: value.clone(),
+                label,
+            });
+        }
+    }
+    Ok(())
+}
+
 fn label_tree(
     ctx: &LabelCtx<'_>,
     value: &JcsValue,
     pointer: &str,
     depth: usize,
     inherited: Option<Label>,
+    budget: &mut usize,
     out: &mut Vec<RecordedLeaf>,
 ) -> Result<(), StoreError> {
     let mut inherited = inherited;
@@ -2215,14 +2609,15 @@ fn label_tree(
     match value {
         JcsValue::Array(items) => {
             for (index, item) in items.iter().enumerate() {
-                let child = format!("{pointer}/{index}");
-                label_tree(ctx, item, &child, child_depth, inherited, out)?;
+                let child = child_pointer(pointer, &index.to_string(), budget)?;
+                label_tree(ctx, item, &child, child_depth, inherited, budget, out)?;
             }
         }
         JcsValue::Object(object) => {
             for (key, item) in object.entries() {
-                let child = format!("{pointer}/{}", jcs::escape_pointer_token(key.as_str()));
-                label_tree(ctx, item, &child, child_depth, inherited, out)?;
+                let token = jcs::escape_pointer_token(key.as_str());
+                let child = child_pointer(pointer, &token, budget)?;
+                label_tree(ctx, item, &child, child_depth, inherited, budget, out)?;
             }
         }
         JcsValue::Null | JcsValue::Bool(_) | JcsValue::Number(_) | JcsValue::String(_) => {
@@ -3753,8 +4148,11 @@ mod tests {
 
     #[test]
     fn approve_step_up_then_commit() {
+        let host = HostAuthority::for_tests();
         let (mut engine, approval) = awaiting_step_up();
-        engine.approve_step_up(approval.reservation_id).unwrap();
+        engine
+            .approve_step_up(&host, approval.reservation_id)
+            .unwrap();
         engine.commit(approval.reservation_id).unwrap();
         assert_eq!(engine.state().budget.reserved, 0);
         assert_eq!(engine.state().budget.committed, 60_000);
@@ -3762,23 +4160,31 @@ mod tests {
 
     #[test]
     fn approve_step_up_twice_rejected() {
+        let host = HostAuthority::for_tests();
         let (mut engine, approval) = awaiting_step_up();
-        engine.approve_step_up(approval.reservation_id).unwrap();
+        engine
+            .approve_step_up(&host, approval.reservation_id)
+            .unwrap();
         assert_eq!(
-            engine.approve_step_up(approval.reservation_id),
+            engine.approve_step_up(&host, approval.reservation_id),
             Err(PepError::InvalidTransition)
         );
         assert_eq!(
-            engine.approve_step_up(99),
+            engine.approve_step_up(&host, 99),
             Err(PepError::UnknownReservation)
         );
     }
 
     #[test]
     fn abort_accepts_awaiting_step_up() {
+        let host = HostAuthority::for_tests();
         let (mut declined, approval) = awaiting_step_up();
         declined
-            .abort(approval.reservation_id, AbortOutcome::DefinitelyNotExecuted)
+            .abort(
+                &host,
+                approval.reservation_id,
+                AbortOutcome::DefinitelyNotExecuted,
+            )
             .unwrap();
         assert_eq!(declined.state().budget.reserved, 0);
         assert_eq!(
@@ -3787,7 +4193,7 @@ mod tests {
         );
         let (mut unknown, approval) = awaiting_step_up();
         unknown
-            .abort(approval.reservation_id, AbortOutcome::Unknown)
+            .abort(&host, approval.reservation_id, AbortOutcome::Unknown)
             .unwrap();
         assert_eq!(unknown.state().budget.reserved, 60_000);
         assert_eq!(
@@ -3798,12 +4204,15 @@ mod tests {
 
     #[test]
     fn ticket_unavailable_until_approved() {
+        let host = HostAuthority::for_tests();
         let (mut engine, approval) = awaiting_step_up();
         assert_eq!(
             engine.ticket(approval.reservation_id),
             Err(PepError::InvalidTransition)
         );
-        engine.approve_step_up(approval.reservation_id).unwrap();
+        engine
+            .approve_step_up(&host, approval.reservation_id)
+            .unwrap();
         let ticket = engine.ticket(approval.reservation_id).unwrap();
         assert_eq!(
             ticket.idempotency_key,
@@ -3851,8 +4260,9 @@ mod tests {
 
     #[test]
     fn abort_unknown_keeps_reserved() {
+        let host = HostAuthority::for_tests();
         let (mut engine, id) = held_payment();
-        engine.abort(id, AbortOutcome::Unknown).unwrap();
+        engine.abort(&host, id, AbortOutcome::Unknown).unwrap();
         assert_eq!(engine.state().budget.reserved, 30_000);
         assert_eq!(
             engine.state().budget.reservations[&id].state,
@@ -3863,9 +4273,10 @@ mod tests {
 
     #[test]
     fn abort_definitely_releases() {
+        let host = HostAuthority::for_tests();
         let (mut engine, id) = held_payment();
         engine
-            .abort(id, AbortOutcome::DefinitelyNotExecuted)
+            .abort(&host, id, AbortOutcome::DefinitelyNotExecuted)
             .unwrap();
         let budget = &engine.state().budget;
         assert_eq!(budget.reserved, 0);
@@ -3876,9 +4287,10 @@ mod tests {
 
     #[test]
     fn abort_clears_in_flight() {
+        let host = HostAuthority::for_tests();
         let (mut engine, id) = held_payment();
         assert!(engine.state().in_flight.contains_key("2"));
-        engine.abort(id, AbortOutcome::Unknown).unwrap();
+        engine.abort(&host, id, AbortOutcome::Unknown).unwrap();
         assert!(!engine.state().in_flight.contains_key("2"));
     }
 
@@ -3901,9 +4313,10 @@ mod tests {
 
     #[test]
     fn commit_after_release_fails() {
+        let host = HostAuthority::for_tests();
         let (mut engine, id) = held_payment();
         engine
-            .abort(id, AbortOutcome::DefinitelyNotExecuted)
+            .abort(&host, id, AbortOutcome::DefinitelyNotExecuted)
             .unwrap();
         assert_eq!(engine.commit(id), Err(PepError::InvalidTransition));
         assert_eq!(engine.commit(99), Err(PepError::UnknownReservation));
@@ -4074,5 +4487,901 @@ mod tests {
         assert_ne!(base, idempotency_key(2, 1, "x"));
         assert_ne!(base, idempotency_key(1, 2, "y"));
         assert_ne!(idempotency_key(0, 0x31, ""), idempotency_key(0, 0, "1"));
+    }
+
+    // ---- One witness funds one payment ----
+
+    #[test]
+    fn one_lookup_funds_one_payment() {
+        let mut engine = engine();
+        lookup(&mut engine, 1, "INV-1001", "30000", "USD");
+        allowed(pay(&mut engine, 2, "INV-1001", 30_000));
+        assert_eq!(
+            denied(pay(&mut engine, 3, "INV-1001", 30_000)),
+            (GuardId::Prov, PolicyError::ProvenanceConsumed)
+        );
+        assert_eq!(engine.state().budget.reserved, 30_000);
+        assert_eq!(engine.state().budget.calls, 1);
+        lookup(&mut engine, 4, "INV-1001", "30000", "USD");
+        allowed(pay(&mut engine, 5, "INV-1001", 30_000));
+    }
+
+    #[test]
+    fn only_a_released_payment_frees_its_witness() {
+        let host = HostAuthority::for_tests();
+        let (mut unknown, id) = held_payment();
+        unknown.abort(&host, id, AbortOutcome::Unknown).unwrap();
+        assert_eq!(
+            denied(pay(&mut unknown, 3, "INV-1001", 30_000)),
+            (GuardId::Prov, PolicyError::ProvenanceConsumed)
+        );
+        let (mut released, id) = held_payment();
+        released
+            .abort(&host, id, AbortOutcome::DefinitelyNotExecuted)
+            .unwrap();
+        allowed(pay(&mut released, 3, "INV-1001", 30_000));
+    }
+
+    #[test]
+    fn trusted_input_funds_one_payment() {
+        let mut engine = engine_on(&store(), recipients(), limits("USD"));
+        let host = HostAuthority::for_tests();
+        engine
+            .record_trusted_input(
+                &host,
+                "u1",
+                br#"{"entity":"rcpt_A","amount_minor":100}"#,
+                Confidentiality::Internal,
+            )
+            .unwrap();
+        let first = allowed(pay_to(&mut engine, 1, "rcpt_A", 100));
+        assert_eq!(
+            engine.state().budget.reservations[&first.reservation.unwrap().reservation_id]
+                .witness_seq,
+            1
+        );
+        assert_eq!(
+            denied(pay_to(&mut engine, 2, "rcpt_A", 100)),
+            (GuardId::Prov, PolicyError::ProvenanceConsumed)
+        );
+    }
+
+    // ---- Call ids are spent for good ----
+
+    #[test]
+    fn abandoned_call_id_is_never_reused() {
+        let mut engine = engine();
+        allow(
+            &mut engine,
+            &request(5, "fetch", r#"{"url":"https://evil.example/"}"#),
+        );
+        engine.abandon("5").unwrap();
+        assert_eq!(
+            denied(engine.evaluate_raw(&request(5, "get_invoice", r#"{"invoice_id":"INV-1001"}"#))),
+            (GuardId::Canon, PolicyError::DuplicateCallId)
+        );
+        // The late response to the abandoned fetch cannot be recorded at all.
+        assert_eq!(
+            engine.record_result_raw("5", &invoice_result("INV-1001", "45000", "USD")),
+            Err(PepError::UnknownCall)
+        );
+    }
+
+    #[test]
+    fn aborted_call_id_is_never_reused() {
+        let host = HostAuthority::for_tests();
+        let (mut engine, id) = held_payment();
+        engine.abort(&host, id, AbortOutcome::Unknown).unwrap();
+        assert_eq!(
+            denied(engine.evaluate_raw(&request(2, "get_ticket", r#"{"ticket_id":"T-1"}"#))),
+            (GuardId::Canon, PolicyError::DuplicateCallId)
+        );
+    }
+
+    #[test]
+    fn long_call_id_rejected() {
+        let mut engine = engine();
+        let too_long = format!("\"{}\"", "x".repeat(MAX_CALL_ID_BYTES - 1));
+        assert_eq!(
+            denied(engine.evaluate_raw(&request_with_id(
+                &too_long,
+                "get_ticket",
+                r#"{"ticket_id":"T-1"}"#
+            ))),
+            (GuardId::Canon, PolicyError::InvalidCallId)
+        );
+        let longest = format!("\"{}\"", "x".repeat(MAX_CALL_ID_BYTES - 2));
+        let decision = allow(
+            &mut engine,
+            &request_with_id(&longest, "get_ticket", r#"{"ticket_id":"T-1"}"#),
+        );
+        assert_eq!(decision.call_id.len(), MAX_CALL_ID_BYTES);
+    }
+
+    #[test]
+    fn in_flight_calls_are_bounded() {
+        let mut engine = engine();
+        let ticket = r#"{"ticket_id":"T-1"}"#;
+        for id in 0..u64::try_from(MAX_IN_FLIGHT).unwrap() {
+            allow(&mut engine, &request(id, "get_ticket", ticket));
+        }
+        assert_eq!(
+            denied(engine.evaluate_raw(&request(1000, "get_ticket", ticket))),
+            (GuardId::Budget, PolicyError::InFlightLimitExceeded)
+        );
+        engine.abandon("0").unwrap();
+        allow(&mut engine, &request(1000, "get_ticket", ticket));
+    }
+
+    #[test]
+    fn episode_call_ids_are_bounded() {
+        let mut engine = engine();
+        let ticket = r#"{"ticket_id":"T-1"}"#;
+        for id in 0..u64::try_from(MAX_CALLS_PER_EPISODE).unwrap() {
+            allow(&mut engine, &request(id, "get_ticket", ticket));
+            engine.abandon(&id.to_string()).unwrap();
+        }
+        assert_eq!(
+            denied(engine.evaluate_raw(&request(99_999, "get_ticket", ticket))),
+            (GuardId::Budget, PolicyError::CallLimitExceeded)
+        );
+    }
+
+    // ---- Reserved _meta and sink arguments ----
+
+    fn request_with_meta(id: u64, meta: &str) -> Vec<u8> {
+        format!(
+            r#"{{"jsonrpc":"2.0","id":{id},"method":"tools/call","params":{{"name":"get_ticket","arguments":{{"ticket_id":"T-1"}},"_meta":{meta}}}}}"#
+        )
+        .into_bytes()
+    }
+
+    #[test]
+    fn reserved_meta_members_denied() {
+        let mut engine = engine();
+        for member in [
+            "dev.pep-sidecar/call-proof",
+            "dev.pep-sidecar/prov",
+            RESERVED_META_PREFIX,
+        ] {
+            let meta = format!(r#"{{"{member}":"forged"}}"#);
+            assert_eq!(
+                denied(engine.evaluate_raw(&request_with_meta(1, &meta))),
+                (GuardId::Canon, PolicyError::ReservedMetaMember),
+                "{member}"
+            );
+        }
+        let meta = format!(r#"{{"{EPISODE_META_KEY}":"eyJ.token","progressToken":7}}"#);
+        let decision = allow(&mut engine, &request_with_meta(2, &meta));
+        assert!(
+            String::from_utf8(decision.canonical_request)
+                .unwrap()
+                .contains(EPISODE_META_KEY)
+        );
+    }
+
+    #[test]
+    fn sink_tools_reject_undeclared_arguments() {
+        let mut engine = engine();
+        let redirect = format!(r#"{{"url":"{PARTNER}","forward_to":"https://evil.example/"}}"#);
+        assert_eq!(
+            denied(engine.evaluate_raw(&request(1, "fetch", &redirect))),
+            (GuardId::Canon, PolicyError::UndeclaredArgument)
+        );
+        let declared = format!(r#"{{"url":"{PARTNER}"}}"#);
+        allow(&mut engine, &request(2, "fetch", &declared));
+    }
+
+    // ---- Pointer budgets ----
+
+    fn long_key_array(key_bytes: usize, items: usize) -> String {
+        format!(
+            r#"{{"{}":[{}]}}"#,
+            "k".repeat(key_bytes),
+            vec!["0"; items].join(",")
+        )
+    }
+
+    #[test]
+    fn result_pointer_bytes_capped() {
+        let mut engine = engine();
+        allow(
+            &mut engine,
+            &request(1, "get_ticket", r#"{"ticket_id":"T-1"}"#),
+        );
+        // About 3000 x 2 KiB = 6 MiB of pointers from a result of about 8 KiB.
+        let result = format!(r#"{{"structuredContent":{}}}"#, long_key_array(2048, 3000));
+        assert_eq!(
+            engine.record_result_raw("1", result.as_bytes()),
+            Err(PepError::Store(StoreError::CapacityExceeded))
+        );
+        assert!(engine.state().in_flight.contains_key("1"));
+        assert!(engine.state().records.is_empty());
+        engine
+            .record_result_raw("1", br#"{"structuredContent":{"ok":1}}"#)
+            .unwrap();
+        let used = "/structuredContent".len() + "/structuredContent/ok".len();
+        assert_eq!(
+            engine.state().pointer_bytes_remaining,
+            MAX_EPISODE_POINTER_BYTES - used
+        );
+    }
+
+    #[test]
+    fn episode_pointer_budget() {
+        let mut engine = engine();
+        engine.state.pointer_bytes_remaining = 40;
+        allow(
+            &mut engine,
+            &request(1, "get_ticket", r#"{"ticket_id":"T-1"}"#),
+        );
+        assert_eq!(
+            engine.record_result_raw("1", br#"{"structuredContent":{"long":1}}"#),
+            Err(PepError::Store(StoreError::CapacityExceeded))
+        );
+        engine
+            .record_result_raw("1", br#"{"structuredContent":{"ok":1}}"#)
+            .unwrap();
+        assert_eq!(engine.state().pointer_bytes_remaining, 1);
+    }
+
+    #[test]
+    fn trusted_input_pointer_bytes_capped() {
+        let mut engine = engine_on(&store(), recipients(), limits("USD"));
+        let host = HostAuthority::for_tests();
+        let raw = long_key_array(2048, 3000);
+        assert_eq!(
+            engine.record_trusted_input(&host, "u1", raw.as_bytes(), Confidentiality::Internal),
+            Err(PepError::Store(StoreError::CapacityExceeded))
+        );
+        assert!(engine.state().records.is_empty());
+    }
+
+    #[test]
+    fn store_writes_are_indexed_without_pointers() {
+        let mut engine = engine();
+        // Walking this with `nodes()` would build 8,000 pointers of 512 KiB each (4 GiB).
+        let text = long_key_array(512 * 1024, 8000);
+        allow(
+            &mut engine,
+            &request(1, "save_note", &format!(r#"{{"key":"k1","text":{text}}}"#)),
+        );
+        // The location, the object and the array; numbers are never content-indexed.
+        assert_eq!(
+            engine.state().label_quota_remaining,
+            MAX_LABEL_ENTRIES_PER_EPISODE - 3
+        );
+    }
+
+    #[test]
+    fn planned_writes_build_no_pointers() {
+        // Built in memory, so not held to the request limit: through `nodes()` this would need
+        // 8,192 pointers of 8 MiB each (64 GiB), which no test machine has.
+        let items = vec![JcsValue::int(0).unwrap(); 8192];
+        let entries = vec![(
+            jcs::JcsString::new("k".repeat(8 << 20)),
+            JcsValue::Array(items),
+        )];
+        let value = JcsValue::Object(jcs::JcsObject::from_entries(entries).unwrap());
+        let key = StoreKey::new(NOTES, "k1", &pins().stores).unwrap();
+        let save_note = &pins().tools["save_note"];
+        let writes = planned_writes(save_note, Some(&key), &[&value]);
+        assert_eq!(writes.len(), 3);
+        assert!(writes.contains(&TaintIndex::Location(key)));
+    }
+
+    // ---- Store keys ----
+
+    #[test]
+    fn case_insensitive_store_needs_ascii_keys() {
+        let stores = pins().stores;
+        for key in ["\u{cd}NV-1001", "\u{ff29}NV-1001", "INV-1001\u{301}"] {
+            assert_eq!(
+                StoreKey::new(BILLING, key, &stores),
+                Err(PolicyError::InvalidStoreKey),
+                "{key:?}"
+            );
+        }
+        assert!(StoreKey::new(NOTES, "\u{cd}NV-1001", &stores).is_ok());
+        let mut engine = engine();
+        let alias = "{\"invoice_id\":\"\u{cd}NV-1001\",\"amount_due_minor\":5}";
+        assert_eq!(
+            denied(engine.evaluate_raw(&request(1, "update_invoice", alias))),
+            (GuardId::Canon, PolicyError::InvalidStoreKey)
+        );
+    }
+
+    // ---- Configuration ----
+
+    #[test]
+    fn binding_must_key_the_lookup_by_entity() {
+        let mut custom = pins();
+        custom
+            .tools
+            .get_mut("get_invoice")
+            .unwrap()
+            .args
+            .push(arg("/hint", ArgRole::Data));
+        custom
+            .tools
+            .get_mut("pay_invoice")
+            .unwrap()
+            .amount_binding
+            .as_mut()
+            .unwrap()
+            .lookup_entity_pointer = "/hint".to_owned();
+        assert_eq!(
+            config_error(intent(invoices(), limits("USD")), custom),
+            ConfigError::InvalidBinding
+        );
+    }
+
+    #[test]
+    fn mutating_internal_tool_needs_location() {
+        let mut custom = pins();
+        let import = tool(
+            "import_invoices",
+            EffectClass::MutatingInternal,
+            vec![arg("/csv", ArgRole::StoreWrite)],
+        );
+        custom.tools.insert(import.name.clone(), import);
+        assert_eq!(
+            config_error(intent(invoices(), limits("USD")), custom),
+            ConfigError::MissingLocation
+        );
+    }
+
+    #[test]
+    fn tool_names_validated() {
+        let pinned_as = |key: &str, name: &str| {
+            let mut custom = pins();
+            custom
+                .tools
+                .insert(key.to_owned(), tool(name, EffectClass::ReadOnly, vec![]));
+            config_error(intent(invoices(), limits("USD")), custom)
+        };
+        for (key, name) in [
+            ("alias", "get_ticket"),
+            (TRUSTED_INPUT_TOOL, TRUSTED_INPUT_TOOL),
+            ("pep/approve", "pep/approve"),
+            ("cafe\u{301}", "cafe\u{301}"),
+            ("", ""),
+        ] {
+            assert_eq!(
+                pinned_as(key, name),
+                ConfigError::InvalidToolName,
+                "{key:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn binding_lookup_must_be_read_only() {
+        for effect in [EffectClass::MutatingExternal, EffectClass::MutatingInternal] {
+            let mut custom = pins();
+            custom.tools.get_mut("get_invoice").unwrap().effect = effect;
+            assert_eq!(
+                config_error(intent(invoices(), limits("USD")), custom),
+                ConfigError::InvalidBinding,
+                "{effect:?}"
+            );
+        }
+    }
+
+    // ---- Nested arguments ----
+
+    fn nested_pins() -> ToolPins {
+        let mut custom = pins();
+        let transfer = ToolPolicy {
+            sink_clearance: Confidentiality::Internal,
+            ..tool(
+                "transfer",
+                EffectClass::Payment,
+                vec![
+                    arg("/to/recipient", ArgRole::Entity(EntityKind::Recipient)),
+                    arg("/amount", ArgRole::Amount),
+                ],
+            )
+        };
+        let batch = tool(
+            "batch",
+            EffectClass::MutatingExternal,
+            vec![arg("/items/0", ArgRole::Data)],
+        );
+        let proxy = sink("proxy", vec![arg("/request/url", ArgRole::SinkDestination)]);
+        for policy in [transfer, batch, proxy] {
+            custom.tools.insert(policy.name.clone(), policy);
+        }
+        custom
+    }
+
+    #[test]
+    fn nested_undeclared_argument_rejected() {
+        let mut engine = PepEngine::new(
+            intent(recipients(), limits("USD")),
+            nested_pins(),
+            SeqPolicy::Unconstrained,
+            store(),
+        )
+        .unwrap();
+        let host = HostAuthority::for_tests();
+        engine
+            .record_trusted_input(
+                &host,
+                "u1",
+                br#"{"entity":"rcpt_A","amount_minor":100}"#,
+                Confidentiality::Internal,
+            )
+            .unwrap();
+        let smuggled = r#"{"to":{"recipient":"rcpt_A","override_account":"x"},"amount":100}"#;
+        assert_eq!(
+            denied(engine.evaluate_raw(&request(1, "transfer", smuggled))),
+            (GuardId::Canon, PolicyError::UndeclaredArgument)
+        );
+        let deeper = r#"{"to":{"recipient":"rcpt_A"},"amount":100,"x":{"y":1}}"#;
+        assert_eq!(
+            denied(engine.evaluate_raw(&request(2, "transfer", deeper))),
+            (GuardId::Canon, PolicyError::UndeclaredArgument)
+        );
+        let clean = r#"{"to":{"recipient":"rcpt_A"},"amount":100}"#;
+        allowed(engine.evaluate_raw(&request(3, "transfer", clean)));
+    }
+
+    #[test]
+    fn nested_sink_and_array_arguments_checked() {
+        let mut engine = PepEngine::new(
+            intent(invoices(), limits("USD")),
+            nested_pins(),
+            SeqPolicy::Unconstrained,
+            store(),
+        )
+        .unwrap();
+        let redirect =
+            format!(r#"{{"request":{{"url":"{PARTNER}","proxy":"https://evil.example/"}}}}"#);
+        assert_eq!(
+            denied(engine.evaluate_raw(&request(1, "proxy", &redirect))),
+            (GuardId::Canon, PolicyError::UndeclaredArgument)
+        );
+        allow(
+            &mut engine,
+            &request(
+                2,
+                "proxy",
+                &format!(r#"{{"request":{{"url":"{PARTNER}"}}}}"#),
+            ),
+        );
+        assert_eq!(
+            denied(engine.evaluate_raw(&request(3, "batch", r#"{"items":["a","b"]}"#))),
+            (GuardId::Canon, PolicyError::UndeclaredArgument)
+        );
+        // A declared argument covers its whole value, containers included.
+        allow(
+            &mut engine,
+            &request(4, "batch", r#"{"items":[{"any":{"shape":[1,2]}}]}"#),
+        );
+        // A scalar where a declared path needs a container is undeclared too.
+        assert_eq!(
+            denied(engine.evaluate_raw(&request(5, "batch", r#"{"items":"--delete-all"}"#))),
+            (GuardId::Canon, PolicyError::UndeclaredArgument)
+        );
+    }
+
+    #[test]
+    fn checked_read_only_tools_take_no_extra_arguments() {
+        let mut custom = pins();
+        // Trusted output, but only a `Data` argument and no store location.
+        let rate = ToolPolicy {
+            output_label: Label::new(Confidentiality::Internal, Integrity::Trusted),
+            trusted_fields: BTreeSet::from(["/structuredContent/rate".to_owned()]),
+            ..tool(
+                "get_rate",
+                EffectClass::ReadOnly,
+                vec![arg("/pair", ArgRole::Data)],
+            )
+        };
+        // Untrusted output, but an argument a guard checks.
+        let payee = tool(
+            "get_payee",
+            EffectClass::ReadOnly,
+            vec![arg("/recipient", ArgRole::Entity(EntityKind::Recipient))],
+        );
+        let quote = tool(
+            "quote",
+            EffectClass::ReadOnly,
+            vec![arg("/currency", ArgRole::Currency)],
+        );
+        for policy in [rate, payee, quote] {
+            custom.tools.insert(policy.name.clone(), policy);
+        }
+        let mut engine = PepEngine::new(
+            intent(recipients(), limits("USD")),
+            custom,
+            SeqPolicy::Unconstrained,
+            store(),
+        )
+        .unwrap();
+        for (name, arguments) in [
+            (
+                "get_invoice",
+                r#"{"invoice_id":"INV-1001","invoice_number":"INV-6666"}"#,
+            ),
+            ("get_note", r#"{"key":"clean","path":"tainted"}"#),
+            ("get_rate", r#"{"pair":"USDEUR","source":"attacker"}"#),
+            (
+                "get_payee",
+                r#"{"recipient":"rcpt_A","recipient_id":"rcpt_Z"}"#,
+            ),
+            ("quote", r#"{"currency":"USD","to":"EUR"}"#),
+        ] {
+            assert_eq!(
+                denied(engine.evaluate_raw(&request(1, name, arguments))),
+                (GuardId::Canon, PolicyError::UndeclaredArgument),
+                "{name}"
+            );
+        }
+        // A read-only tool with untrusted output, no location and no sink may still take flags.
+        allow(
+            &mut engine,
+            &request(2, "get_ticket", r#"{"ticket_id":"T-1","verbose":true}"#),
+        );
+    }
+
+    // ---- isError ----
+
+    #[test]
+    fn malformed_is_error_never_trusted() {
+        for flag in [r#""true""#, "1", "null", "{}"] {
+            let mut engine = engine();
+            allow(
+                &mut engine,
+                &request(1, "get_invoice", r#"{"invoice_id":"INV-1001"}"#),
+            );
+            let result = format!(
+                r#"{{"isError":{flag},"structuredContent":{{"amount_due_minor":30000,"currency":"USD"}}}}"#
+            );
+            engine.record_result_raw("1", result.as_bytes()).unwrap();
+            assert_eq!(
+                denied(pay(&mut engine, 2, "INV-1001", 30_000)),
+                (GuardId::Label, PolicyError::IntegrityViolation),
+                "isError {flag}"
+            );
+        }
+        let mut engine = engine();
+        allow(
+            &mut engine,
+            &request(1, "get_invoice", r#"{"invoice_id":"INV-1001"}"#),
+        );
+        engine
+            .record_result_raw(
+                "1",
+                br#"{"isError":false,"structuredContent":{"amount_due_minor":30000,"currency":"USD"}}"#,
+            )
+            .unwrap();
+        allowed(pay(&mut engine, 2, "INV-1001", 30_000));
+    }
+
+    // ---- Invisible characters and nested keys ----
+
+    #[test]
+    fn invisible_characters_rejected_in_store_keys() {
+        let stores = pins().stores;
+        for key in [
+            "k\u{200b}1",
+            "k\u{ad}1",
+            "k1\u{fe0f}",
+            "\u{feff}k1",
+            "k\u{2060}1",
+            "k\u{e0041}1",
+            "k\u{180f}1",
+        ] {
+            assert_eq!(
+                StoreKey::new(NOTES, key, &stores),
+                Err(PolicyError::InvalidStoreKey),
+                "{key:?}"
+            );
+        }
+        assert_eq!(
+            StoreKey::new("notes://ag\u{200d}ent", "k1", &stores),
+            Err(PolicyError::InvalidStoreKey)
+        );
+        assert!(StoreKey::new(NOTES, "k\u{e9}1", &stores).is_ok());
+        let mut engine = engine();
+        assert_eq!(
+            denied(engine.evaluate_raw(&request(
+                1,
+                "save_note",
+                "{\"key\":\"k1\u{200b}\",\"text\":\"x\"}"
+            ))),
+            (GuardId::Canon, PolicyError::InvalidStoreKey)
+        );
+    }
+
+    /// The code point field of every `Default_Ignorable_Code_Point` line in
+    /// `DerivedCoreProperties-18.0.0.txt`, one line per entry and in file order, so this list
+    /// can be diffed against the published file.
+    const DEFAULT_IGNORABLE_18_0_0: &str = "
+        00AD
+        034F
+        061C
+        115F..1160
+        17B4..17B5
+        180B..180D
+        180E
+        180F
+        200B..200F
+        202A..202E
+        2060..2064
+        2065
+        2066..206F
+        3164
+        FE00..FE0F
+        FEFF
+        FFA0
+        FFF0..FFF8
+        1BCA0..1BCA3
+        1D173..1D17A
+        E0000
+        E0001
+        E0002..E001F
+        E0020..E007F
+        E0080..E00FF
+        E0100..E01EF
+        E01F0..E0FFF
+    ";
+
+    /// `# Total code points: 4174` at the end of that section.
+    const DEFAULT_IGNORABLE_18_0_0_TOTAL: u32 = 4174;
+
+    #[test]
+    fn default_ignorable_matches_unicode_18_0_0() {
+        let scalar = |hex: &str| char::from_u32(u32::from_str_radix(hex, 16).unwrap()).unwrap();
+        let lines: Vec<(char, char)> = DEFAULT_IGNORABLE_18_0_0
+            .split_whitespace()
+            .map(|field| {
+                let (first, last) = field.split_once("..").unwrap_or((field, field));
+                (scalar(first), scalar(last))
+            })
+            .collect();
+        assert_eq!(lines.len(), 27);
+        let listed = |c: char| {
+            lines
+                .iter()
+                .any(|&(first, last)| (first..=last).contains(&c))
+        };
+
+        // Every Unicode scalar value, so a missing, extra or shifted code point fails here.
+        let mut count = 0;
+        let mut mismatches = Vec::new();
+        for c in char::MIN..=char::MAX {
+            let ignorable = is_default_ignorable(c);
+            if ignorable != listed(c) {
+                mismatches.push(format!("U+{:04X}", u32::from(c)));
+            }
+            if ignorable {
+                count += 1;
+            }
+        }
+        assert!(
+            mismatches.is_empty(),
+            "differs from Unicode 18.0.0: {mismatches:?}"
+        );
+        assert_eq!(count, DEFAULT_IGNORABLE_18_0_0_TOTAL);
+        let total: u32 = lines
+            .iter()
+            .map(|&(first, last)| u32::from(last) - u32::from(first) + 1)
+            .sum();
+        assert_eq!(total, DEFAULT_IGNORABLE_18_0_0_TOTAL);
+
+        // Range edges: adjacent lines merge into the 17 match arms. Both ends of each arm are
+        // ignorable, and the scalar values just outside it are not.
+        let mut arms: Vec<(char, char)> = Vec::new();
+        for &(first, last) in &lines {
+            match arms.last_mut() {
+                Some(arm) if u32::from(arm.1) + 1 == u32::from(first) => arm.1 = last,
+                _ => arms.push((first, last)),
+            }
+        }
+        assert_eq!(arms.len(), 17);
+        for (first, last) in arms {
+            for inside in [first, last] {
+                assert!(is_default_ignorable(inside), "U+{:04X}", u32::from(inside));
+            }
+            let before = u32::from(first).checked_sub(1).and_then(char::from_u32);
+            let after = char::from_u32(u32::from(last) + 1);
+            for outside in [before, after].into_iter().flatten() {
+                assert!(
+                    !is_default_ignorable(outside),
+                    "U+{:04X}",
+                    u32::from(outside)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn store_keys_are_bounded() {
+        let stores = pins().stores;
+        let longest = "k".repeat(MAX_STORE_KEY_BYTES);
+        assert!(StoreKey::new(NOTES, &longest, &stores).is_ok());
+        assert_eq!(
+            StoreKey::new(NOTES, &format!("{longest}k"), &stores),
+            Err(PolicyError::InvalidStoreKey)
+        );
+        let deepest = vec!["a"; MAX_STORE_KEY_SEGMENTS].join("/");
+        assert!(StoreKey::new(NOTES, &deepest, &stores).is_ok());
+        assert_eq!(
+            StoreKey::new(NOTES, &format!("{deepest}/a"), &stores),
+            Err(PolicyError::InvalidStoreKey)
+        );
+        // A request-sized key of `a/a/…` is denied, instead of costing O(segments²) ancestors.
+        let deep = vec!["a"; 400_000].join("/");
+        let mut engine = engine();
+        assert_eq!(
+            denied(engine.evaluate_raw(&request(
+                1,
+                "save_note",
+                &format!(r#"{{"key":"{deep}","text":"x"}}"#)
+            ))),
+            (GuardId::Canon, PolicyError::InvalidStoreKey)
+        );
+    }
+
+    #[test]
+    fn overlapping_stores_rejected() {
+        for extra in [
+            "notes://agent/proj",
+            "notes://agent/",
+            "billing://invoices/2026",
+        ] {
+            let mut custom = pins();
+            custom.stores.insert(
+                extra.to_owned(),
+                KeyPolicy {
+                    case_insensitive: false,
+                },
+            );
+            assert_eq!(
+                config_error(intent(invoices(), limits("USD")), custom),
+                ConfigError::OverlappingStores,
+                "{extra}"
+            );
+        }
+        let with_stores = |extra: [(&str, bool); 2]| {
+            let mut custom = pins();
+            for (uri, case_insensitive) in extra {
+                custom
+                    .stores
+                    .insert(uri.to_owned(), KeyPolicy { case_insensitive });
+            }
+            PepEngine::new(
+                intent(invoices(), limits("USD")),
+                custom,
+                SeqPolicy::Unconstrained,
+                store(),
+            )
+            .err()
+        };
+        // On a case-insensitive backend these two stores reach the same records.
+        let folded = [
+            ("files://share/Finance", true),
+            ("files://share/finance/2026", false),
+        ];
+        assert_eq!(
+            with_stores(folded),
+            Some(PepError::InvalidConfig(ConfigError::OverlappingStores))
+        );
+        let distinct = [
+            ("files://share/Finance", false),
+            ("files://share/finance/2026", false),
+        ];
+        assert_eq!(with_stores(distinct), None);
+        let separate = [("notes://agent2", false), ("billing://invoices2", true)];
+        assert_eq!(with_stores(separate), None);
+    }
+
+    #[test]
+    fn store_key_ancestors() {
+        let stores = pins().stores;
+        let key = StoreKey::new(NOTES, "a/b/c", &stores).unwrap();
+        let ancestors: Vec<String> = key
+            .ancestors()
+            .map(|ancestor| ancestor.key().to_owned())
+            .collect();
+        assert_eq!(ancestors, ["a", "a/b"]);
+        assert!(key.ancestors().all(|ancestor| ancestor.uri() == NOTES));
+        let flat = StoreKey::new(NOTES, "k1", &stores).unwrap();
+        assert_eq!(flat.ancestors().count(), 0);
+    }
+
+    #[test]
+    fn sub_key_write_taints_parent_record() {
+        let mut engine = engine();
+        allow(
+            &mut engine,
+            &request(
+                1,
+                "update_invoice",
+                r#"{"invoice_id":"INV-1001/lines/1","amount_due_minor":30000}"#,
+            ),
+        );
+        lookup(&mut engine, 2, "INV-1001", "30000", "USD");
+        assert_eq!(
+            latest_leaf(&engine, "/structuredContent/amount_due_minor")
+                .label
+                .integ,
+            Integrity::UntrustedAgentWrite
+        );
+        assert_eq!(
+            denied(pay(&mut engine, 3, "INV-1001", 30_000)),
+            (GuardId::Label, PolicyError::IntegrityViolation)
+        );
+    }
+
+    fn note_integrity(writer_key: &str, reader_key: &str) -> Integrity {
+        let shared = store();
+        let mut writer = engine_on(&shared, invoices(), limits("USD"));
+        let write = format!(r#"{{"key":"{writer_key}","text":"x"}}"#);
+        allow(&mut writer, &request(1, "save_note", &write));
+        let mut reader = engine_on(&shared, invoices(), limits("USD"));
+        let read = format!(r#"{{"key":"{reader_key}"}}"#);
+        allow(&mut reader, &request(1, "get_note", &read));
+        reader
+            .record_result_raw("1", br#"{"structuredContent":{"body":"hello"}}"#)
+            .unwrap();
+        latest_leaf(&reader, "/structuredContent/body").label.integ
+    }
+
+    #[test]
+    fn nested_key_taint_reaches_parents_and_children_not_siblings() {
+        assert_eq!(
+            note_integrity("proj/a/b", "proj"),
+            Integrity::UntrustedAgentWrite
+        );
+        assert_eq!(
+            note_integrity("proj", "proj/a/b"),
+            Integrity::UntrustedAgentWrite
+        );
+        assert_eq!(
+            note_integrity("proj/a", "proj/b"),
+            Integrity::UntrustedExternal
+        );
+        assert_eq!(
+            note_integrity("proj/a", "proj/a"),
+            Integrity::UntrustedAgentWrite
+        );
+    }
+
+    #[test]
+    fn nested_key_write_uses_one_quota_entry_per_level() {
+        let mut engine = engine();
+        allow(
+            &mut engine,
+            &request(1, "save_note", r#"{"key":"a/b/c","text":"x"}"#),
+        );
+        // `Location(a/b/c)`, `Below(a)` and `Below(a/b)`; "x" is too short to be indexed.
+        assert_eq!(
+            engine.state().label_quota_remaining,
+            MAX_LABEL_ENTRIES_PER_EPISODE - 3
+        );
+    }
+
+    // ---- A payment is never planned without its inputs ----
+
+    #[test]
+    fn payment_inputs_fail_closed() {
+        let payment = pay_invoice();
+        assert_eq!(
+            payment_inputs(&payment, Some(100), Some(("INV-1001".to_owned(), 1)), None).err(),
+            Some(deny(GuardId::Prov, PolicyError::ProvenanceMissing))
+        );
+        assert_eq!(
+            payment_inputs(&payment, None, None, None).err(),
+            Some(deny(GuardId::Prov, PolicyError::ProvenanceMissing))
+        );
+        let read_only = get_invoice();
+        assert!(matches!(
+            payment_inputs(&read_only, None, None, None),
+            Ok(None)
+        ));
     }
 }

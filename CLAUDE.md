@@ -1,7 +1,7 @@
 # CLAUDE.md — pep-sidecar Operational & Security Rules
-```
+
 ## 1. Project Overview
-`pep-sidecar` is an OS-isolated, stateful OAuth-native Policy Enforcement Point (PEP) sidecar for AI agent payments and tool execution, written in Rust `1.97.0` (Edition `2024`, MSRV `1.88`). Everything architectural is specified in `@SPEC.md`.
+`pep-sidecar` is an OS-isolated, stateful OAuth-native Policy Enforcement Point (PEP) sidecar for AI agent payments and tool execution, written in Rust `1.97.1` (Edition `2024`, MSRV `1.88`). Everything architectural is specified in `@SPEC.md`.
 ## 2. Mandatory Verification Loop (Run After Every Edit)
 `cargo` is not installed on Windows; run all `cargo` commands inside WSL2 (`wsl.exe`) with `CARGO_TARGET_DIR=$HOME/.cargo-target/pep-sidecar` and `RUSTFLAGS='-D warnings'`.
 Never declare a task complete until all five commands pass with zero warnings:
@@ -13,7 +13,7 @@ cargo clippy --all-targets --features lenient-numbers -- -D warnings && cargo te
 cargo clippy --all-targets --target aarch64-apple-darwin -- -D warnings
 ```
 
-3. Strict Rust & Clippy Coding Rules (NEVER Violate)
+## 3. Strict Rust & Clippy Coding Rules (NEVER Violate)
 
 Cargo.toml enforces [lints.rust] and [lints.clippy] with -D warnings. Do NOT weaken or remove lints in Cargo.toml, and never add #[allow(...)] or #[expect(...)] in library code without explicit approval and a documented reason.
 
@@ -42,7 +42,7 @@ Cargo.toml enforces [lints.rust] and [lints.clippy] with -D warnings. Do NOT wea
 
     No Default on Policy Types: Never derive or implement Default on Budget, Limits, or policy structs. Use explicit constructors like Budget::empty().
 
-4. Non-Negotiable Security Invariants (F-03 to F-16)
+## 4. Non-Negotiable Security Invariants (F-03 to F-16)
 
     Wire-Level JCS Parsing (F-03, F-04, F-05):
 

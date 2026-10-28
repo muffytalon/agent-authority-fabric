@@ -85,6 +85,13 @@ pub enum JcsError {
         /// Byte offset of the backslash that starts the escape.
         offset: usize,
     },
+    /// A Unicode noncharacter (U+FDD0 to U+FDEF, or U+xFFFE and U+xFFFF in any plane). I-JSON
+    /// forbids them (RFC 7493 §2.1), and RFC 8785 §3.1 requires I-JSON input.
+    #[error("noncharacter at byte {offset}")]
+    Noncharacter {
+        /// Byte offset of the character, or of the backslash that starts its escape.
+        offset: usize,
+    },
     /// A number with a leading zero, such as `00` or `-01`.
     #[error("leading zero at byte {offset}")]
     LeadingZero {
@@ -148,6 +155,7 @@ impl JcsError {
             | Self::ControlCharInString { offset }
             | Self::InvalidEscape { offset }
             | Self::LoneSurrogate { offset }
+            | Self::Noncharacter { offset }
             | Self::LeadingZero { offset }
             | Self::NumberOutOfRange { offset }
             | Self::NonIntegerNumber { offset }
@@ -182,11 +190,13 @@ pub struct ParseOptions {
     pub max_depth: usize,
     /// Maximum number of values, containers included.
     pub max_nodes: usize,
+    /// Whether to reject Unicode noncharacters, as I-JSON requires.
+    pub reject_noncharacters: bool,
 }
 
 impl ParseOptions {
     /// The request profile: safe integers only (fractions too with `lenient-numbers`), 1 MiB,
-    /// depth 64 and 8192 values.
+    /// depth 64, 8192 values and no noncharacters.
     #[must_use]
     pub const fn request() -> Self {
         Self {
@@ -194,10 +204,12 @@ impl ParseOptions {
             max_bytes: MAX_REQUEST_BYTES,
             max_depth: MAX_DEPTH,
             max_nodes: MAX_REQUEST_NODES,
+            reject_noncharacters: true,
         }
     }
 
     /// The tool-result profile: any finite number, depth 64, and the given size limits.
+    /// Noncharacters are accepted, because results carry arbitrary text from tools.
     #[must_use]
     pub const fn result(max_bytes: usize, max_nodes: usize) -> Self {
         Self {
@@ -205,6 +217,7 @@ impl ParseOptions {
             max_bytes,
             max_depth: MAX_DEPTH,
             max_nodes,
+            reject_noncharacters: false,
         }
     }
 }
@@ -447,7 +460,18 @@ impl JcsValue {
         Some(current)
     }
 
+    /// Calls `visit(depth, value)` for every value in the tree, in pre-order (the root has depth
+    /// 0), without building pointers.
+    pub fn walk<F: FnMut(usize, &JcsValue)>(&self, visit: &mut F) {
+        walk_nodes(self, 0, visit);
+    }
+
     /// Every value in the tree, in pre-order, with its pointer and depth.
+    ///
+    /// Every value gets its own pointer string, so this costs O(values × path length) bytes:
+    /// one long key above a large array turns kilobytes of JSON into gigabytes. Use
+    /// [`JcsValue::walk`] when the pointers are not needed, and bound the pointer bytes yourself
+    /// before calling this on untrusted input.
     #[must_use]
     pub fn nodes(&self) -> Vec<Node<'_>> {
         let mut out = Vec::new();
@@ -455,7 +479,8 @@ impl JcsValue {
         out
     }
 
-    /// Every scalar value in the tree, in pre-order, with its pointer and depth.
+    /// Every scalar value in the tree, in pre-order, with its pointer and depth. It has the
+    /// same pointer cost as [`JcsValue::nodes`].
     #[must_use]
     pub fn leaves(&self) -> Vec<Node<'_>> {
         self.nodes()
@@ -624,7 +649,10 @@ fn nfc(text: String) -> String {
     }
 }
 
-fn unescape_pointer_token(raw: &str) -> Option<String> {
+/// Unescapes one RFC 6901 reference token: `~0` becomes `~` and `~1` becomes `/` (so `~01` is
+/// `~1`). Returns `None` for any other use of `~`.
+#[must_use]
+pub fn unescape_pointer_token(raw: &str) -> Option<String> {
     let mut out = String::with_capacity(raw.len());
     let mut chars = raw.chars();
     while let Some(c) = chars.next() {
@@ -656,6 +684,24 @@ fn parse_array_index(token: &str) -> Option<usize> {
         return None;
     }
     token.parse().ok()
+}
+
+fn walk_nodes<F: FnMut(usize, &JcsValue)>(value: &JcsValue, depth: usize, visit: &mut F) {
+    visit(depth, value);
+    let child_depth = depth.saturating_add(1);
+    match value {
+        JcsValue::Array(items) => {
+            for item in items {
+                walk_nodes(item, child_depth, visit);
+            }
+        }
+        JcsValue::Object(object) => {
+            for (_, item) in &object.entries {
+                walk_nodes(item, child_depth, visit);
+            }
+        }
+        JcsValue::Null | JcsValue::Bool(_) | JcsValue::Number(_) | JcsValue::String(_) => {}
+    }
 }
 
 fn collect_nodes<'a>(value: &'a JcsValue, pointer: &str, depth: usize, out: &mut Vec<Node<'a>>) {
@@ -736,6 +782,12 @@ fn push_control_escape(out: &mut String, code: u32) {
     out.push_str("\\u00");
     out.push(if code < 0x10 { '0' } else { '1' });
     out.push(char::from_digit(code & 0x0F, 16).unwrap_or('0'));
+}
+
+/// U+FDD0 to U+FDEF, and the last two code points of every plane.
+fn is_noncharacter(c: char) -> bool {
+    let code = u32::from(c);
+    (0xFDD0..=0xFDEF).contains(&code) || code & 0xFFFE == 0xFFFE
 }
 
 struct Member {
@@ -997,9 +1049,21 @@ impl Cursor<'_> {
         let end = start.checked_add(width).ok_or(invalid)?;
         let bytes = self.buf.get(start..end).ok_or(invalid)?;
         let text = core::str::from_utf8(bytes).map_err(|_| invalid)?;
+        for c in text.chars() {
+            self.check_char(c, start)?;
+        }
         out.push_str(text);
         self.pos = end;
         Ok(())
+    }
+
+    /// Rejects a noncharacter when the profile asks for it.
+    fn check_char(&self, c: char, offset: usize) -> Result<(), JcsError> {
+        if self.options.reject_noncharacters && is_noncharacter(c) {
+            Err(JcsError::Noncharacter { offset })
+        } else {
+            Ok(())
+        }
     }
 
     fn escape(&mut self, out: &mut String) -> Result<(), JcsError> {
@@ -1048,12 +1112,14 @@ impl Cursor<'_> {
                 .next()
                 .and_then(Result::ok)
                 .ok_or(lone)?;
+            self.check_char(decoded, start)?;
             out.push(decoded);
         } else if (0xDC00..=0xDFFF).contains(&unit) {
             return Err(lone);
         } else {
             let decoded =
                 char::from_u32(u32::from(unit)).ok_or(JcsError::InvalidEscape { offset: start })?;
+            self.check_char(decoded, start)?;
             out.push(decoded);
         }
         Ok(())
@@ -1203,6 +1269,14 @@ mod tests {
             digest(b"{}").unwrap(),
             "sha-256:RBNvo1WzZ4oRRq0W9-hknpT7T8If536DEMBg9hyq_4o"
         );
+    }
+
+    /// `SPEC.md` §2 records the Unicode version of the NFC tables. A crate upgrade that changes
+    /// the tables changes the digest of any text with characters they newly cover, so it must
+    /// fail here and come with a SPEC update and the conformance vectors rerun.
+    #[test]
+    fn nfc_tables_are_unicode_18_0_0() {
+        assert_eq!(unicode_normalization::UNICODE_VERSION, (18, 0, 0));
     }
 
     #[test]
@@ -1564,5 +1638,52 @@ mod tests {
     #[test]
     fn error_offset_accessor() {
         assert_eq!(err(b"[1,]").offset(), 3);
+    }
+
+    #[test]
+    fn noncharacters_rejected_in_requests() {
+        for (input, offset) in [
+            (format!("\"{}\"", u("ffff")), 1),
+            (format!("\"a{}\"", u("fdd0")), 2),
+            (format!("\"{}\"", u("fdef")), 1),
+            (format!("\"{}{}\"", u("d83f"), u("dffe")), 1),
+            (format!(r#"{{"{}":1}}"#, u("fffe")), 2),
+        ] {
+            assert_eq!(
+                err(input.as_bytes()),
+                JcsError::Noncharacter { offset },
+                "{input}"
+            );
+        }
+        assert_eq!(
+            err(&[b'"', 0xEF, 0xBF, 0xBF, b'"']),
+            JcsError::Noncharacter { offset: 1 }
+        );
+        assert_eq!(
+            err(&[b'"', b'x', 0xF4, 0x8F, 0xBF, 0xBF, b'"']),
+            JcsError::Noncharacter { offset: 2 }
+        );
+        assert_eq!(err(&[b'"', 0xEF, 0xBF, 0xBF, b'"']).offset(), 1);
+        for allowed in [u("fffd"), u("fdcf"), u("fdf0"), u("e000")] {
+            assert!(
+                parse(format!("\"{allowed}\"").as_bytes()).is_ok(),
+                "{allowed}"
+            );
+        }
+        let result = ParseOptions::result(1024, 64);
+        assert!(parse_with(format!("\"{}\"", u("ffff")).as_bytes(), &result).is_ok());
+    }
+
+    #[test]
+    fn walk_matches_nodes_without_pointers() {
+        let value = parse(br#"{"a":[1,{"b":"x"}],"c/d":null}"#).unwrap();
+        let mut walked = Vec::new();
+        value.walk(&mut |depth, node| walked.push((depth, node.clone())));
+        let expected: Vec<(usize, JcsValue)> = value
+            .nodes()
+            .into_iter()
+            .map(|node| (node.depth, node.value.clone()))
+            .collect();
+        assert_eq!(walked, expected);
     }
 }

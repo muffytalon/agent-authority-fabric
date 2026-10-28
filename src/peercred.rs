@@ -4,25 +4,41 @@
 //! owned by the effective user and not writable by group or others cannot have its entries
 //! created, renamed or removed by any other non-root principal between the check and the bind.
 //! Others cannot traverse it either, so the gap between `bind` and `chmod` only admits the
-//! intended group. The remaining assumption is that the parent's ancestors (for example `/run`)
-//! are root-owned.
+//! intended group. Every ancestor of the parent's canonical path is checked as well (owned by
+//! root or the effective user, and not writable by group or others unless sticky), so no other
+//! user can swap the parent itself, and the socket is bound under that canonical path.
+//!
+//! On Linux a new socket takes the parent's group only when the parent is setgid (or the
+//! process's effective group already is that group), so `/run/pep` should be mode `2750`. The
+//! bind fails otherwise, rather than leaving a socket the agent's group cannot open.
 //!
 //! The peer PID is advisory until the Week 2 `SO_PEERPIDFD` upgrade.
 
-use std::fs::{self, Permissions};
+use std::fs::{self, Metadata, Permissions};
 use std::io;
 use std::os::fd::AsFd;
 use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _, PermissionsExt as _};
-use std::os::unix::net::UnixListener;
-use std::path::Path;
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::{Component, Path};
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::thread;
+use std::time::Duration;
 
 use nix::sys::socket::{getsockopt, sockopt};
 use nix::unistd::geteuid;
 
 /// Mode of the bound socket.
 pub const SOCKET_MODE: u32 = 0o660;
+/// How long the probe of an existing socket may wait for its connect before the socket counts
+/// as live.
+pub const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 /// Parent-directory permission bits that must be clear: group write and everything for others.
 pub const FORBIDDEN_PARENT_BITS: u32 = 0o027;
+/// Ancestor permission bits that must be clear unless the ancestor is sticky: group write and
+/// other write.
+pub const FORBIDDEN_ANCESTOR_BITS: u32 = 0o022;
+
+const STICKY_BIT: u32 = 0o1000;
 
 /// Errors from peer-credential checks and socket binding.
 #[derive(Debug, thiserror::Error)]
@@ -44,9 +60,23 @@ pub enum PeerError {
     /// The socket path is relative.
     #[error("socket path is not absolute")]
     PathNotAbsolute,
+    /// The socket path contains a `..` component.
+    #[error("socket path contains a parent-directory component")]
+    PathHasParentComponent,
     /// The socket path has no parent directory.
     #[error("socket path has no parent directory")]
     NoParent,
+    /// An ancestor of the parent directory would let another user replace the parent.
+    #[error("ancestor directory (owner {owner}, mode {mode:o}) is not safe")]
+    AncestorUnsafe {
+        /// The ancestor's owner.
+        owner: u32,
+        /// The ancestor's permission bits.
+        mode: u32,
+    },
+    /// The parent directory changed while it was being checked.
+    #[error("parent directory changed during the check")]
+    ParentChanged,
     /// The parent directory is a symbolic link.
     #[error("parent directory is a symlink")]
     ParentIsSymlink,
@@ -78,11 +108,22 @@ pub enum PeerError {
         /// The socket's owner.
         actual: u32,
     },
+    /// A process is still listening on the existing socket (for example another PEP instance).
+    #[error("a live socket already exists at the path")]
+    SocketInUse,
     /// The bound socket does not have mode 0660 or is not ours.
     #[error("bound socket mode {mode:o} is not 0660")]
     SocketModeMismatch {
         /// The socket's permission bits.
         mode: u32,
+    },
+    /// The bound socket did not get the parent directory's group (make the parent setgid).
+    #[error("bound socket group {actual} is not the parent's group {expected}")]
+    SocketGroupMismatch {
+        /// The parent directory's group.
+        expected: u32,
+        /// The socket's group.
+        actual: u32,
     },
 }
 
@@ -147,11 +188,15 @@ pub fn require_peer_uid<F: AsFd>(socket: &F, expected: u32) -> Result<PeerCred, 
 
 /// Binds a Unix listener at `path` without TOCTOU races.
 ///
-/// 1. `path` must be absolute.
+/// 1. `path` must be absolute and have no `..` component.
 /// 2. Its parent must be a real directory (not a symlink) owned by the effective uid, with
-///    none of [`FORBIDDEN_PARENT_BITS`] set.
-/// 3. An existing file at `path` is unlinked only if it is a socket owned by the effective uid.
-/// 4. The socket is bound, set to [`SOCKET_MODE`], and checked again.
+///    none of [`FORBIDDEN_PARENT_BITS`] set. Every ancestor of the parent's canonical path must
+///    be a directory owned by root or the effective uid, with none of
+///    [`FORBIDDEN_ANCESTOR_BITS`] set unless it is sticky.
+/// 3. An existing file at `path` is unlinked only if it is a socket owned by the effective uid
+///    that no process is listening on.
+/// 4. The socket is bound under the parent's canonical path, set to [`SOCKET_MODE`], and checked
+///    again, including that it carries the parent's group.
 ///
 /// # Errors
 ///
@@ -160,20 +205,43 @@ pub fn bind_safe_listener(path: &Path) -> Result<UnixListener, PeerError> {
     if !path.is_absolute() {
         return Err(PeerError::PathNotAbsolute);
     }
+    if path
+        .components()
+        .any(|component| component == Component::ParentDir)
+    {
+        return Err(PeerError::PathHasParentComponent);
+    }
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .ok_or(PeerError::NoParent)?;
+    let name = path.file_name().ok_or(PeerError::NoParent)?;
     let euid = geteuid().as_raw();
-    check_parent(parent, euid)?;
-    check_existing(path, euid)?;
-    let listener = UnixListener::bind(path)?;
-    fs::set_permissions(path, Permissions::from_mode(SOCKET_MODE))?;
-    verify_bound(path, euid)?;
+    let checked = check_parent(parent, euid)?;
+    let real_parent = fs::canonicalize(parent)?;
+    check_ancestors(&real_parent, euid)?;
+    let real = fs::symlink_metadata(&real_parent)?;
+    if (real.dev(), real.ino()) != (checked.dev(), checked.ino()) {
+        return Err(PeerError::ParentChanged);
+    }
+    let socket = real_parent.join(name);
+    check_existing(&socket, euid)?;
+    let listener = UnixListener::bind(&socket)?;
+    let finished = fs::set_permissions(&socket, Permissions::from_mode(SOCKET_MODE))
+        .map_err(PeerError::from)
+        .and_then(|()| verify_bound(&socket, euid, checked.gid()));
+    if let Err(error) = finished {
+        // Do not leave a socket with the wrong mode or group behind. This call created it, in
+        // a directory no other user can write to, so removing it cannot touch anyone else's
+        // file.
+        drop(listener);
+        drop(fs::remove_file(&socket));
+        return Err(error);
+    }
     Ok(listener)
 }
 
-fn check_parent(parent: &Path, euid: u32) -> Result<(), PeerError> {
+fn check_parent(parent: &Path, euid: u32) -> Result<Metadata, PeerError> {
     let metadata = fs::symlink_metadata(parent)?;
     let file_type = metadata.file_type();
     if file_type.is_symlink() {
@@ -192,6 +260,22 @@ fn check_parent(parent: &Path, euid: u32) -> Result<(), PeerError> {
     if mode & FORBIDDEN_PARENT_BITS != 0 {
         return Err(PeerError::ParentModeTooPermissive { mode });
     }
+    Ok(metadata)
+}
+
+/// Checks every ancestor of the canonical parent path. A sticky directory (like `/tmp`) may be
+/// world-writable, because others still cannot rename or remove entries they do not own.
+fn check_ancestors(real_parent: &Path, euid: u32) -> Result<(), PeerError> {
+    for ancestor in real_parent.ancestors().skip(1) {
+        let metadata = fs::symlink_metadata(ancestor)?;
+        let owner = metadata.uid();
+        let mode = metadata.mode() & 0o7777;
+        let trusted_owner = owner == 0 || owner == euid;
+        let writable_by_others = mode & FORBIDDEN_ANCESTOR_BITS != 0 && mode & STICKY_BIT == 0;
+        if !metadata.file_type().is_dir() || !trusted_owner || writable_by_others {
+            return Err(PeerError::AncestorUnsafe { owner, mode });
+        }
+    }
     Ok(())
 }
 
@@ -209,17 +293,56 @@ fn check_existing(path: &Path, euid: u32) -> Result<(), PeerError> {
                     actual: metadata.uid(),
                 });
             }
+            // Only a stale socket may be replaced: unlinking a live one would silently orphan
+            // the instance still listening on it.
+            if socket_is_live(path)? {
+                return Err(PeerError::SocketInUse);
+            }
             fs::remove_file(path)?;
             Ok(())
         }
     }
 }
 
-fn verify_bound(path: &Path, euid: u32) -> Result<(), PeerError> {
+/// Whether a process listens on the socket at `path`. A connection that is refused means the
+/// socket is stale. A connect that neither succeeds nor fails within [`PROBE_TIMEOUT`] means a
+/// listener exists whose backlog is full (the agent's group can fill it), which is live too:
+/// a plain blocking connect would hang here forever. The probe runs on its own thread, which
+/// is left behind if it never returns.
+///
+/// Two gaps remain. On macOS a full backlog is refused at once, so a busy live socket there
+/// still looks stale. And the probe and the unlink are not atomic: two instances of the same
+/// user starting at the same moment on one stale socket can both see it as stale, and the
+/// second unlink then orphans the first listener. An exclusive lock on a sibling lock file,
+/// held for the listener's lifetime (`nix::fcntl::Flock`, behind nix's `fs` feature), would
+/// close both.
+fn socket_is_live(path: &Path) -> Result<bool, PeerError> {
+    let (sender, receiver) = mpsc::channel();
+    let target = path.to_path_buf();
+    thread::Builder::new()
+        .name("pep-socket-probe".to_owned())
+        .spawn(move || drop(sender.send(UnixStream::connect(&target).map(drop))))?;
+    match receiver.recv_timeout(PROBE_TIMEOUT) {
+        Ok(Ok(())) | Err(RecvTimeoutError::Timeout) => Ok(true),
+        Ok(Err(error)) if error.kind() == io::ErrorKind::ConnectionRefused => Ok(false),
+        Ok(Err(error)) => Err(PeerError::Io(error)),
+        Err(RecvTimeoutError::Disconnected) => Err(PeerError::Io(io::Error::other(
+            "socket probe thread failed",
+        ))),
+    }
+}
+
+fn verify_bound(path: &Path, euid: u32, parent_gid: u32) -> Result<(), PeerError> {
     let metadata = fs::symlink_metadata(path)?;
     let mode = metadata.mode() & 0o777;
     if !metadata.file_type().is_socket() || metadata.uid() != euid || mode != SOCKET_MODE {
         return Err(PeerError::SocketModeMismatch { mode });
+    }
+    if metadata.gid() != parent_gid {
+        return Err(PeerError::SocketGroupMismatch {
+            expected: parent_gid,
+            actual: metadata.gid(),
+        });
     }
     Ok(())
 }
@@ -387,5 +510,114 @@ mod tests {
             bind_safe_listener(&dir.socket()),
             Err(PeerError::ParentOwnerMismatch { .. })
         ));
+    }
+
+    #[test]
+    fn live_socket_not_replaced() {
+        let dir = TempDir::with_mode(0o750);
+        let path = dir.socket();
+        let listener = bind_safe_listener(&path).unwrap();
+        assert!(matches!(
+            bind_safe_listener(&path),
+            Err(PeerError::SocketInUse)
+        ));
+        let _client = UnixStream::connect(&path).unwrap();
+        listener.accept().unwrap();
+    }
+
+    #[test]
+    fn parent_dir_component_rejected() {
+        let dir = TempDir::with_mode(0o750);
+        fs::create_dir(dir.path.join("x")).unwrap();
+        assert!(matches!(
+            bind_safe_listener(&dir.path.join("x/../mcp.sock")),
+            Err(PeerError::PathHasParentComponent)
+        ));
+    }
+
+    #[test]
+    fn writable_ancestor_rejected_unless_sticky() {
+        let outer = TempDir::with_mode(0o777);
+        let inner = outer.path.join("inner");
+        fs::create_dir(&inner).unwrap();
+        fs::set_permissions(&inner, Permissions::from_mode(0o750)).unwrap();
+        assert!(matches!(
+            bind_safe_listener(&inner.join("mcp.sock")),
+            Err(PeerError::AncestorUnsafe { mode: 0o777, .. })
+        ));
+        fs::set_permissions(&outer.path, Permissions::from_mode(0o1777)).unwrap();
+        let _listener = bind_safe_listener(&inner.join("mcp.sock")).unwrap();
+    }
+
+    #[test]
+    fn symlinked_ancestor_binds_under_canonical_path() {
+        let dir = TempDir::with_mode(0o750);
+        let real = dir.path.join("real");
+        fs::create_dir(&real).unwrap();
+        fs::set_permissions(&real, Permissions::from_mode(0o750)).unwrap();
+        let link = dir.path.join("link");
+        std::os::unix::fs::symlink(&dir.path, &link).unwrap();
+        let listener = bind_safe_listener(&link.join("real/mcp.sock")).unwrap();
+        let canonical = fs::canonicalize(&real).unwrap().join("mcp.sock");
+        assert_eq!(
+            listener.local_addr().unwrap().as_pathname(),
+            Some(canonical.as_path())
+        );
+        assert!(
+            fs::symlink_metadata(&canonical)
+                .unwrap()
+                .file_type()
+                .is_socket()
+        );
+    }
+
+    #[test]
+    #[ignore = "opens about 4,100 sockets to fill the listen backlog (needs a high fd limit)"]
+    fn full_backlog_counts_as_live() {
+        let dir = TempDir::with_mode(0o750);
+        let path = dir.socket();
+        let _listener = bind_safe_listener(&path).unwrap();
+        // Queue connections nobody accepts until one no longer gets through.
+        let mut queued = Vec::new();
+        let full = loop {
+            let (sender, receiver) = mpsc::channel();
+            let target = path.clone();
+            thread::spawn(move || drop(sender.send(UnixStream::connect(&target))));
+            match receiver.recv_timeout(Duration::from_millis(500)) {
+                Ok(stream) => queued.push(stream.unwrap()),
+                Err(_) => break true,
+            }
+            if queued.len() > 100_000 {
+                break false;
+            }
+        };
+        assert!(full, "the listen backlog never filled");
+        let (sender, receiver) = mpsc::channel();
+        let target = path.clone();
+        thread::spawn(move || drop(sender.send(bind_safe_listener(&target).map(drop))));
+        let result = receiver
+            .recv_timeout(PROBE_TIMEOUT * 5)
+            .expect("bind_safe_listener hung on a full backlog");
+        assert!(matches!(result, Err(PeerError::SocketInUse)));
+    }
+
+    #[test]
+    #[ignore = "needs root: gives the parent directory a group the process is not in"]
+    fn socket_group_must_match_parent() {
+        let dir = TempDir::with_mode(0o750);
+        std::os::unix::fs::chown(&dir.path, None, Some(65_534)).unwrap();
+        fs::set_permissions(&dir.path, Permissions::from_mode(0o750)).unwrap();
+        assert!(matches!(
+            bind_safe_listener(&dir.socket()),
+            Err(PeerError::SocketGroupMismatch {
+                expected: 65_534,
+                ..
+            })
+        ));
+        // The rejected socket is removed, not left behind with the wrong group.
+        assert!(fs::symlink_metadata(dir.socket()).is_err());
+        fs::set_permissions(&dir.path, Permissions::from_mode(0o2750)).unwrap();
+        let _listener = bind_safe_listener(&dir.socket()).unwrap();
+        assert_eq!(fs::symlink_metadata(dir.socket()).unwrap().gid(), 65_534);
     }
 }

@@ -12,7 +12,7 @@
 - `origin_hash = digest({"source_call_id": cid, "tool": tool, "query_digest": qd, "result_pointer": ptr, "value": val})`
 - **`JCS_strict_NFC` Profile (RFC 8785 + I-JSON + Unicode NFC):**
   - Input at most 1 MiB, depth at most 64, no BOM, no trailing data.
-  - NFC on strings and keys before UTF-16 sorting; record the Unicode version the pinned `unicode-normalization` crate implements (`unicode-normalization = "=0.1.26"`, Unicode 16.0).
+  - NFC on strings and keys before UTF-16 sorting; record the Unicode version the pinned `unicode-normalization` crate implements (`unicode-normalization = "=0.1.26"`, Unicode 18.0.0, i.e. `unicode_normalization::UNICODE_VERSION == (18, 0, 0)`).
   - Duplicate keys rejected after NFC.
   - Integers within `±(2^53 - 1)` (`[-9007199254740991, 9007199254740991]`); `-0` becomes `0`.
   - Key order differs from the RFC 8785 `U+FB33` example because of NFC (`U+FB33` decomposes to `U+05D3 U+05BC` before UTF-16 sorting).

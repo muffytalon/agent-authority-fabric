@@ -1,6 +1,7 @@
+# Pinned per CLAUDE.md §1. The 1.97.1 point release (2026-07-16) only fixes an LLVM
+# miscompilation that 1.97.0 made more likely (rust-lang/rust#159035).
 [toolchain]
-# Pinned per SPEC; note a 1.97.1 point release exists (2026-07-16).
-channel = "1.97.0"
+channel = "1.97.1"
 profile = "minimal"
 components = ["clippy", "rustfmt"]
 # macOS cross-lint of peercred from Linux.
