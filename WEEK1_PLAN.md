@@ -3,7 +3,7 @@
 Status: approved 2026-10-24. Updated 2026-10-28 to match the code after the 27 Oct review fixes (`claude/pep-sidecar-week1-code-review.md`) and the 27 Oct crate re-verification. Revised 2026-10-28 to match the code after the review fixes.
 
 ## Context
-Week 1 delivers a single crate, `pep-sidecar`, with four library modules: `lib`, `jcs`, `engine` and `peercred`. They must pass all five commands of the CLAUDE.md §2 loop (the fifth is the macOS cross-lint).
+Week 1 delivers a single crate, `pep-sidecar`, with four library modules: `lib`, `jcs`, `engine` and `peercred`. They must pass all six commands of the CLAUDE.md §2 loop (the fifth is the macOS cross-lint, the sixth `cargo deny check`).
 
 Decisions:
 | Topic | Decision |
@@ -218,6 +218,7 @@ cargo clippy --all-targets -- -D warnings
 cargo test -- --nocapture
 cargo clippy --all-targets --features lenient-numbers -- -D warnings && cargo test --features lenient-numbers
 cargo clippy --all-targets --target aarch64-apple-darwin -- -D warnings
+cargo deny check
 ```
 
 ## Risks
@@ -226,11 +227,12 @@ cargo clippy --all-targets --target aarch64-apple-darwin -- -D warnings
 - **Case-insensitive stores take ASCII keys only.** A collation such as `utf8mb4_0900_ai_ci` also folds accents and width, which the PEP can't reproduce, so non-ASCII keys are rejected there.
 - **Short-value laundering through a backend copy** to a different location isn't caught by taint. The value must still be the latest Trusted lookup for the Entity, in the right currency.
 - **Remaining limits:** low-entropy long strings can still be content-indexed; bindings accept only the exact amount; hashing costs O(bytes × depth). All three are to be measured in Weeks 2 and 4.
-- **Unicode version skew.** Every digest and F-07 key depends on the NFC tables, which are Unicode 18.0.0 in `unicode-normalization 0.1.26`. A peer that recomputes `action_digest` with older Unicode data, such as the broker (SPEC §1), produces different bytes for strings containing characters newer than its tables, and so rejects legitimate calls. A crate bump changes digests in the same way. The test `nfc_tables_are_unicode_18_0_0` makes a bump fail loudly, and `default_ignorable_matches_unicode_18_0_0` pins the hand-written ignorable list to the same Unicode 18.0.0 data, but every peer must pin the same Unicode version. The Unicode version of the Python used for the §6 cross-check is not recorded.
-- **Untested MSRV.** `Cargo.toml` declares `rust-version = "1.88"`, but `rust-toolchain.toml` pins 1.97.1, so none of the verification commands compiles with 1.88. `sha2 0.11.1` needs exactly 1.88, and both sha2 and thiserror have raised their MSRV in patch releases, so the exact `=` pins are what stop a dependency from moving past 1.88.
+- **Unicode version skew.** Every digest and F-07 key depends on the NFC tables, which are Unicode 18.0.0 in `unicode-normalization 0.1.26`. A peer that recomputes `action_digest` with older Unicode data, such as the broker (SPEC §1), produces different bytes for strings containing characters newer than its tables, and so rejects legitimate calls. A crate bump changes digests in the same way. The test `nfc_tables_are_unicode_18_0_0` makes a bump fail loudly, and `default_ignorable_matches_unicode_18_0_0` pins the hand-written ignorable list to the same Unicode 18.0.0 data. SPEC §1–§2 now pin the broker to Unicode 18.0.0 and make a Unicode upgrade ship to the PEP and the broker together; any other peer that recomputes digests needs the same pin. The Unicode version of the Python used for the §6 cross-check is not recorded.
 - **Young releases.** On 2026-10-28, `unicode-normalization 0.1.26` is 12 days old and `sha2 0.11.1` is 16 days old. All six pins were re-verified against crates.io on 2026-10-27 (`reports/Pep sidecar crate API verification.md`).
 
 Resolved since approval:
 - `approve_step_up` was not capability-gated. It now takes `&HostAuthority`, like `record_trusted_input`, and so does `abort`.
 - `KeyPolicy` used `to_lowercase()` rather than full Unicode case folding. Case-insensitive stores now accept only ASCII keys and lower-case them with `to_ascii_lowercase()`, because the backend's collation may also fold accents, width or ligatures, which the PEP cannot reproduce.
+- `Cargo.toml` declared `rust-version = "1.88"`, but no verification command ever compiled with 1.88. The claim is dropped: `rust-version` is now 1.97.1, the toolchain `rust-toolchain.toml` pins, so every verification command checks it.
+- The two root-only `peercred` tests had never run. On 2026-10-28 all three ignored tests passed in one run as root on rustc 1.97.1.
 - The ULID regex was missing from SPEC.md. SPEC.md §2 now gives `^[0-9A-HJKMNP-TV-Z]{26}$`, with a first character of at most `7`.

@@ -1,17 +1,19 @@
 # CLAUDE.md — pep-sidecar Operational & Security Rules
 
 ## 1. Project Overview
-`pep-sidecar` is an OS-isolated, stateful OAuth-native Policy Enforcement Point (PEP) sidecar for AI agent payments and tool execution, written in Rust `1.97.1` (Edition `2024`, MSRV `1.88`). Everything architectural is specified in `@SPEC.md`.
+`pep-sidecar` is an OS-isolated, stateful OAuth-native Policy Enforcement Point (PEP) sidecar for AI agent payments and tool execution, written in Rust `1.97.1` (Edition `2024`; `rust-version` is also `1.97.1`, so no older compiler is claimed or supported). Everything architectural is specified in `@SPEC.md`.
 ## 2. Mandatory Verification Loop (Run After Every Edit)
 `cargo` is not installed on Windows; run all `cargo` commands inside WSL2 (`wsl.exe`) with `CARGO_TARGET_DIR=$HOME/.cargo-target/pep-sidecar` and `RUSTFLAGS='-D warnings'`.
-Never declare a task complete until all five commands pass with zero warnings:
+Never declare a task complete until all six commands pass with zero warnings:
 ```bash
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test -- --nocapture
 cargo clippy --all-targets --features lenient-numbers -- -D warnings && cargo test --features lenient-numbers
 cargo clippy --all-targets --target aarch64-apple-darwin -- -D warnings
+cargo deny check
 ```
+`cargo deny check` applies `deny.toml` (advisories, licences, bans, sources) and needs `cargo-deny` installed in WSL (`cargo install --locked cargo-deny`); its advisories check fetches the RustSec database. When a pin in `Cargo.toml` changes, also update `reports/Dependency unsafe record.md`.
 
 ## 3. Strict Rust & Clippy Coding Rules (NEVER Violate)
 

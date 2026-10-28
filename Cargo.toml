@@ -2,7 +2,7 @@
 name = "pep-sidecar"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.97.1" # The pinned toolchain (rust-toolchain.toml); no older compiler is supported.
 publish = false
 description = "OS-isolated, stateful OAuth-native Policy Enforcement Point sidecar for AI agent payments and tool execution"
 

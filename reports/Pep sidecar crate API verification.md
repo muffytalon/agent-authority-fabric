@@ -270,7 +270,7 @@ All five CLAUDE.md §2 commands ran in WSL with cargo and rustc 1.97.0, `CARGO_T
 | `cargo clippy --all-targets --features lenient-numbers -- -D warnings && cargo test --features lenient-numbers` | Clippy exit 0; 145 passed, 0 failed, 3 ignored; doctest passed |
 | `cargo clippy --all-targets --target aarch64-apple-darwin -- -D warnings` | Exit 0 |
 
-Of the three ignored tests, `peercred::tests::full_backlog_counts_as_live` passed when run with `ulimit -n 8192` and `--ignored`. The other two, `parent_owner_mismatch_rejected` and `socket_group_must_match_parent`, need root and were not run. aarch64-apple-darwin is still linted and type-checked only: nothing was linked or run on macOS.
+The three ignored tests then ran once together, on rustc 1.97.1. The unit-test binary was built as the normal user, and only that binary ran as root (`wsl -u root`, `ulimit -n 8192`, `--ignored --exact`), so no build file became root-owned. `full_backlog_counts_as_live`, `parent_owner_mismatch_rejected` and `socket_group_must_match_parent` all passed (3 passed, 0 failed). aarch64-apple-darwin is still linted and type-checked only: nothing was linked or run on macOS.
 
 ### Edits applied
 
@@ -301,8 +301,13 @@ The file was read through the summarising fetch tool, so two consistency checks 
 
 ### Still open
 
-- **The declared MSRV 1.88 is untested.** `rust-toolchain.toml` pins 1.97.1, so no command compiles with 1.88.
-- **Two `peercred` tests need root** and have never run.
 - **Week 2 facts**: the minimum kernel for `SO_PEERPIDFD` and its failure mode on older kernels, the non-blocking `FlockArg` variant, and how to read a PID from a pidfd.
-- **Transitive MSRVs** and the Unicode version of the Python `unicodedata` used for the conformance vectors.
-- **Two stale lines in WEEK1_PLAN.md.** Line 218 says sha2 0.11.1 and unicode-normalization 0.1.26 are "less than two weeks old"; on 2026-10-28 they are 16 and 12 days old. Line 217 says "The ULID regex is not in SPEC.md yet", but SPEC.md line 24 now contains it.
+- **The Unicode version of the Python `unicodedata`** used for the conformance vectors.
+
+Closed after this section was first written:
+
+- **MSRV.** The untested `rust-version = "1.88"` is dropped. `rust-version` is now 1.97.1, the pinned toolchain, so every command checks it. Transitive MSRVs only matter if a dependency needs a newer compiler, and then the build fails.
+- **Root-only `peercred` tests.** All three ignored tests passed in one run (above).
+- **Broker Unicode version.** SPEC.md §1 and §2 pin the broker to Unicode 18.0.0, and a Unicode upgrade ships to the PEP and the broker together.
+- **Stale WEEK1_PLAN.md lines.** Both are corrected.
+- **Licence policy and dependency `unsafe`.** `deny.toml` allows `MIT`, `Apache-2.0` and `Unicode-3.0`, and [Dependency unsafe record.md](Dependency%20unsafe%20record.md) lists where every dependency uses `unsafe`.

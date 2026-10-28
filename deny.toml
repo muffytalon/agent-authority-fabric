@@ -1,0 +1,37 @@
+# cargo-deny policy for pep-sidecar. Run inside WSL from the project root:
+#   cargo deny check
+# It checks RustSec advisories, licences, duplicate versions and crate sources. It does not
+# look at `unsafe`: `reports/Dependency unsafe record.md` records that, and must be updated
+# whenever a pin in Cargo.toml changes.
+
+[graph]
+# The two targets of the CLAUDE.md §2 verification loop.
+targets = ["x86_64-unknown-linux-gnu", "aarch64-apple-darwin"]
+all-features = true
+
+[advisories]
+# Vulnerability and unsoundness advisories are errors by default; yanked versions are too.
+yanked = "deny"
+
+[licenses]
+# Every dependency's licence expression must be satisfiable from this list.
+# - MIT and Apache-2.0 cover the dual-licensed crates, and also ryu-js (Apache-2.0 OR BSL-1.0)
+#   and tinyvec (Zlib OR Apache-2.0 OR MIT).
+# - Unicode-3.0 covers the Unicode data tables in unicode-normalization 0.1.26 and
+#   unicode-ident 1.0.27, both licensed `(MIT OR Apache-2.0) AND Unicode-3.0`.
+allow = ["MIT", "Apache-2.0", "Unicode-3.0"]
+confidence-threshold = 0.93
+
+[licenses.private]
+# pep-sidecar itself is `publish = false` and has no licence field.
+ignore = true
+
+[bans]
+# Every dependency is pinned exactly, so a second version of any crate is a decision to review.
+multiple-versions = "deny"
+wildcards = "deny"
+
+[sources]
+# crates.io only: no other registry and no git dependencies.
+unknown-registry = "deny"
+unknown-git = "deny"

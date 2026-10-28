@@ -4,7 +4,7 @@
 - **Process & UID Isolation:**
   - `agent` container/process: `UID 20001:20001`, read-only rootfs, `cap_drop: [ALL]`, `no-new-privileges: true`, zero direct IPv4/IPv6 egress (`nftables` drops all packets from `skuid 20001`; no loopback TCP holes).
   - `pep` sidecar: `UID 20002:20002`, listens on `unix:///run/pep/mcp.sock` (parent `/run/pep` owned by `20002:20001` mode `2750` (setgid, so the socket inherits group `20001`); `mcp.sock` `20002:20001` mode `0660`). Verifies peer identity via `SO_PEERCRED` + `SO_PEERPIDFD` (Linux) or `getpeereid` + `LOCAL_PEERPID` (macOS).
-  - `broker` egress proxy: `UID 20003:20003`, accepts calls only from the PEP's SPIFFE ID carrying a valid ES256 Call Proof, recomputes `action_digest`, recomputes the F-07 `Idempotency-Key` from `eid`, `rid`, and its own `action_digest`, and injects vaulted credentials + `Idempotency-Key`.
+  - `broker` egress proxy: `UID 20003:20003`, accepts calls only from the PEP's SPIFFE ID carrying a valid ES256 Call Proof, recomputes `action_digest` with the same `JCS_strict_NFC` profile pinned to Unicode 18.0.0 (§2), recomputes the F-07 `Idempotency-Key` from `eid`, `rid`, and its own `action_digest`, and injects vaulted credentials + `Idempotency-Key`.
 
 ## 2. Cryptographic Digest Conventions (`src/jcs.rs`)
 - `digest(x) = "sha-256:" + base64url_no_pad(SHA-256(JCS_strict_NFC(x)))`
@@ -12,7 +12,7 @@
 - `origin_hash = digest({"source_call_id": cid, "tool": tool, "query_digest": qd, "result_pointer": ptr, "value": val})`
 - **`JCS_strict_NFC` Profile (RFC 8785 + I-JSON + Unicode NFC):**
   - Input at most 1 MiB, depth at most 64, no BOM, no trailing data.
-  - NFC on strings and keys before UTF-16 sorting; record the Unicode version the pinned `unicode-normalization` crate implements (`unicode-normalization = "=0.1.26"`, Unicode 18.0.0, i.e. `unicode_normalization::UNICODE_VERSION == (18, 0, 0)`).
+  - NFC on strings and keys before UTF-16 sorting; record the Unicode version the pinned `unicode-normalization` crate implements (`unicode-normalization = "=0.1.26"`, Unicode 18.0.0, i.e. `unicode_normalization::UNICODE_VERSION == (18, 0, 0)`). The broker, and any other component that recomputes a digest, is pinned to the same Unicode 18.0.0: NFC output, and so every digest and F-07 key, differs between Unicode versions for newly encoded characters. A Unicode upgrade therefore ships to the PEP and the broker in one release.
   - Duplicate keys rejected after NFC.
   - Integers within `±(2^53 - 1)` (`[-9007199254740991, 9007199254740991]`); `-0` becomes `0`.
   - Key order differs from the RFC 8785 `U+FB33` example because of NFC (`U+FB33` decomposes to `U+05D3 U+05BC` before UTF-16 sorting).
