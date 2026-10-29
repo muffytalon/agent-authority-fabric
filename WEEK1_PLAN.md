@@ -30,6 +30,7 @@ Decisions:
 - Every cargo command exports `CARGO_TARGET_DIR=~/.cargo-target/pep-sidecar`, which keeps `target/` out of the OneDrive folder.
 - It also exports `RUSTFLAGS='-D warnings'`. Windows env vars don't reach WSL, so without this the `RUSTFLAGS` in settings.json would be lost.
 - `.claude/settings.json` runs `cargo check --all-targets` through `wsl.exe` after every edit, and allow-lists the verification commands.
+- `.github/workflows/ci.yml` (added 2026-10-29) runs the same six commands on GitHub on every push and pull request, and weekly to catch new RustSec advisories. A second job runs the three `#[ignore]` peercred tests as root.
 
 ## 1. `rust-toolchain.toml` + `Cargo.toml`
 - The toolchain is pinned to `1.97.1` with clippy, rustfmt and `aarch64-apple-darwin`. The 1.97.1 point release (2026-07-16) only fixes an LLVM miscompilation that 1.97.0 made more likely (rust-lang/rust#159035).

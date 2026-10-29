@@ -1,0 +1,104 @@
+# The CLAUDE.md §2 verification loop, run on GitHub.
+#
+# - `verify` runs the six commands exactly as CLAUDE.md §2 writes them, with the same
+#   RUSTFLAGS, on the toolchain rust-toolchain.toml pins.
+# - `ignored-tests` runs the three #[ignore] peercred tests. Two need root, which
+#   GitHub-hosted runners give through passwordless sudo.
+# - The weekly run catches new RustSec advisories against an unchanged Cargo.lock.
+#
+# Actions are pinned to full commit SHAs, with the release tag in the trailing comment.
+name: CI
+
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: "17 6 * * 1" # Mondays, 06:17 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+  # Same version as the WSL install the loop was verified with.
+  CARGO_DENY_VERSION: 0.20.2
+
+jobs:
+  verify:
+    name: Verification loop (CLAUDE.md §2)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install the pinned toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
+
+      - name: Check that Cargo.lock is up to date
+        run: cargo fetch --locked
+
+      - name: Cache cargo-deny
+        id: cargo-deny-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cargo/bin/cargo-deny
+          key: cargo-deny-${{ env.CARGO_DENY_VERSION }}-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Install cargo-deny
+        if: steps.cargo-deny-cache.outputs.cache-hit != 'true'
+        # Built with the runner's stable toolchain and without the project's -D warnings,
+        # which would turn a new compiler's warnings in cargo-deny itself into errors.
+        env:
+          RUSTFLAGS: ""
+        run: |
+          rustup toolchain install stable --profile minimal
+          cargo +stable install --locked "cargo-deny@${CARGO_DENY_VERSION}"
+
+      - name: 1. cargo fmt --check
+        run: cargo fmt --check
+
+      - name: 2. cargo clippy --all-targets
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: 3. cargo test
+        run: cargo test -- --nocapture
+
+      - name: 4. lenient-numbers clippy and test
+        run: cargo clippy --all-targets --features lenient-numbers -- -D warnings && cargo test --features lenient-numbers
+
+      - name: 5. macOS cross-lint
+        run: cargo clippy --all-targets --target aarch64-apple-darwin -- -D warnings
+
+      - name: 6. cargo deny check
+        run: cargo deny check
+
+  ignored-tests:
+    name: Ignored peercred tests (root)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install the pinned toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
+
+      - name: Run the #[ignore] tests as root
+        # parent_owner_mismatch_rejected and socket_group_must_match_parent need root;
+        # full_backlog_counts_as_live opens about 4,100 sockets, hence the fd limit.
+        run: |
+          sudo env "PATH=$PATH" \
+            "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" \
+            "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" \
+            "RUSTFLAGS=$RUSTFLAGS" \
+            "CARGO_TERM_COLOR=$CARGO_TERM_COLOR" \
+            bash -c 'ulimit -n 8192 && cargo test --locked -- --ignored'
