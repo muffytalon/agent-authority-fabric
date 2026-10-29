@@ -688,6 +688,10 @@ fn parse_array_index(token: &str) -> Option<usize> {
 
 fn walk_nodes<F: FnMut(usize, &JcsValue)>(value: &JcsValue, depth: usize, visit: &mut F) {
     visit(depth, value);
+    // Saturating is safe here (CLAUDE.md §3): every level of nesting is its own allocation, so
+    // no value is `usize::MAX` deep and the cap is unreachable. If it were reached, a pinned
+    // depth would only keep deeper containers out of content indexing; strings and children
+    // would still be visited, so no taint is lost.
     let child_depth = depth.saturating_add(1);
     match value {
         JcsValue::Array(items) => {
@@ -705,6 +709,8 @@ fn walk_nodes<F: FnMut(usize, &JcsValue)>(value: &JcsValue, depth: usize, visit:
 }
 
 fn collect_nodes<'a>(value: &'a JcsValue, pointer: &str, depth: usize, out: &mut Vec<Node<'a>>) {
+    // Saturating is safe here (CLAUDE.md §3): as in `walk_nodes`, the cap is unreachable, and
+    // the depth is only reported in each `Node`, never compared by this module.
     let child_depth = depth.saturating_add(1);
     out.push(Node {
         pointer: pointer.to_owned(),
@@ -914,15 +920,15 @@ impl Cursor<'_> {
         match self.peek() {
             None => Err(self.eof()),
             Some(b'{') => {
-                self.enter(start)?;
+                let outer = self.enter(start)?;
                 let value = self.object();
-                self.leave();
+                self.depth = outer;
                 value
             }
             Some(b'[') => {
-                self.enter(start)?;
+                let outer = self.enter(start)?;
                 let value = self.array();
-                self.leave();
+                self.depth = outer;
                 value
             }
             Some(b'"') => self.string().map(JcsValue::String),
@@ -934,18 +940,18 @@ impl Cursor<'_> {
         }
     }
 
-    fn enter(&mut self, start: usize) -> Result<(), JcsError> {
+    /// Enters a container and returns the outer depth, which the caller restores on leaving
+    /// (restoring needs no arithmetic, so it cannot go wrong).
+    fn enter(&mut self, start: usize) -> Result<usize, JcsError> {
         let too_deep = JcsError::DepthExceeded { offset: start };
-        let depth = self.depth.checked_add(1).ok_or(too_deep)?;
+        let outer = self.depth;
+        let depth = outer.checked_add(1).ok_or(too_deep)?;
         if depth > self.options.max_depth {
             return Err(too_deep);
         }
         self.depth = depth;
-        self.bump()
-    }
-
-    fn leave(&mut self) {
-        self.depth = self.depth.saturating_sub(1);
+        self.bump()?;
+        Ok(outer)
     }
 
     fn object(&mut self) -> Result<JcsValue, JcsError> {

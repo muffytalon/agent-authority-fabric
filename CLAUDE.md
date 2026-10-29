@@ -82,7 +82,7 @@ Cargo.toml enforces [lints.rust] and [lints.clippy] with -D warnings. Do NOT wea
 
     Trusted Values & Host Authority (F-13):
 
-        Trusted values come only from record_trusted_input (which requires &HostAuthority) or from the signed trusted_fields of a tool pinned as Trusted, with no taint. Code reachable from the agent socket never receives HostAuthority and never calls approve_step_up. Undeclared arguments not present in the tool's pinned argument policy are rejected.
+        Trusted values come only from record_trusted_input (which requires &HostAuthority) or from the signed trusted_fields of a tool pinned as Trusted, with no taint. Code reachable from the agent socket never receives HostAuthority and never calls approve_step_up. Undeclared arguments not present in the tool's pinned argument policy are rejected, at every depth. The one exception is a read-only tool that is not a sink, has no trusted_fields and declares only Data arguments: no guard reads its arguments, so it may take extra flags such as verbose (until the Week 2 lockfile pins full argument schemas).
 
     Payment Amount Witness & Binding (F-14):
 

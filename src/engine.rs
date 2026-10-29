@@ -1188,6 +1188,7 @@ struct RoleArgs<'a> {
     store_uris: Vec<&'a JcsValue>,
     store_keys: Vec<&'a JcsValue>,
     store_writes: Vec<&'a JcsValue>,
+    data: Vec<&'a JcsValue>,
 }
 
 struct Canon<'a> {
@@ -1241,6 +1242,12 @@ struct Plan {
     write_label: Label,
     label_quota_after: usize,
     prov: Vec<String>,
+}
+
+#[derive(Clone, Copy)]
+struct RecordQuotas {
+    result_nodes_remaining: usize,
+    pointer_bytes_remaining: usize,
 }
 
 struct LabelCtx<'a> {
@@ -1345,6 +1352,7 @@ impl PepEngine {
         )?;
         let seq = self.state.next_seq;
         let next_seq = seq.checked_add(1).ok_or(StoreError::CapacityExceeded)?;
+        let quotas = self.quotas_after(parsed.nodes, budget, remaining)?;
         let ratchet = leaves
             .iter()
             .map(|leaf| leaf.label.conf)
@@ -1365,8 +1373,7 @@ impl PepEngine {
                 leaves,
             },
             next_seq,
-            parsed.nodes,
-            budget.saturating_sub(remaining),
+            quotas,
             ratchet,
         );
         Ok(())
@@ -1403,6 +1410,7 @@ impl PepEngine {
         trusted_leaves(&value, "", label, &mut remaining, &mut leaves)?;
         let seq = self.state.next_seq;
         let next_seq = seq.checked_add(1).ok_or(StoreError::CapacityExceeded)?;
+        let quotas = self.quotas_after(0, budget, remaining)?;
         let query_digest = jcs::digest_value(&value);
         self.commit_record(
             Recorded {
@@ -1415,8 +1423,7 @@ impl PepEngine {
                 leaves,
             },
             next_seq,
-            0,
-            budget.saturating_sub(remaining),
+            quotas,
             conf,
         );
         Ok(())
@@ -1560,8 +1567,7 @@ impl PepEngine {
         g_seq(&self.seq, state.last_tool.as_deref(), name)?;
 
         // 7. G_budget (computes the plan, applies nothing)
-        let taint_writes =
-            planned_writes(tool, canon.store_key.as_ref(), &canon.roles.store_writes);
+        let taint_writes = planned_writes(tool, canon.store_key.as_ref(), &canon.roles);
         let payment = payment_inputs(tool, amount, entity, witness.as_ref())?;
         let (payment, label_quota_after) = g_budget(state, payment, taint_writes.len())?;
 
@@ -1690,12 +1696,36 @@ impl PepEngine {
         Ok(decision)
     }
 
+    /// The episode's result-node and pointer-byte quotas once a record that used `nodes` values
+    /// and `budget - remaining` pointer bytes is stored. Computed before anything changes, so an
+    /// inconsistent count refuses the record instead of leaving the episode half-updated.
+    fn quotas_after(
+        &self,
+        nodes: usize,
+        budget: usize,
+        remaining: usize,
+    ) -> Result<RecordQuotas, StoreError> {
+        let full = StoreError::CapacityExceeded;
+        let pointer_bytes = budget.checked_sub(remaining).ok_or(full)?;
+        Ok(RecordQuotas {
+            result_nodes_remaining: self
+                .state
+                .result_nodes_remaining
+                .checked_sub(nodes)
+                .ok_or(full)?,
+            pointer_bytes_remaining: self
+                .state
+                .pointer_bytes_remaining
+                .checked_sub(pointer_bytes)
+                .ok_or(full)?,
+        })
+    }
+
     fn commit_record(
         &mut self,
         record: Recorded,
         next_seq: u64,
-        nodes: usize,
-        pointer_bytes: usize,
+        quotas: RecordQuotas,
         ratchet: Confidentiality,
     ) {
         let state = &mut self.state;
@@ -1710,8 +1740,8 @@ impl PepEngine {
                 });
         }
         state.context_conf = state.context_conf.max(ratchet);
-        state.result_nodes_remaining = state.result_nodes_remaining.saturating_sub(nodes);
-        state.pointer_bytes_remaining = state.pointer_bytes_remaining.saturating_sub(pointer_bytes);
+        state.result_nodes_remaining = quotas.result_nodes_remaining;
+        state.pointer_bytes_remaining = quotas.pointer_bytes_remaining;
         state
             .recorded_call_ids
             .insert(record.source_call_id.clone());
@@ -1784,13 +1814,14 @@ impl Engine for PepEngine {
                     .reserved
                     .checked_sub(amount)
                     .ok_or(PepError::InvalidTransition)?;
+                // A live reservation holds one use of its entity; a count of zero means the
+                // books disagree, so refuse rather than clamp.
                 let uses = state
                     .budget
                     .entity_uses
                     .get(&entity)
-                    .copied()
-                    .unwrap_or(0)
-                    .saturating_sub(1);
+                    .and_then(|uses| uses.checked_sub(1))
+                    .ok_or(PepError::InvalidTransition)?;
                 state.budget.reserved = reserved;
                 state.budget.entity_uses.insert(entity, uses);
                 ResState::Released
@@ -2029,6 +2060,7 @@ fn resolve_roles<'a>(
         store_uris: Vec::new(),
         store_keys: Vec::new(),
         store_writes: Vec::new(),
+        data: Vec::new(),
     };
     for spec in &tool.args {
         let Some(value) = arguments.pointer(&spec.pointer) else {
@@ -2057,7 +2089,7 @@ fn resolve_roles<'a>(
             ArgRole::StoreUri => roles.store_uris.push(value),
             ArgRole::StoreKey => roles.store_keys.push(value),
             ArgRole::StoreWrite => roles.store_writes.push(value),
-            ArgRole::Data => {}
+            ArgRole::Data => roles.data.push(value),
         }
     }
     if roles.store_uris.len() > 1 || roles.store_keys.len() > 1 {
@@ -2337,10 +2369,11 @@ fn g_seq(policy: &SeqPolicy, last_tool: Option<&str>, name: &str) -> Result<(), 
 fn planned_writes(
     tool: &ToolPolicy,
     store_key: Option<&StoreKey>,
-    writes: &[&JcsValue],
+    roles: &RoleArgs<'_>,
 ) -> Vec<TaintIndex> {
+    let mutating_internal = tool.effect == EffectClass::MutatingInternal;
     let mut indexes = BTreeSet::new();
-    if (tool.effect == EffectClass::MutatingInternal || !writes.is_empty())
+    if (mutating_internal || !roles.store_writes.is_empty())
         && let Some(key) = store_key
     {
         indexes.insert(TaintIndex::Location(key.clone()));
@@ -2349,7 +2382,11 @@ fn planned_writes(
             indexes.insert(TaintIndex::Below(ancestor));
         }
     }
-    for value in writes {
+    // F-08: everything a `MutatingInternal` tool is given is written, free text declared as
+    // `Data` included. Without its digest, a secret saved here could be read back in another
+    // episode through a different untrusted tool (a search over the store) with no label.
+    let data: &[&JcsValue] = if mutating_internal { &roles.data } else { &[] };
+    for value in roles.store_writes.iter().chain(data) {
         // `walk`, not `nodes`: the agent controls this value, and building a pointer per node
         // lets one long key over a large array allocate gigabytes.
         value.walk(&mut |depth, node| {
@@ -2605,7 +2642,7 @@ fn label_tree(
     {
         inherited = Some(inherited.map_or(found, |label| label.join(found)));
     }
-    let child_depth = depth.saturating_add(1);
+    let child_depth = depth.checked_add(1).ok_or(StoreError::CapacityExceeded)?;
     match value {
         JcsValue::Array(items) => {
             for (index, item) in items.iter().enumerate() {
@@ -3835,6 +3872,69 @@ mod tests {
     }
 
     #[test]
+    fn mutating_internal_data_argument_is_content_tainted() {
+        // A note tool whose body is free text (`Data`) rather than a `StoreWrite`.
+        let mut custom = pins();
+        let post_note = ToolPolicy {
+            store_uri: Some(NOTES.to_owned()),
+            ..tool(
+                "post_note",
+                EffectClass::MutatingInternal,
+                vec![arg("/key", ArgRole::StoreKey), arg("/body", ArgRole::Data)],
+            )
+        };
+        custom.tools.insert(post_note.name.clone(), post_note);
+        let shared = store();
+        let engine_with = |pins: ToolPins| {
+            PepEngine::new(
+                intent(invoices(), limits("USD")),
+                pins,
+                SeqPolicy::Unconstrained,
+                shared.clone(),
+            )
+            .unwrap()
+        };
+        let mut writer = engine_with(custom.clone());
+        let host = HostAuthority::for_tests();
+        writer
+            .record_trusted_input(
+                &host,
+                "s",
+                br#"{"note":"x"}"#,
+                Confidentiality::Confidential,
+            )
+            .unwrap();
+        allow(
+            &mut writer,
+            &request(
+                1,
+                "post_note",
+                r#"{"key":"k9","body":"the Q3 numbers are not public yet"}"#,
+            ),
+        );
+        // Another episode reads the text back through a different, untrusted tool.
+        let mut reader = engine_with(custom);
+        allow(
+            &mut reader,
+            &request(1, "get_ticket", r#"{"ticket_id":"T-1"}"#),
+        );
+        reader
+            .record_result_raw(
+                "1",
+                br#"{"structuredContent":{"body":"the Q3 numbers are not public yet"}}"#,
+            )
+            .unwrap();
+        assert_eq!(
+            latest_leaf(&reader, "/structuredContent/body").label,
+            Label::new(
+                Confidentiality::Confidential,
+                Integrity::UntrustedAgentWrite
+            )
+        );
+        assert_eq!(reader.state().context_conf, Confidentiality::Confidential);
+    }
+
+    #[test]
     fn short_scalars_not_content_indexed() {
         let shared = store();
         let mut writer = engine_on(&shared, invoices(), limits("USD"));
@@ -4763,9 +4863,17 @@ mod tests {
             JcsValue::Array(items),
         )];
         let value = JcsValue::Object(jcs::JcsObject::from_entries(entries).unwrap());
+        let arguments = JcsValue::Object(
+            jcs::JcsObject::from_entries(vec![
+                (jcs::JcsString::new("key"), JcsValue::string("k1")),
+                (jcs::JcsString::new("text"), value),
+            ])
+            .unwrap(),
+        );
         let key = StoreKey::new(NOTES, "k1", &pins().stores).unwrap();
         let save_note = &pins().tools["save_note"];
-        let writes = planned_writes(save_note, Some(&key), &[&value]);
+        let roles = resolve_roles(save_note, &arguments).unwrap();
+        let writes = planned_writes(save_note, Some(&key), &roles);
         assert_eq!(writes.len(), 3);
         assert!(writes.contains(&TaintIndex::Location(key)));
     }
