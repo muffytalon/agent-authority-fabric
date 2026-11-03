@@ -96,7 +96,9 @@ jobs:
           echo "No getrandom in $(wc -l < "$tree") tree lines"
 
   ignored-tests:
-    name: Ignored peercred tests (root)
+    # Q1 (WEEK2_PLAN step 4): peer identity is checked on the runner's own kernel, which is
+    # newer than the development machine's. The tests branch on the kernel version and log it.
+    name: Peer identity on the runner's kernel, and the root-only tests
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -107,13 +109,25 @@ jobs:
       - name: Install the pinned toolchain (rust-toolchain.toml)
         run: rustup toolchain install
 
+      - name: Record the runner's kernel
+        run: |
+          uname -r
+          echo "Runner kernel: \`$(uname -r)\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: peercred tests on this kernel, as the runner user
+        # require_peer_on_this_kernel expects SO_PEERPIDFD on Linux 6.5 and later and a
+        # rejection before it; reaped_peer_rejected expects a stale pidfd (Pid -1).
+        run: cargo test --locked --lib peercred:: -- --nocapture
+
       - name: Run the #[ignore] tests as root
         # parent_owner_mismatch_rejected and socket_group_must_match_parent need root;
-        # full_backlog_counts_as_live opens about 4,100 sockets, hence the fd limit.
+        # cross_namespace_peer_alive_with_pid_zero needs unshare's user, PID and mount
+        # namespaces, which the runner allows only to root; full_backlog_counts_as_live opens
+        # about 4,100 sockets, hence the fd limit.
         run: |
           sudo env "PATH=$PATH" \
             "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" \
             "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" \
             "RUSTFLAGS=$RUSTFLAGS" \
             "CARGO_TERM_COLOR=$CARGO_TERM_COLOR" \
-            bash -c 'ulimit -n 8192 && cargo test --locked -- --ignored'
+            bash -c 'ulimit -n 8192 && cargo test --locked -- --ignored --nocapture'

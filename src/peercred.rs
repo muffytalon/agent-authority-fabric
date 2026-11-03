@@ -12,11 +12,24 @@
 //! process's effective group already is that group), so `/run/pep` should be mode `2750`. The
 //! bind fails otherwise, rather than leaving a socket the agent's group cannot open.
 //!
-//! The peer PID is advisory until the Week 2 `SO_PEERPIDFD` upgrade.
+//! [`require_peer`] admits a peer only if both its uid and its gid are the expected ones (Q1).
+//! On Linux it also takes the peer's pidfd (`SO_PEERPIDFD`, Linux 6.5 and later) and requires
+//! the pidfd's fdinfo `Pid:` to be at least 0.
+//! - In Compose the peer sits in a sibling PID namespace. There `SO_PEERCRED` reports pid 0, and
+//!   fdinfo shows `Pid: 0` while the peer lives, so the pidfd proves only that the peer is
+//!   alive. Identity rests on the uid and gid.
+//! - A reaped peer shows `Pid: -1` and is rejected. Recent kernels return a stale pidfd for it,
+//!   not an error, so the fdinfo check is what catches it.
+//! - Every `getsockopt` error rejects, `ENOPROTOOPT` (a kernel older than 6.5) included.
+//!
+//! PIDs from `SO_PEERCRED` and `LOCAL_PEERPID` stay advisory. macOS has no pidfd, so there the
+//! check is the uid and gid alone.
 
 use std::fs::{self, Metadata, Permissions};
 use std::io;
 use std::os::fd::AsFd;
+#[cfg(target_os = "linux")]
+use std::os::fd::{AsRawFd as _, OwnedFd};
 use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _, PermissionsExt as _};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Component, Path};
@@ -57,6 +70,29 @@ pub enum PeerError {
         /// The peer's uid.
         actual: u32,
     },
+    /// The peer runs with an unexpected group.
+    #[error("peer gid {actual} is not the expected gid {expected}")]
+    UnexpectedPeerGid {
+        /// The required gid.
+        expected: u32,
+        /// The peer's gid.
+        actual: u32,
+    },
+    /// The kernel has no `SO_PEERPIDFD` (`ENOPROTOOPT`: Linux older than 6.5).
+    #[error("SO_PEERPIDFD is not supported by this kernel")]
+    PidfdUnsupported,
+    /// The socket has no peer process recorded (`ENODATA`).
+    #[error("the socket has no recorded peer process")]
+    PidfdNoPeer,
+    /// `SO_PEERPIDFD` failed with any other error.
+    #[error("SO_PEERPIDFD failed: {0}")]
+    PidfdFailed(nix::Error),
+    /// The peer process has exited and been reaped (fdinfo `Pid: -1`).
+    #[error("the peer process has exited")]
+    PeerExited,
+    /// The pidfd's fdinfo does not hold exactly one well-formed `Pid:` line.
+    #[error("the peer pidfd's fdinfo is malformed")]
+    FdinfoMalformed,
     /// The socket path is relative.
     #[error("socket path is not absolute")]
     PathNotAbsolute,
@@ -134,7 +170,8 @@ pub struct PeerCred {
     pub uid: u32,
     /// Effective group id.
     pub gid: u32,
-    /// Process id, if the platform reports it (advisory: PIDs can be reused).
+    /// Process id, if the platform reports it (advisory: PIDs can be reused). On Linux it is 0
+    /// when the peer is in a PID namespace this process cannot see.
     pub pid: Option<i32>,
 }
 
@@ -169,20 +206,88 @@ fn os_peer_cred<F: AsFd>(socket: &F) -> Result<PeerCred, PeerError> {
     })
 }
 
-/// Reads the peer's credentials and requires its uid to be `expected`.
+/// Reads the peer's credentials and requires its uid to be `uid` and its gid to be `gid`. On
+/// Linux the peer must also be alive, as its pidfd shows (see the module docs). Every failure
+/// rejects the peer.
 ///
 /// # Errors
 ///
-/// Returns [`PeerError::UnexpectedPeerUid`] for another uid, or the errors of [`peer_cred`].
-pub fn require_peer_uid<F: AsFd>(socket: &F, expected: u32) -> Result<PeerCred, PeerError> {
+/// - [`PeerError::UnexpectedPeerUid`] or [`PeerError::UnexpectedPeerGid`] for another identity;
+/// - on Linux, [`PeerError::PidfdUnsupported`], [`PeerError::PidfdNoPeer`],
+///   [`PeerError::PidfdFailed`], [`PeerError::PeerExited`] or [`PeerError::FdinfoMalformed`]
+///   when the peer cannot be shown to be alive, or [`PeerError::Io`] if its fdinfo is
+///   unreadable;
+/// - the errors of [`peer_cred`].
+pub fn require_peer<F: AsFd>(socket: &F, uid: u32, gid: u32) -> Result<PeerCred, PeerError> {
     let credentials = peer_cred(socket)?;
-    if credentials.uid == expected {
-        Ok(credentials)
-    } else {
-        Err(PeerError::UnexpectedPeerUid {
-            expected,
+    if credentials.uid != uid {
+        return Err(PeerError::UnexpectedPeerUid {
+            expected: uid,
             actual: credentials.uid,
-        })
+        });
+    }
+    if credentials.gid != gid {
+        return Err(PeerError::UnexpectedPeerGid {
+            expected: gid,
+            actual: credentials.gid,
+        });
+    }
+    #[cfg(target_os = "linux")]
+    require_peer_alive(socket)?;
+    Ok(credentials)
+}
+
+/// Requires the peer's pidfd to show a live process. The pidfd is closed on return.
+#[cfg(target_os = "linux")]
+fn require_peer_alive<F: AsFd>(socket: &F) -> Result<(), PeerError> {
+    let pidfd = peer_pidfd(socket)?;
+    let fdinfo = fs::read_to_string(fdinfo_path(&pidfd))?;
+    pidfd_alive(fdinfo_pid(&fdinfo)?)
+}
+
+#[cfg(target_os = "linux")]
+fn peer_pidfd<F: AsFd>(socket: &F) -> Result<OwnedFd, PeerError> {
+    classify_pidfd(getsockopt(socket, sockopt::PeerPidfd))
+}
+
+/// Maps a `SO_PEERPIDFD` failure to its error. Separate from the system call so that tests can
+/// inject any errno.
+#[cfg(target_os = "linux")]
+fn classify_pidfd(result: nix::Result<OwnedFd>) -> Result<OwnedFd, PeerError> {
+    result.map_err(|errno| match errno {
+        nix::errno::Errno::ENOPROTOOPT => PeerError::PidfdUnsupported,
+        nix::errno::Errno::ENODATA => PeerError::PidfdNoPeer,
+        other => PeerError::PidfdFailed(other),
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn fdinfo_path(fd: &OwnedFd) -> std::path::PathBuf {
+    std::path::PathBuf::from(format!("/proc/self/fdinfo/{}", fd.as_raw_fd()))
+}
+
+/// The value of the single `Pid:` line of a pidfd's fdinfo. (`NSpid:` lines do not match.)
+#[cfg(target_os = "linux")]
+fn fdinfo_pid(fdinfo: &str) -> Result<i32, PeerError> {
+    let mut values = fdinfo.lines().filter_map(|line| line.strip_prefix("Pid:"));
+    let (Some(value), None) = (values.next(), values.next()) else {
+        return Err(PeerError::FdinfoMalformed);
+    };
+    value.trim().parse().map_err(|_| PeerError::FdinfoMalformed)
+}
+
+/// Q1's liveness rule for an fdinfo `Pid:` value:
+/// - `-1`: the peer has been reaped, so it is rejected;
+/// - `0`: the peer lives in a PID namespace this process cannot see (the Compose case);
+/// - a positive value: the peer's pid in this namespace.
+///
+/// Any other negative value is malformed.
+#[cfg(target_os = "linux")]
+fn pidfd_alive(pid: i32) -> Result<(), PeerError> {
+    match pid {
+        -1 => Err(PeerError::PeerExited),
+        0.. => Ok(()),
+        _ => Err(PeerError::FdinfoMalformed),
     }
 }
 
@@ -357,6 +462,7 @@ fn verify_bound(path: &Path, euid: u32, parent_gid: u32) -> Result<(), PeerError
 )]
 mod tests {
     use super::*;
+    use nix::unistd::getegid;
     use std::os::unix::net::UnixStream;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -400,18 +506,303 @@ mod tests {
         let listener = bind_safe_listener(&path).unwrap();
         let _client = UnixStream::connect(&path).unwrap();
         let (server, _) = listener.accept().unwrap();
-        let euid = geteuid().as_raw();
+        let (uid, gid) = (geteuid().as_raw(), getegid().as_raw());
         let credentials = peer_cred(&server).unwrap();
-        assert_eq!(credentials.uid, euid);
+        assert_eq!((credentials.uid, credentials.gid), (uid, gid));
         assert_eq!(
             credentials.pid,
             Some(i32::try_from(std::process::id()).unwrap())
         );
-        assert_eq!(require_peer_uid(&server, euid).unwrap(), credentials);
+        assert_eq!(require_peer(&server, uid, gid).unwrap(), credentials);
         assert!(matches!(
-            require_peer_uid(&server, euid.wrapping_add(1)),
+            require_peer(&server, uid.wrapping_add(1), gid),
             Err(PeerError::UnexpectedPeerUid { .. })
         ));
+    }
+
+    /// C-UID's unit check: a socketpair's peer is this process, so only our own uid and gid pass.
+    #[test]
+    fn socketpair_self_connect() {
+        let (left, _right) = UnixStream::pair().unwrap();
+        let (uid, gid) = (geteuid().as_raw(), getegid().as_raw());
+        let credentials = require_peer(&left, uid, gid).unwrap();
+        assert_eq!((credentials.uid, credentials.gid), (uid, gid));
+        assert!(matches!(
+            require_peer(&left, uid.wrapping_add(1), gid),
+            Err(PeerError::UnexpectedPeerUid { expected, actual })
+                if expected == uid.wrapping_add(1) && actual == uid
+        ));
+        // Uid right, gid wrong: rejected (Q1).
+        assert!(matches!(
+            require_peer(&left, uid, gid.wrapping_add(1)),
+            Err(PeerError::UnexpectedPeerGid { expected, actual })
+                if expected == gid.wrapping_add(1) && actual == gid
+        ));
+    }
+
+    /// The C-PID checks and the kernel-dependent tests. They are Linux-only: macOS has no pidfd.
+    #[cfg(target_os = "linux")]
+    mod pidfd {
+        use super::*;
+        use nix::errno::Errno;
+        use std::io::Write as _;
+        use std::process::{Child, Command, Stdio};
+
+        /// Set for a helper run of this test binary: the socket the helper uses.
+        const HELPER_SOCKET: &str = "PEP_PEERCRED_HELPER_SOCKET";
+
+        /// Re-runs this test binary to execute only the ignored helper test `name`.
+        fn helper(name: &str) -> Command {
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command.args(["--exact", name, "--ignored", "--test-threads=1", "--quiet"]);
+            command
+        }
+
+        /// Fails unless the helper run succeeded and actually ran its one test. A renamed helper
+        /// would otherwise match no test and exit successfully without doing anything.
+        fn assert_helper_ran(output: &std::process::Output) {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && stdout.contains("test result: ok. 1 passed"),
+                "helper failed or ran no test: {}\n{stdout}",
+                output.status
+            );
+        }
+
+        /// `(major, minor, release)` from `/proc/sys/kernel/osrelease`, such as `(6, 18, "6.18.54.1-…")`.
+        fn kernel_version() -> (u32, u32, String) {
+            let release = fs::read_to_string("/proc/sys/kernel/osrelease").unwrap();
+            let release = release.trim().to_owned();
+            let mut parts = release.split(['.', '-']);
+            let major = parts.next().unwrap().parse().unwrap();
+            let minor = parts.next().unwrap().parse().unwrap();
+            (major, minor, release)
+        }
+
+        fn log(line: &str) {
+            writeln!(io::stderr().lock(), "{line}").unwrap();
+        }
+
+        /// C-PID: an injected `getsockopt` errno always rejects, and `ENOPROTOOPT` (a kernel
+        /// older than 6.5) and `ENODATA` get their own errors.
+        #[test]
+        fn pidfd_errno_rejects() {
+            assert!(matches!(
+                classify_pidfd(Err(Errno::ENOPROTOOPT)),
+                Err(PeerError::PidfdUnsupported)
+            ));
+            assert!(matches!(
+                classify_pidfd(Err(Errno::ENODATA)),
+                Err(PeerError::PidfdNoPeer)
+            ));
+            for errno in [Errno::EINVAL, Errno::ESRCH, Errno::EBADF, Errno::EMFILE] {
+                assert!(matches!(
+                    classify_pidfd(Err(errno)),
+                    Err(PeerError::PidfdFailed(e)) if e == errno
+                ));
+            }
+        }
+
+        /// C-PID: the fdinfo parser reads exactly one `Pid:` line and ignores `NSpid:`.
+        #[test]
+        fn fdinfo_pid_parser() {
+            let live =
+                "pos:\t0\nflags:\t02000002\nmnt_id:\t15\nino:\t1057\nPid:\t1234\nNSpid:\t1234\n";
+            assert_eq!(fdinfo_pid(live).unwrap(), 1234);
+            assert_eq!(fdinfo_pid("Pid:\t0\nNSpid:\t0\n").unwrap(), 0);
+            assert_eq!(fdinfo_pid("Pid:\t-1\nNSpid:\t-1\n").unwrap(), -1);
+            for malformed in [
+                "",
+                "pos:\t0\nNSpid:\t7\n",
+                "Pid:\t7\nPid:\t8\n",
+                "Pid:\t\n",
+                "Pid:\tseven\n",
+                "Pid:\t99999999999\n",
+            ] {
+                assert!(
+                    matches!(fdinfo_pid(malformed), Err(PeerError::FdinfoMalformed)),
+                    "{malformed:?}"
+                );
+            }
+        }
+
+        /// C-PID: `Pid: -1` rejects, and `Pid: 0` (a peer in a namespace this process cannot
+        /// see) is accepted, as Q1 (i) decides.
+        #[test]
+        fn pidfd_liveness_rule() {
+            assert!(matches!(pidfd_alive(-1), Err(PeerError::PeerExited)));
+            assert!(pidfd_alive(0).is_ok());
+            assert!(pidfd_alive(1).is_ok());
+            assert!(pidfd_alive(i32::MAX).is_ok());
+            for malformed in [-2, i32::MIN] {
+                assert!(matches!(
+                    pidfd_alive(malformed),
+                    Err(PeerError::FdinfoMalformed)
+                ));
+            }
+        }
+
+        /// The kernel branch: on Linux 6.5 and later the pidfd works and shows this process's
+        /// own pid (same namespace); on an older kernel `require_peer` rejects with
+        /// `PidfdUnsupported`. The kernel is logged so CI records which branch ran.
+        #[test]
+        fn require_peer_on_this_kernel() {
+            let (major, minor, release) = kernel_version();
+            let (left, _right) = UnixStream::pair().unwrap();
+            let (uid, gid) = (geteuid().as_raw(), getegid().as_raw());
+            if (major, minor) >= (6, 5) {
+                log(&format!("kernel {release}: SO_PEERPIDFD expected to work"));
+                require_peer(&left, uid, gid).unwrap();
+                let pidfd = peer_pidfd(&left).unwrap();
+                let fdinfo = fs::read_to_string(fdinfo_path(&pidfd)).unwrap();
+                assert_eq!(
+                    fdinfo_pid(&fdinfo).unwrap(),
+                    i32::try_from(std::process::id()).unwrap()
+                );
+            } else {
+                log(&format!(
+                    "kernel {release}: older than 6.5, expecting rejection"
+                ));
+                assert!(matches!(
+                    require_peer(&left, uid, gid),
+                    Err(PeerError::PidfdUnsupported)
+                ));
+            }
+        }
+
+        /// C-PID: the pidfd is close-on-exec, and `require_peer` closes it, so no pidfd leaks
+        /// into a child process or piles up.
+        #[test]
+        fn pidfd_cloexec_and_closed() {
+            let (left, _right) = UnixStream::pair().unwrap();
+            let pidfd = peer_pidfd(&left).unwrap();
+            let fdinfo = fs::read_to_string(fdinfo_path(&pidfd)).unwrap();
+            let flags = fdinfo
+                .lines()
+                .find_map(|line| line.strip_prefix("flags:"))
+                .map(|value| u32::from_str_radix(value.trim(), 8).unwrap())
+                .unwrap();
+            let cloexec = u32::try_from(nix::libc::O_CLOEXEC).unwrap();
+            assert_ne!(flags & cloexec, 0, "pidfd flags {flags:o} lack O_CLOEXEC");
+            drop(pidfd);
+
+            let (uid, gid) = (geteuid().as_raw(), getegid().as_raw());
+            let open_fds = || fs::read_dir("/proc/self/fd").unwrap().count();
+            let before = open_fds();
+            for _ in 0..256 {
+                require_peer(&left, uid, gid).unwrap();
+            }
+            // Other tests open and close descriptors concurrently, so allow some noise; a leak
+            // would add 256.
+            let after = open_fds();
+            assert!(
+                after < before + 64,
+                "{before} fds before, {after} after 256 checks"
+            );
+        }
+
+        /// C-PID: a peer that exits and is reaped before the check is rejected. This kernel
+        /// (and CI's) returns a stale pidfd showing `Pid: -1`, not an error.
+        #[test]
+        fn reaped_peer_rejected() {
+            let dir = TempDir::with_mode(0o750);
+            let path = dir.socket();
+            let listener = UnixListener::bind(&path).unwrap();
+            // The helper connects and exits; `output` waits for it, which reaps it.
+            let output = helper("peercred::tests::pidfd::helper_connect_and_exit")
+                .env(HELPER_SOCKET, &path)
+                .output()
+                .unwrap();
+            assert_helper_ran(&output);
+            let (server, _) = listener.accept().unwrap();
+            let (uid, gid) = (geteuid().as_raw(), getegid().as_raw());
+            // The credentials recorded at connect time are still there...
+            assert_eq!(peer_cred(&server).unwrap().uid, uid);
+            // ...but the peer is gone.
+            assert!(matches!(
+                require_peer(&server, uid, gid),
+                Err(PeerError::PeerExited)
+            ));
+        }
+
+        #[test]
+        #[ignore = "helper process for reaped_peer_rejected; does nothing when run on its own"]
+        fn helper_connect_and_exit() {
+            if let Some(path) = std::env::var_os(HELPER_SOCKET) {
+                drop(UnixStream::connect(path).unwrap());
+            }
+        }
+
+        /// The Compose case (Q1): the listener is in a new user, PID and mount namespace that
+        /// cannot see the peer, so `SO_PEERCRED` reports pid 0 and fdinfo shows `Pid: 0`, and
+        /// the live peer is still accepted. The new user namespace maps the peer's uid and gid
+        /// to 0, as Appendix A of `WEEK2_PLAN.md` observed.
+        #[test]
+        #[ignore = "needs unshare(1) with user, PID and mount namespaces (root, or unprivileged user namespaces)"]
+        fn cross_namespace_peer_alive_with_pid_zero() {
+            let dir = TempDir::with_mode(0o750);
+            let path = dir.socket();
+            let mut child = Command::new("unshare")
+                .args([
+                    "--user",
+                    "--map-root-user",
+                    "--pid",
+                    "--fork",
+                    "--mount-proc",
+                    "--",
+                ])
+                .arg(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "peercred::tests::pidfd::helper_namespace_listener",
+                    "--ignored",
+                    "--test-threads=1",
+                    "--quiet",
+                ])
+                .env(HELPER_SOCKET, &path)
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap();
+            // Stay connected, and alive, until the helper has checked us.
+            let stream = connect_when_bound(&path, &mut child);
+            let output = child.wait_with_output().unwrap();
+            drop(stream);
+            assert_helper_ran(&output);
+        }
+
+        fn connect_when_bound(path: &Path, child: &mut Child) -> UnixStream {
+            for _ in 0..400 {
+                if let Ok(stream) = UnixStream::connect(path) {
+                    return stream;
+                }
+                if let Some(status) = child.try_wait().unwrap() {
+                    panic!("namespace helper exited before binding: {status}");
+                }
+                thread::sleep(Duration::from_millis(25));
+            }
+            drop(child.kill());
+            panic!("namespace helper never bound {}", path.display());
+        }
+
+        #[test]
+        #[ignore = "helper process for cross_namespace_peer_alive_with_pid_zero; does nothing when run on its own"]
+        fn helper_namespace_listener() {
+            let Some(path) = std::env::var_os(HELPER_SOCKET) else {
+                return;
+            };
+            let listener = UnixListener::bind(path).unwrap();
+            let (server, _) = listener.accept().unwrap();
+            let credentials = require_peer(&server, 0, 0).unwrap();
+            assert_eq!(credentials.pid, Some(0));
+            let pidfd = peer_pidfd(&server).unwrap();
+            let fdinfo = fs::read_to_string(fdinfo_path(&pidfd)).unwrap();
+            assert_eq!(fdinfo_pid(&fdinfo).unwrap(), 0);
+            // Identity still rests on the uid and gid across namespaces.
+            assert!(matches!(
+                require_peer(&server, 0, 1),
+                Err(PeerError::UnexpectedPeerGid { .. })
+            ));
+        }
     }
 
     #[test]
