@@ -117,7 +117,9 @@ jobs:
       - name: peercred tests on this kernel, as the runner user
         # require_peer_on_this_kernel expects SO_PEERPIDFD on Linux 6.5 and later and a
         # rejection before it; reaped_peer_rejected expects a stale pidfd (Pid -1).
-        run: cargo test --locked --lib peercred:: -- --nocapture
+        # A block scalar: in a plain one, the ": " after `peercred:` would start a YAML mapping.
+        run: |
+          cargo test --locked --lib peercred:: -- --nocapture
 
       - name: Run the #[ignore] tests as root
         # parent_owner_mismatch_rejected and socket_group_must_match_parent need root;
