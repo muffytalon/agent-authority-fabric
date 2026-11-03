@@ -19,7 +19,9 @@ yanked = "deny"
 #   and tinyvec (Zlib OR Apache-2.0 OR MIT).
 # - Unicode-3.0 covers the Unicode data tables in unicode-normalization 0.1.26 and
 #   unicode-ident 1.0.27, both licensed `(MIT OR Apache-2.0) AND Unicode-3.0`.
-allow = ["MIT", "Apache-2.0", "Unicode-3.0"]
+# - BSD-3-Clause covers subtle 2.6.1 (constant-time primitives), which p256 0.14.0 pulls in
+#   through elliptic-curve, ff and group. It is the only crate that needs it (WEEK2_PLAN step 3).
+allow = ["MIT", "Apache-2.0", "Unicode-3.0", "BSD-3-Clause"]
 confidence-threshold = 0.93
 
 [licenses.private]
@@ -30,6 +32,15 @@ ignore = true
 # Every dependency is pinned exactly, so a second version of any crate is a decision to review.
 multiple-versions = "deny"
 wildcards = "deny"
+# Crates that must never enter the tree (WEEK2_PLAN step 3).
+deny = [
+    { crate = "getrandom", reason = "keys and nonces come from /dev/urandom through std; p256 stays without `std`" },
+    { crate = "serde", reason = "all JSON goes through jcs (F-03); revisit in Week 5" },
+    { crate = "serde_json", reason = "silently drops duplicate keys (F-03); revisit in Week 5" },
+    { crate = "openssl", reason = "the crypto stack is RustCrypto p256 and sha2 only" },
+    { crate = "openssl-sys", reason = "the crypto stack is RustCrypto p256 and sha2 only" },
+    { crate = "ring", reason = "the crypto stack is RustCrypto p256 and sha2 only" },
+]
 
 [sources]
 # crates.io only: no other registry and no git dependencies.

@@ -1402,7 +1402,7 @@ networks:
 - `SigningKey` reproduces that signature exactly, high-S as it comes, and `normalize_s` changes it.
 - The tree adds 23 crates to the repo's lock, as RV counted: crypto-bigint 0.7.10 and ctutils 0.4.8 (RV said 0.4.7), with no getrandom.
 - The only new licence is `subtle`'s BSD-3-Clause. `ff` and `group` declare `MIT/Apache-2.0`.
-- Every new crate declares rust-version ≤ 1.87.
+- Every new crate that declares a rust-version declares ≤ 1.87. (Corrected in step 3: subtle 2.6.1 declares none.)
 - Mean sign and verify times on an AMD Ryzen 3 5300U, release: 0.57 ms and 0.56 ms on 1.97.1; 0.50 ms and 0.45 ms on 1.99.1.
 - `cargo tree -i getrandom --target all` exits 101 when nothing matches. The fail-closed form in step 3 finds 0 `getrandom` lines.
 - `cargo deny check` with the repo's `deny.toml`:
@@ -1589,10 +1589,11 @@ The stand-in, the clients and their pinned SDKs are in `spikes/d2-transport/`, a
 
 | Item | Why it is open | Settled at |
 |---|---|---|
-| `cargo deny` on the real tree with p256 | The probe tree passes the repo policy once BSD-3-Clause is allowed, and none of its 23 crates is already in the lock. A run on a scratch copy of the repo was refused here | Step 3 |
 | Engines copying an image directory's owner and mode into an empty volume (RV, from moby [84][85]); `*-state` volumes taking the image's owner | Docker is not installed yet: step 1 needs your sudo | Step 8 |
 | Whether the MCP conformance suite can run against the PEP | It takes an HTTP URL, its scenarios may need fixture tools, and the bridge must attach an Episode Token to `tools/list` and `tools/call` (RV3 D5) | Step 9 |
 | Source [65] | No reachable mirror; the plan does not rely on it | — |
+
+Settled in step 3 (2026-11-03) and removed from this table: `cargo deny` on the real tree with p256. The tree adds the probe's 23 crates exactly; with BSD-3-Clause allowed it passes with no warnings, and before that only `subtle` is rejected (`reports/Week2 crypto crate check.md`).
 
 Settled on 2026-11-03 and removed from this table (Appendix A):
 - the 31 Oct draft's row "`VerifyingKey::from_sec1_bytes` with only `["ecdsa"]`", by RV2's build and the probe;

@@ -14,6 +14,9 @@ lenient-numbers = []
 # Versions verified on crates.io 2026-10-24.
 [dependencies]
 base64 = { version = "=0.23.1", default-features = false, features = ["alloc"] } # 2026-08-04
+# ES256 for JWS and DSSE (WEEK2_PLAN step 3). `default-features = false` keeps out `std`, which
+# would enable getrandom, and `pem`/`precomputed-tables`; `ecdsa` adds `arithmetic` and `sha256`.
+p256 = { version = "=0.14.0", default-features = false, features = ["ecdsa"] }   # 2026-07-03, MSRV 1.85
 ryu-js = { version = "=1.0.3", default-features = false }                        # 2026-07-10
 sha2 = { version = "=0.11.1", default-features = false }                         # 2026-10-12, MSRV 1.88
 thiserror = "=2.0.21"                                                            # 2026-09-23

@@ -80,6 +80,21 @@ jobs:
       - name: 6. cargo deny check
         run: cargo deny check
 
+      - name: "G5: no getrandom on any target (fail-closed)"
+        # `cargo tree -i getrandom` exits 101 when nothing matches, so inverting its status would
+        # also pass when cargo itself fails. Instead, list the whole tree and fail if that fails,
+        # then fail on any getrandom line (WEEK2_PLAN step 3). deny.toml also bans the crate.
+        shell: bash
+        run: |
+          set -euo pipefail
+          tree="$RUNNER_TEMP/cargo-tree.txt"
+          cargo tree --locked --target all --all-features --prefix none > "$tree"
+          if grep '^getrandom v' "$tree"; then
+            echo "::error::getrandom is in the dependency tree"
+            exit 1
+          fi
+          echo "No getrandom in $(wc -l < "$tree") tree lines"
+
   ignored-tests:
     name: Ignored peercred tests (root)
     runs-on: ubuntu-24.04
