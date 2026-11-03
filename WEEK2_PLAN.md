@@ -4,9 +4,10 @@ Status: draft for review, 2026-11-03. D2 is CLOSED (2026-11-03). The other 17 de
 - **AP:** the attached Week 2 plan, "pep-sidecar Week 2 Plan: Toolchain, MCP Transport and Gate 1 Readiness", in the parent folder;
 - **MG:** the 29 Oct merge notes.
 
-It folds in two reviews:
+It folds in three reviews:
 - **RV**, the 31 Oct review of MG;
-- **RV2**, the review of this plan's 31 Oct draft.
+- **RV2**, the review of this plan's 31 Oct draft;
+- **RV3**, a review of this plan on 2026-11-03, after D2 closed. Each of its code claims was re-checked against `src/` before it was folded in (Appendix A).
 
 Each claim was checked against:
 - this repo at `bb25e27`;
@@ -15,7 +16,7 @@ Each claim was checked against:
 - the Week 1 verified plan;
 - the primary sources listed at the end.
 
-RV2's repo claims were re-checked on 2026-11-03, and its p256 build was reproduced on this machine. Its external claims (MCP rules, SDK timeouts, Rust regressions) were then checked against primary sources, and the FFI `bool` regression was tested on 1.97.1 directly. A third pass tested p256 with a prehash ≥ n and this kernel's pidfd behaviour, and settled the remaining web questions (Appendix A). Steps are renumbered from the 31 Oct draft. Appendix C maps the old numbers and says where every AP, MG, RV and RV2 item went.
+RV2's repo claims were re-checked on 2026-11-03, and its p256 build was reproduced on this machine. Its external claims (MCP rules, SDK timeouts, Rust regressions) were then checked against primary sources, and the FFI `bool` regression was tested on 1.97.1 directly. A third pass tested p256 with a prehash ≥ n and this kernel's pidfd behaviour, and settled the remaining web questions (Appendix A). Steps are renumbered from the 31 Oct draft. Appendix C maps the old numbers and says where every AP, MG, RV, RV2 and RV3 item went.
 
 ## TL;DR
 - **What Gate 1 needs:** four things that do not exist yet:
@@ -33,12 +34,21 @@ RV2's repo claims were re-checked on 2026-11-03, and its p256 build was reproduc
   - **E1:** who mints and ends Episode Tokens;
   - **J1:** whether canonical result bytes may change what the agent sees.
 - **D1's evidence is complete, but D1 stays OPEN until step 2.** All four fixes released after 1.97.1 have been traced, and none applies to it. One was tested on 1.97.1 directly; the other three came from changes first shipped in 1.98.0 or 1.99.0 (D1).
-- **The engine needs six changes** (§2a):
-  - forwarded bytes are built by a new `forward` module;
+- **RV3 found gaps in the Week 2 state model,** and this draft fixes them:
+  - restored reservations whose ids collide with new ones (R1);
+  - undefined episode identity, which let concurrent episodes multiply an intent's budget (E1);
+  - a confidentiality ratchet that reset with every episode (R1, E1);
+  - forwarding to a tool that drifted during a step-up wait (P1);
+  - drift hidden by a poll that fails (L1).
+
+  It also showed that about half of the 62 "attacks" could never reveal a bypass. §3 now counts 54 genuine attacks.
+- **The engine needs seven changes** (§2a):
+  - forwarded bytes are built by a new `forward` module, so the Episode Token never leaves the PEP;
   - `record_result_raw` accepts only `complete` results;
-  - G_pin gains a quarantine check;
-  - G_budget gains a `NeedsReconcile` check keyed on the entity;
-  - an engine is built from its intent's journaled ledger (R1);
+  - G_pin gains a quarantine check, re-run just before each upstream write;
+  - G_budget gains a `NeedsReconcile` check keyed on the entity, over both current and restored reservations;
+  - an engine is built from the journaled ledger: restored reservations keyed by (eid, rid), the intent's ratchet level and a fresh eid (R1, E1);
+  - one call's taint entries are journaled as one record;
   - step 10 adds the strict argument schema and per-tool step-up.
 
   `jcs` gains one result number mode (J1).
@@ -48,7 +58,7 @@ RV2's repo claims were re-checked on 2026-11-03, and its p256 build was reproduc
   - `prov` as witness hashes only;
   - JSON-only broker replies.
 
-  It is still more than a week of work (Risks).
+  It is still more than a week of work. Risks gives RV3's cut list, ordered by Gate 1 impact.
 
 ## Context
 Week 2 ends at Gate 1 (SPEC §4). SPEC §4 lists `SO_PEERPIDFD`, `src/lockfile.rs`, `src/tokens.rs` and the Gate 1 containment suite. Gate 1 also presupposes three things that SPEC §4 assigns to no week:
@@ -66,7 +76,7 @@ Facts this plan relies on (checked 2026-10-31, re-checked 2026-11-03; evidence i
 | Kernel | This machine runs WSL2 kernel 6.18.54.1. CI's `ubuntu-24.04` runner runs 7.0.0-1017-azure, a newer kernel [99]. `SO_PEERPIDFD` needs ≥ 6.5. Across PID namespaces, `PIDFD_GET_INFO` returns `EREMOTE` (7.0, and backported to 6.18.14), which was tested on this machine (Q1). |
 | Parsing | All JSON is parsed with `jcs`, never serde: requests, results, JWS headers and claims, DSSE payloads, the lockfile and the config. This rejects duplicate keys and duplicate claims (F-03). |
 | Limits | Request bodies are capped at 1 MiB, depth 64 and 8,192 values (`jcs` request profile). |
-| Engine today | Every agent `_meta` member outside `dev.pep-sidecar/` is forwarded inside `canonical_request`.<br>`commit` leaves the call in `in_flight`.<br>`record_result_raw` never reads `resultType`.<br>`require_peer_uid` checks the uid only.<br>`EffectClass` has four variants.<br>Budgets, reservations and the F-08 label store (`InMemoryLabelStore`) live only in memory. |
+| Engine today | The agent's whole request is forwarded inside `canonical_request`, with every `_meta` member outside `dev.pep-sidecar/`, plus the Episode Token itself. `is_reserved_meta` exempts `dev.pep-sidecar/episode`, and a test asserts the token is forwarded (RV3), so today the bearer token would reach the broker and the tool servers.<br>`commit` leaves the call in `in_flight`.<br>`record_result_raw` never reads `resultType`.<br>`require_peer_uid` checks the uid only.<br>`EffectClass` has four variants.<br>Budgets, reservations and the F-08 label store (`InMemoryLabelStore`) live only in memory. |
 | MCP | Revision 2026-07-28: stateless, with per-request `_meta`. Servers MUST implement `server/discover`. A client disconnect is a cancellation, and streams cannot be resumed. |
 | Clocks | Containers share the host's wall clock. Time namespaces offset only the monotonic and boot clocks [86], so one container's wall clock cannot be stepped on its own. |
 | Unicode | Digests use Unicode 18.0.0 NFC (SPEC §2). The stub broker shares the PEP's `jcs` code, so it uses the same tables. |
@@ -78,9 +88,9 @@ Gate 1 is evaluated on the release profile in the Compose topology (§4), not in
 
 | # | Criterion | Threshold |
 |---|---|---|
-| G1 | Containment attack tests passing, judged by the bypass oracle (§2a) | ≥ 50 attack tests per deployment profile in S1, run in Compose on this machine, with 0 bypasses. §3 lists 62. Its 45 conformance checks run in CI and must pass, but don't count |
-| G2 | Rug-pull mutations quarantined | All of ≥ 20 (§3 lists 25), each within the detection window T (L1), with no call forwarded to a drifted tool after detection, and 0 false positives on the negatives |
-| G3 | Replays of captured Episode Tokens and Call Proofs rejected | 1,000 of 1,000 in Compose, including restart replays. Clock steps are tested in-process (step 6) and reported beside G3 |
+| G1 | Containment attack tests passing, judged by the bypass oracle (§2a) | ≥ 50 attack tests per deployment profile in S1, run in Compose on this machine, with 0 bypasses. §3 lists 54. Its 74 conformance and robustness checks run in CI and must pass, but don't count |
+| G2 | Rug-pull mutations quarantined | All of ≥ 20 (§3 lists 27), each quarantining the mutated server within the detection window T (L1), with no call forwarded to it after detection (re-checked just before each upstream write), and 0 false positives on the negatives |
+| G3 | Replays of captured Call Proofs, and misuses of captured Episode Tokens, rejected | 1,000 of 1,000 in Compose, split across §3's classes, restart replays included. A live Episode Token reused by its own peer is by design, not a replay. Clock steps are tested in-process (step 6) and reported beside G3 |
 | G4 | p99 added latency of the PEP plus the broker, as defined in O1 | ≤ 25 ms, with the PEP-only p99 reported beside it. Release build, in Compose on this machine, with the CPU model recorded |
 | G5 | Supply chain | `cargo deny check` clean, with no ignores. Exactly one crypto-bigint, ≥ 0.7.6. No getrandom anywhere in `cargo tree --target all`, checked fail-closed (step 3). (`cargo audit` is dropped: `cargo deny` reads the same RustSec database.) |
 | G6 | Decisions | Every §1 decision CLOSED, with its rationale recorded |
@@ -91,7 +101,7 @@ Status: D2 is CLOSED (2026-11-03); the other 17 are OPEN. Each closes just befor
 - **N1 and B1** close before step 8.
 - **S1 and O1** close before step 9.
 
-RV2 had T1, L1 and Q1 closing after step 2. RV2's own reordering (§2) moves them into step 2: crypto, peer identity and tokens now come before the binary, and the config's `pins` section uses the lockfile v1 payload. "Recommendation" is a label, not a decision.
+RV2 had T1, L1 and Q1 closing after step 2. RV2's own reordering (§2) moves them into step 2: crypto, peer identity and tokens now come before the binary, and the config's `pins` section uses the lockfile v1 payload. "Recommendation" is a label, not a decision. RV3's questions for step 2 are listed at the end of this section, with where each is now answered.
 
 | ID | Decision | Recommendation | Blocks step | Closes |
 |---|---|---|---|---|
@@ -100,17 +110,17 @@ RV2 had T1, L1 and Q1 closing after step 2. RV2's own reordering (§2) moves the
 | N1 | Network model | (a) `network_mode: none` for the agent, the PEP and the operator, with the broker on an internal network | 8 | Before step 8 |
 | Q1 | Peer identity across PID namespaces; peer gid | (i) cross-namespace pidfd mode, plus a gid check | 4 | Step 2 |
 | S1 | Deployment profiles in Gate 1 | Compose only | 9 | Before step 9 |
-| M1 | MCP 2026-07-28 surface | The PEP is a full 2026-07-28 server to the agent, and builds every upstream request itself | 7 | Step 2 |
-| M2 | Results that are not `complete` | Never recorded. A payment becomes `abort(Unknown)` | 7 | Step 2 |
-| P1 | Payment outcome mapping | The table in P1. Step-up waits are capped at 50 s | 7 | Step 2 |
-| R1 | Restarts with in-memory state | (a) per-boot keys plus a payment and taint journal | 6, 7 | Step 2 |
-| E1 | Episode lifecycle | `start_episode` and `end_episode` on the control socket, a 30-minute idle timeout, and the token delivered on stdin | 6, 7 | Step 2 |
-| H1 | Host control socket | `/run/pep-ctl` owned 20002:20004 with mode 2750, operator uid 20004 | 7 | Step 2 |
-| T1 | Token profiles | rfc8725bis-10 rules with a header allowlist and strict base64url. Call Proof `typ` `pep-callproof+jwt`, low-S, on every forwarded call. A per-episode rate limit sizes the replay cache | 6 | Step 2 |
-| L1 | Lockfile v1 content | Engine-named fields. The unsigned payload is also the config's `pins`. DER signatures only. Drift found by polling | 7, 10 | Step 2 |
-| O1 | Latency definition | PEP plus broker residence time, under open-loop load, with the PEP alone reported beside it | 9 | Before step 9 |
-| B1 | Release build profile | `overflow-checks = true`; `panic = "abort"` only together with R1 (a) | 8 | Before step 8 |
-| U1 | Wire shapes of denials and errors | One shape for every policy denial; MCP-mandated errors keep their codes, in a fixed order | 7 | Step 2 |
+| M1 | MCP 2026-07-28 surface | The PEP is a full 2026-07-28 server to the agent, assigns each request's JSON-RPC id itself, and builds every upstream request itself | 7 | Step 2 |
+| M2 | Results that are not `complete` | Never recorded. A payment's reservation follows the broker's explicit outcome (P1) | 7 | Step 2 |
+| P1 | Payment outcome mapping | The table in P1, with a defined point of forwarding and a re-check just before it. The step-up wait plus the upstream timeout stays at or under 55 s | 7 | Step 2 |
+| R1 | Restarts with in-memory state | (a) per-boot keys, plus a journal of payments, taint and the confidentiality ratchet. Restored reservations are keyed by (eid, rid) | 6, 7 | Step 2 |
+| E1 | Episode lifecycle | `start_episode` mints a fresh eid; at most one live episode per intent; one agent process per episode. `end_episode`, a 30-minute idle timeout, and the token delivered on stdin | 6, 7 | Step 2 |
+| H1 | Host control socket | `/run/pep-ctl` owned 20002:20004 with mode 2750, operator uid 20004, with its own connection capacity, served first | 7 | Step 2 |
+| T1 | Token profiles | rfc8725bis-10 rules with a header allowlist and strict base64url. Call Proof `typ` `pep-callproof+jwt` on every forwarded call. Low-S required on both token types. Revocation keyed by eid. A per-episode rate limit sizes the replay cache | 6 | Step 2 |
+| L1 | Lockfile v1 content | Engine-named fields and the full canonical definitions. The unsigned payload is also the config's `pins`. DER signatures only. Drift found by polling; any drift or failed poll quarantines the whole server | 7, 10 | Step 2 |
+| O1 | Latency definition | PEP plus broker residence time, under open-loop load with stated provisioning, with the PEP alone reported beside it | 9 | Before step 9 |
+| B1 | Release build profile | `overflow-checks = true`; `panic = "abort"` only together with R1 (a); the release binary builds with default features | 8 | Before step 8 |
+| U1 | Wire shapes of denials and errors | One shape for every policy denial; MCP-mandated errors keep their codes; one total reply order | 7 | Step 2 |
 | J1 | Result fidelity | (b) the result profile keeps the exact digits of integers beyond ±(2^53−1) | 7 | Step 2 |
 | A1 | Engine threading | One actor thread per episode | 7 | Step 2 |
 
@@ -172,14 +182,19 @@ RV2 had T1, L1 and Q1 closing after step 2. RV2's own reordering (§2) moves the
   - The Episode Token stays in `_meta["dev.pep-sidecar/episode"]`.
   - `Pep-Episode` is optional, and a mismatch gets 400 and -32020.
 - **Why:** the closing condition is met. Both SDK v2 lines ran `server/discover`, `tools/list`, `tools/call` and `subscriptions/listen` against the stand-in, sending every header and `_meta` field M1 checks.
+- **The Episode Token (added after RV3's finding E1).** The first runs attached no token, so a second pair of runs tested whether a caller can (Appendix A):
+  - In both SDKs, a client-wide `Pep-Episode` header reaches every request, including the SDK's own `server/discover` probe and `subscriptions/listen`.
+  - Both SDKs let the caller set `_meta["dev.pep-sidecar/episode"]` on `tools/list` and `tools/call`, where it survives beside the SDK's own `_meta` keys.
+  - Neither takes caller `_meta` on `subscriptions/listen`. M1 therefore requires the token on `tools/list` and `tools/call` only, which `_meta` covers, so SPEC §3.3 needs no change.
 - **Conditions on agents** (the Gate 1 harness, and Week 4's, §5):
   - TypeScript needs `versionNegotiation: { mode: { pin: '2026-07-28' } }`, and `fetch` and `Agent` from the same `undici` package;
-  - Python needs an `httpx2.AsyncHTTPTransport(uds=…)` client with `trust_env=False`, passed as `http_client`.
+  - Python needs an `httpx2.AsyncHTTPTransport(uds=…)` client with `trust_env=False`, passed as `http_client`;
+  - both attach the token in `_meta` on `tools/list` and `tools/call`, and may also send it as a matching `Pep-Episode` header.
 - **Consequences for other decisions:**
-  - M1: the PEP must accept string JSON-RPC ids;
+  - M1: the transport must accept string JSON-RPC ids on every method. The engine already accepts string and safe-integer ids for `tools/call` (`canonical_call_id`). M1 now has the PEP assign its own id (RV3 F6);
   - `notifications/cancelled` handling belongs to U1, which stays open.
-- **Evidence:** `spikes/d2-transport/`.
-- **SPEC:** §1 and §4 updated (§6).
+- **Evidence:** `spikes/d2-transport/` (11 runs).
+- **SPEC:** §1 and §4 updated (§6). After RV3's finding E2, §1 says what "one request per connection" means for each kind of reply.
 
 ### N1. Network model
 - **Evidence:**
@@ -269,42 +284,48 @@ RV2 had T1, L1 and Q1 closing after step 2. RV2's own reordering (§2) moves the
   | Method | Handling |
   |---|---|
   | `tools/call` | The engine. The transport parses the body once and builds the `ToolCall`. |
-  | `tools/list` | Served by the PEP from its cached, verified view, never fetched upstream per agent request:<br>• a valid Episode Token is required;<br>• the view holds only definitions whose canonical digest matches the lockfile pin and that are not quarantined;<br>• the drift poller (L1) refreshes it from every upstream page;<br>• one page, `ttlMs: 0` (a quarantine can change it at any moment), `cacheScope: "private"`. |
-  | `server/discover` | Answered by the PEP:<br>• no token needed;<br>• `supportedVersions: ["2026-07-28"]`;<br>• `capabilities: {"tools": {}}`;<br>• `ttlMs: 0`, `cacheScope: "public"`;<br>• no upstream `instructions` unless the lockfile pins their text. |
-  | `subscriptions/listen` | A PEP-generated SSE stream, the only non-JSON reply:<br>• first `notifications/subscriptions/acknowledged`, with the subscription id and `notifications: {}`, because the PEP supports no notification type;<br>• then the completion result, and the stream closes. Closing gracefully tells the client not to reconnect.<br>The PEP does not also send `notifications/cancelled` (the M1 ambiguity): both SDKs treat it as an unexpected close.<br>Both SDKs (Python 2.3.0, TypeScript 2.4.0) accept this reply, end the subscription gracefully, and never re-listen on their own. |
+  | `tools/list` | Served by the PEP from the lockfile, never fetched upstream per agent request:<br>• a valid Episode Token is required;<br>• the PEP serves the full canonical definitions the lockfile pins (L1), minus every tool of a quarantined server. It never serves upstream text it has not pinned;<br>• the drift poller (L1) only compares upstream against the pins;<br>• one page, `ttlMs: 0` (a quarantine can change it at any moment), `cacheScope: "private"`. |
+  | `server/discover` | Answered by the PEP:<br>• no token needed;<br>• `supportedVersions: ["2026-07-28"]`;<br>• `capabilities: {"tools": {}}`;<br>• `ttlMs: 0`, `cacheScope: "public"`;<br>• no upstream `instructions` unless the lockfile pins their text, which it then serves. |
+  | `subscriptions/listen` | A PEP-generated SSE stream, the only non-JSON reply. No token is needed: the reply is constant and reveals nothing (RV3 F8):<br>• first `notifications/subscriptions/acknowledged`, with the subscription id and `notifications: {}`, because the PEP supports no notification type;<br>• then the completion result, and the stream closes. Closing gracefully tells the client not to reconnect.<br>The PEP does not also send `notifications/cancelled` (the M1 ambiguity): both SDKs treat it as an unexpected close.<br>Both SDKs (Python 2.3.0, TypeScript 2.4.0) accept this reply, end the subscription gracefully, and never re-listen on their own. |
   | Anything else, `ping` included | 404 and -32601 |
 
 - **Client notifications.**
   - A `notifications/cancelled` POST gets 202 and is ignored, before the checks below. The TypeScript SDK sends one, without `Mcp-Method`, when it closes a subscription itself. A 400 there surfaces as a client error event (Appendix A).
   - The PEP never acts on it. Cancellation stays the closing of the connection (P1), so the notification never touches a reservation.
   - Any other notification gets 400.
-- **Agent requests, checked in the transport, before the engine.** HTTP-level replies (405, 403) come first. Then, in this order, so each request gets exactly one reply:
+- **Agent requests, checked in the transport, before the engine.** U1 gives the one total order for every reply (RV3 B3). Its header and `_meta` steps are:
   1. a missing standard header → -32020;
   2. a missing `_meta` field (`protocolVersion` or `clientCapabilities`), or a `clientCapabilities` that is not an object → -32602;
   3. a header that differs from the body or from `_meta` → -32020. `Mcp-Name` is base64-decoded and NFC-normalized before comparing, and a `Pep-Episode` mismatch is included;
   4. any `Mcp-Param-*` header → -32020, because no pinned tool declares `x-mcp-header`;
   5. a version that is present and consistent but not `2026-07-28` → -32022.
 
-  Request ids may be strings: the SDKs used `"server-discover-probe-1"`, `"listen:0"` and `"listen-1"`.
+- **Request ids.**
+  - The agent's id may be a string or a safe integer; the SDKs used `"server-discover-probe-1"`, `"listen:0"` and `"listen-1"`.
+  - A string id must be 1–64 printable ASCII characters, so no NFC change can alter it. Anything else gets 400 and -32600.
+  - The PEP replaces the agent's id with its own ULID before the engine sees the request, and puts the agent's id back on the reply (RV3 F6). `DuplicateCallId` then cannot fire when a harness recreates its client mid-episode. Every engine call id, upstream id and log join key is also unique across boots (RV3 A6).
+  - SPEC §2's `cid` becomes that PEP-assigned id (§6).
 
   After the checks:
   - every other agent `_meta` member is dropped and never forwarded;
   - `g_canon` keeps its denial of reserved `dev.pep-sidecar/` members.
 - **Episode Token bindings:**
-  - its `eid` selects the episode's actor (A1);
-  - `peer_uid` must equal the connection's uid;
+  - `tools/list` and `tools/call` require the token, in `_meta["dev.pep-sidecar/episode"]`. A `Pep-Episode` header, if present, must match. `server/discover` and `subscriptions/listen` need none. Both SDKs can attach `_meta` to these two methods (D2);
+  - its `eid` selects the episode's actor (A1), and must name a live episode: end and idle are tracked per eid (T1);
+  - `peer_uid` must equal the connection's uid, re-checked on every use of a cached token (RV3 F8);
   - `release_epoch` must equal the loaded lockfile's, which must be ≥ the config's `min_accepted_epoch`;
   - `intent_digest` must equal the configured intent's.
 - **Upstream requests, always built by the PEP:**
-  - `forward::tools_call_request` builds the body: a PEP-assigned JSON-RPC id, the canonical name and arguments, and `_meta` = `protocolVersion`, `clientCapabilities: {}`, the PEP's `clientInfo` and the Call Proof.
+  - `forward::tools_call_request` builds the body: the PEP-assigned ULID the engine saw, the canonical name and arguments, and `_meta` = `protocolVersion`, `clientCapabilities: {}`, the PEP's `clientInfo` and the Call Proof.
   - Headers are derived from that body: `MCP-Protocol-Version`, `Mcp-Method` and `Mcp-Name`, with no `Mcp-Param-*`.
-  - Nothing the agent sent (headers, `_meta` members, id, `logLevel`, `progressToken`) is copied. The PEP is an MCP endpoint, not an HTTP intermediary.
+  - Nothing the agent sent (headers, `_meta` members, id, `logLevel`, `progressToken`) is copied, and that includes the Episode Token, which today's `canonical_request` does forward (Context). The PEP is an MCP endpoint, not an HTTP intermediary.
 - **Upstream responses** (the broker answers JSON only; §2a):
   - `application/json` only, with byte and time caps. An SSE reply or any other content type is invalid;
   - exactly one response, whose id must match;
   - an unknown or absent `resultType` is invalid (M2);
+  - for a payment, the broker's explicit outcome decides the reservation (P1), and `resultType` decides only whether the result is recorded (RV3 B6);
   - `_meta["dev.pep-sidecar/outcome"]` is trusted only on a connection whose peer uid is 20003; after it is read, the result's `_meta` is dropped.
-- **Mutual peer checks:** the broker requires peer uid 20002, and the PEP requires 20003.
+- **Mutual peer checks:** the broker requires peer uid and gid 20002, and the PEP requires 20003 for both (RV3 F7).
 
 ### M2. Results that are not `complete`
 **Evidence:**
@@ -318,7 +339,10 @@ RV2 had T1, L1 and Q1 closing after step 2. RV2's own reordering (§2) moves the
 - Send empty `clientCapabilities` upstream, and advertise no extensions.
 - `record_result_raw` accepts only `resultType == "complete"`.
 - An absent `resultType` is rejected too. That deliberately departs from the client MUST above. It is safe because the lockfile pins 2026-07-28 servers, which must send the field, so an absent one means the server is not what was pinned. SPEC records the deviation (§6).
-- Anything else is never recorded or forwarded: a non-payment call is abandoned, and a payment gets `abort(Unknown)`.
+- Anything else is never recorded or forwarded to the agent. A non-payment call is abandoned. A payment's reservation still follows the broker's explicit outcome (P1, RV3 B6):
+  - `executed` commits, and the result is abandoned;
+  - `refused` gives `abort(DefinitelyNotExecuted)`;
+  - `unknown`, or no outcome, gives `abort(Unknown)`.
 - MRTR retries stay rejected in `g_canon`, now deliberately, with a test named for it.
 
 ### P1. Payment outcome mapping
@@ -335,12 +359,26 @@ RV2 had T1, L1 and Q1 closing after step 2. RV2's own reordering (§2) moves the
 | The explicit outcome is `refused` with a tool result, never inferred from an HTTP status or `isError` | `record_result_raw` first, then `abort(DefinitelyNotExecuted)`. `abort` removes `in_flight`, so recording after it would fail | The recorded refusal |
 | The broker rejects the Call Proof (`refused`, with no tool result: the call was never forwarded) | `abort(DefinitelyNotExecuted)` | `PEP_UNAVAILABLE` |
 | Broker timeout, disconnect, an ambiguous reply, or outcome `unknown` | `abort(Unknown)`. Nothing is recorded | `PEP_UNAVAILABLE` |
-| The agent disconnects before the call is forwarded, a step-up wait included | `abort(DefinitelyNotExecuted)` | — |
-| The agent disconnects after the call is forwarded | Nothing from the agent side. The upstream leg runs to completion or timeout, and its outcome applies | — |
+| The agent disconnects before the point of forwarding, a step-up wait included | `abort(DefinitelyNotExecuted)` | — |
+| The agent disconnects after the point of forwarding | Nothing from the agent side. The upstream leg runs to completion or timeout, and its outcome applies | — |
 | Step-up declined or timed out | `abort(DefinitelyNotExecuted)`: nothing was sent | `PEP_DENIED` |
+| The re-check just before forwarding fails (a quarantined server, a changed epoch, an ended episode) | `abort(DefinitelyNotExecuted)`: nothing was sent | `PEP_DENIED` |
+| A journal append or fsync fails before forwarding (R1) | `abort(DefinitelyNotExecuted)` | `PEP_UNAVAILABLE` |
 | Any non-payment call | Record and forward. On a timeout or error, `abandon` | `PEP_UNAVAILABLE` on failure |
 
-- **Outcome sources:** outcomes come only from the upstream side, never from anything the agent does. That includes a `notifications/cancelled` naming a forwarded call's id, which the PEP accepts and ignores (M1).
+- **Outcome sources (corrected after RV3 B1):**
+  - No agent message changes a reservation. That includes a `notifications/cancelled` naming a forwarded call's id, which the PEP accepts and ignores (M1).
+  - An agent disconnect releases a reservation only before its point of forwarding.
+  - After that point, a reservation ends only through the broker's explicit outcome or a timeout of the upstream leg.
+  - Before it, a reservation can also end through the operator (a decline), a timer (a step-up timeout), `end_episode`, or a local failure (a failed re-check or journal write).
+- **Point of forwarding (RV3 A8).**
+  - Each episode's actor (A1) decides it alone. It is the moment the actor fsyncs the reservation's `forwarded` journal record (R1). Under R1 (b) it is the moment the actor hands the call to its upstream worker.
+  - The actor then hands the call to a worker thread, which makes the upstream call and reports the result back to the actor.
+  - After that point nothing on the agent's side changes the reservation.
+- **Re-check just before forwarding (RV3 A4).**
+  - Immediately before the point of forwarding, the actor re-runs G_pin's checks: the server is not quarantined, and the lockfile epoch is unchanged. It also confirms the episode is still live.
+  - On a failure the call gets `abort(DefinitelyNotExecuted)` and `PEP_DENIED`.
+  - This closes the gap where a payment evaluated before drift was detected waited for step-up, was approved, and reached a drifted tool.
 - **Step-up waits.** The agent's request stays open for up to `step_up_timeout_ms`. Clients give up sooner than a human approval can take (verified 2026-11-03; Appendix A):
   - **TypeScript SDK:** `DEFAULT_REQUEST_TIMEOUT_MSEC` is 60,000 in both v1 (1.32.2) and v2 (`@modelcontextprotocol/client` 2.4.0). It applies whenever the caller passes no `timeout` [93][94]. Only progress notifications reset it, and only when the caller sets `resetTimeoutOnProgress` (default false).
   - **Node `fetch`** (undici's default global Agent): 300 s to receive the headers, and 300 s between body chunks [95].
@@ -351,7 +389,7 @@ RV2 had T1, L1 and Q1 closing after step 2. RV2's own reordering (§2) moves the
   - **(i)** cap `step_up_timeout_ms` below the shortest client timeout, the TypeScript SDK's 60 s;
   - **(ii)** answer step-up calls with SSE and send `:` keep-alives. Keep-alives reset undici's body timer and httpx2's read timer, but not the TypeScript SDK's request timer, which only an opted-in progress notification resets.
 
-  Recommended: (i), with `step_up_timeout_ms` ≤ 50,000 in Week 2. Longer approvals wait for Week 4 (§5).
+  Recommended: (i). The agent's request waits for the step-up and then for the upstream call, so `step_up_timeout_ms` + `upstream_timeout_ms` must stay at or under 55,000, checked when the config loads (RV3 F2). The defaults are 45,000 + 10,000. Longer approvals wait for Week 4 (§5).
 - **Late approvals:** if the agent disconnects during a step-up wait, the reservation is released (the "before forwarded" row). A later approval finds no `AwaitingStepUp` reservation and is refused (C-CTL).
 - **Retries after `Unknown`:**
   - A retry gets a new reservation id, and so a new F-07 key that the provider cannot dedupe.
@@ -359,6 +397,10 @@ RV2 had T1, L1 and Q1 closing after step 2. RV2's own reordering (§2) moves the
   - **Why the entity, not the `action_digest`:** the agent controls the digest. `pay_invoice` has a free `Data` argument (`/memo`), so changing one byte gives a new digest. G_prov does force a fresh lookup. But if the system of record still shows the amount due because the first payment is pending, a second payment passes, and `per_entity_max_uses` (2 in the test config) allows it (RV2).
   - Entity plus amount and currency was the alternative. The entity alone is stricter.
   - This replaces Five-Track §3.6's (eid, action_digest, idempotency_key) dedupe.
+- **Broker outcome mapping (RV3 B6).** The stub tool server reports `status`, and the broker maps it as follows:
+  - `executed` → `executed`;
+  - `declined` → `refused`;
+  - `pending`, a missing status, or anything ambiguous → `unknown`.
 - **In-flight accounting:** a unit test checks that `in_flight` drains to zero after a run.
 
 ### R1. Restarts with in-memory state
@@ -368,18 +410,33 @@ RV2 had T1, L1 and Q1 closing after step 2. RV2's own reordering (§2) moves the
   - B1 makes it worse: with `panic = "abort"`, any panic the agent can reach becomes "restart, start the episodes again, fresh limits".
   - The label store is lost too, so a value an agent wrote before a restart reads as untainted after it. That launders causality across the restart (F-08).
   - A broker restart empties its `jti` cache inside the 60-second Call Proof window.
+  - Three gaps RV3 found in the 3 Nov design (each fixed below):
+    - **Colliding ids.** Restored reservations kept their old ids, while every new engine numbers reservations from 1 (engine.rs:1023), and an insert replaces an entry with the same id (engine.rs:1637). A new payment could overwrite a restored `NeedsReconcile` entry and so unblock a second payment to that entity (A1).
+    - **A resetting ratchet.** The F-09 ratchet (`context_conf`) starts at Public in every engine (engine.rs:1016), and was not journaled (A3).
+    - **Uncounted calls.** Only forwarded payments were journaled, so a reservation released before forwarding still counted in `calls` (abort never decrements it), yet a restart refunded it (B5).
 - **Options:**
-  - **(a) A small write-ahead journal** (RV2), for payment reservations and F-08 taint records.
+  - **(a) A small write-ahead journal** (RV2), for payment reservations, F-08 taint records and the F-09 ratchet.
   - **(b) Accepted risk:** record the budget reset and the taint loss as accepted Gate 1 risks, in those words, and keep `panic = "unwind"` (B1).
 - **The journal, under (a):**
-  - **Where:** `/var/lib/pep/journal.jsonl`, on an on-disk named volume (`pep-state`, owned 20002, mode 0700) that only the PEP mounts.
-  - **Payment records:** before a payment is forwarded, the PEP appends a `reserve` record {intent, eid, rid, entity, amount_minor, currency, action_digest, idempotency_key} and fsyncs it. After the upstream leg it appends an `outcome` record (`executed`, `refused` or `unknown`).
-  - **Taint records:** a journal-backed `LabelStore` appends and fsyncs each F-08 record before `record` returns. F-08 records at decision time, so taint is durable before the write is forwarded.
-  - **Fail closed:** if an append or fsync fails, the payment gets `abort(DefinitelyNotExecuted)`, the write is denied, and the agent gets `PEP_UNAVAILABLE`. Outcome records need no fsync: losing one only replays its reservation as unresolved, which fails closed.
+  - **Where:** `/var/lib/pep/journal.jsonl`, on an on-disk named volume (`pep-state`, owned 20002, mode 0700) that only the PEP mounts. The decision log lives on its own volume (`pep-log`, §2a), so a flood of logged errors cannot fill the journal's disk (RV3 B4).
+  - **Lock and boot (RV3 A9).**
+    - The PEP takes an exclusive `File::try_lock` on `journal.lock` before it reads the journal, so a second instance stops before replay.
+    - At boot it truncates a torn last line (an append whose fsync never completed, so its call was never forwarded), fsyncs, and only then serves.
+    - Any other malformed line stops the PEP from starting.
+  - **Payment records (RV3 B5, A8):**
+    - `reserve` {intent, eid, rid, entity, amount_minor, currency, action_digest, idempotency_key}, appended when the reservation is made, step-up waits included;
+    - `forwarded` {eid, rid}, appended and fsynced at the point of forwarding (P1), before the upstream write;
+    - `outcome` {eid, rid, result}, where the result is `executed`, `refused`, `unknown` or `released`. `released` covers a decline, a step-up timeout, an agent disconnect before forwarding, a failed re-check and `end_episode`.
+  - **Taint and ratchet records.** A journal-backed `LabelStore` takes one call's F-08 entries as a single record (`record_all`). The intent's F-09 ratchet level is journaled whenever it rises (RV3 A3). Both are durable before the call is forwarded.
+  - **One fsync per call, with group commit (RV3 A9).** A call's records go in one append and one fsync. The shared writer batches appends that arrive together, so one agent write, with its tens of taint entries, cannot stall every episode's payments. G4's load mix includes writes (O1).
+  - **Capacity.** The label store's capacity is checked before an append. A write that would exceed it is denied (fail closed), so replay can never overflow the store.
+  - **Fail closed:** if an append or fsync fails, a payment gets `abort(DefinitelyNotExecuted)`, a write is denied, and the agent gets `PEP_UNAVAILABLE`. `outcome` records need no fsync: losing one only replays its reservation as unresolved, which fails closed.
   - **Replay at boot:**
-    - Per intent, the counters are rebuilt to what the engine would hold had it not restarted.
-    - Unresolved entries (no outcome, or `unknown`) come back as `NeedsReconcile`. They count in `reserved`, in `calls` and in entity uses.
-    - A torn last line is dropped, because its fsync never completed, so its call was never forwarded. Any other malformed line stops the PEP from starting.
+    - Per intent, `committed`, `calls` and entity uses are rebuilt from every `reserve` and its outcome, so released reservations still count in `calls` (SPEC §3.1).
+    - Entries that were `forwarded` with no outcome, or with `unknown`, come back as `NeedsReconcile`. They count in `reserved`, in `calls` and in entity uses.
+    - Restored reservations keep their original (eid, rid), in a set separate from the new episode's own reservations, so a new id can never overwrite one (RV3 A1). They fund nothing: their funding witness matches no record.
+    - The set of entities with an unresolved payment is PEP-wide, because two intents may name the same invoice. `ReconcilePending` checks it for every payment, in every intent.
+    - The intent's highest ratchet level is restored too.
   - **Every episode of an intent starts from that ledger.** RV2 had unresolved entries count against the intent. Committed spend counts too: without it, a restart would still refund it. So neither a restart nor a new episode refunds spend.
     - This makes a configured intent behave like the Week 5 RAR, which binds one `episode_id`.
     - Gate 1 tests use one intent per test group.
@@ -396,14 +453,20 @@ RV2 had T1, L1 and Q1 closing after step 2. RV2's own reordering (§2) moves the
 - **Evidence:** neither AP nor MG says who mints Episode Tokens. Five-Track §3.6 has the PEP mint them on a trusted `start_episode` call, with a 30-minute idle timeout that SPEC §3.3 dropped.
 - **Recommendation:**
   - **Minting.** `start_episode(intent)` on the control socket (H1) mints the token: `typ` `pep-episode+jwt`, with SPEC §3.3's claims and `exp − iat ≤ 28800`.
-    - It builds the episode's engine from the intent's journaled ledger (R1).
+    - **A fresh eid (RV3 A2).** It mints a fresh ULID eid and writes it into the engine's `PepIntent.episode_id` and into the token's `txn` (SPEC §3.2). The engine's F-07 key (built from `intent.episode_id`, engine.rs:1475) and the broker's (built from the proof's `eid`) therefore agree.
+    - It builds the episode's engine from the intent's journaled ledger, ratchet level included (R1).
+    - **At most one live episode per intent (RV3 A2).** "Live" includes an ended episode whose calls are still upstream. `start_episode` for an intent that has one is refused (a C-CTL check). Otherwise each concurrent episode would read the ledger once and spend on its own, multiplying `cumulative_max_minor`, `max_calls` and `per_entity_max_uses`.
     - It is refused once `limits.episodes` episodes are live.
-  - **Ending.** `end_episode(eid)` revokes one episode without a restart (§2a control protocol).
+  - **Ending.** `end_episode(eid)` revokes one episode without a restart (§2a control protocol). Revocation and idle state are keyed by eid, never by token bytes (T1).
   - **Idle timeout.** Restore the 30-minute idle timeout.
   - **Keys.** The Episode Token key is separate from the Call Proof key.
-  - **Week 2 claim values.** Week 2 fills `sub`, `client_id`, `rar_digest` and `txn` from the configured intent; Week 5's RAR and Txn-Token values replace them.
+  - **Week 2 claim values.** Week 2 fills `sub`, `client_id` and `rar_digest` from the configured intent, and `txn` is the episode's eid; Week 5's RAR and Txn-Token values replace them.
   - **Why the token has no `iss`, `aud`, `jti` or `nbf`.** The PEP mints and verifies the token itself, and the distinct `typ` and key make Episode Token and Call Proof validation mutually exclusive (rfc8725bis-10 §3.12 [74]). Record this in SPEC §3.3.
   - **Getting the token to the agent.** The Gate 1 harness writes the token to the agent process's stdin. Never argv, env or a volume, for the same reason C-PROC checks the PEP's argv.
+  - **One agent process per episode (RV3 A3).**
+    - The harness starts a fresh agent process for each episode, and gives a token only to a process that has never held another. After a PEP restart it restarts the agent too.
+    - So a process that read Secret data never carries it into a later episode's context.
+    - The journaled ratchet (R1) is the backstop if a harness breaks this rule. SPEC §3.3 states the rule (§6).
 
 ### H1. Host control socket
 - **Evidence.** MG's "0700, operator uid" contradicts itself:
@@ -412,7 +475,8 @@ RV2 had T1, L1 and Q1 closing after step 2. RV2's own reordering (§2) moves the
 - **Recommendation:** use this layout, which `bind_safe_listener` accepts unchanged:
   - `/run/pep-ctl`, owned 20002:20004, mode 2750, where 20004 is a new operator uid;
   - never mounted into the agent;
-  - peer uid 20004 required.
+  - peer uid 20004 and gid 20004 required (`require_peer`, RV3 F7);
+  - **its own capacity (RV3 A11):** the control socket has its own connection limit (`limits.control_connections`), separate from the agent's, and each actor drains its host channel before its agent channel. So a flooding agent cannot delay `end_episode`, a decline or an approval.
 - **Approvals:**
   - they carry (eid, rid, `action_digest`, amount);
   - all four are checked against the `AwaitingStepUp` reservation before `approve_step_up(rid)`, which takes only the rid;
@@ -423,8 +487,8 @@ RV2 had T1, L1 and Q1 closing after step 2. RV2's own reordering (§2) moves the
 ### T1. Token profiles
 **JOSE rules** for both token types (rfc8725bis-10 [74]):
 - an algorithm allowlist of ES256 only, with each key bound to one algorithm and one token type;
-- an allowlist of protected-header parameters: `alg` and `typ` required, `kid` optional, and any other member rejects. This replaces AP's deny list of `jku`, `jwk`, `x5u` and `crit` (RV2);
-- reject any compact token containing a character outside `[A-Za-z0-9_-.]` before decoding;
+- an allowlist of protected-header parameters: `alg`, `typ` and `kid` required, and any other member rejects. This replaces AP's deny list of `jku`, `jwk`, `x5u` and `crit` (RV2). `kid` is the RFC 7638 thumbprint of the current boot's key, so a token or proof from a previous boot fails on `kid` before its signature is checked (RV3, question 5);
+- reject any compact token containing a character outside `[A-Za-z0-9_.-]` before decoding;
 - strict base64url decoding, with no padding and no non-zero trailing bits, so each token has exactly one encoding. base64's `URL_SAFE_NO_PAD` engine, which `jcs` already uses, does both (Appendix A). The `_INDIFFERENT` engines are never used;
 - exact `typ`;
 - a 64-byte r‖s signature;
@@ -442,7 +506,7 @@ RV2 had T1, L1 and Q1 closing after step 2. RV2's own reordering (§2) moves the
 
 **Signatures.**
 - The PEP normalizes its signatures to low-S. p256's signer emits high-S as it comes: the RFC 6979 A.2.5 signature it reproduces is high-S. So the PEP calls `normalize_s` itself.
-- The broker rejects high-S Call Proofs.
+- The broker rejects high-S Call Proofs, and the PEP rejects high-S Episode Tokens. Each token then has exactly one valid signature as well as one encoding (RV3 A7). p256's `verify` accepts high-S (Appendix A), so both verifiers check it explicitly.
 - DSSE verification accepts high-S, because the signers are third-party tools.
 - The replay cache is keyed on `jti`, never on signature bytes.
 
@@ -451,7 +515,7 @@ RV2 had T1, L1 and Q1 closing after step 2. RV2's own reordering (§2) moves the
 - `tool_schema_digest`: the lockfile's pinned upstream digest;
 - concrete `iss` and `aud` SPIFFE ids;
 - the target-server binding: a claim, or the server inside `aud`;
-- which claims the broker checks;
+- which claims the broker checks. It requires `rid` exactly when the lockfile marks the tool as a payment (RV3, question 5);
 - `prov`: the witness origin hashes `Allowed.prov` already holds, at most two, and exact. RV2 cut the second option (capped `leaf_index` matches), so the former step 11 folds into step 6.
 
 `tth` follows wimse-wpt-02 [75], as the hash of the Txn-Token, and waits for Week 5.
@@ -473,10 +537,15 @@ RV2 had T1, L1 and Q1 closing after step 2. RV2's own reordering (§2) moves the
 - `exp` checks and eviction run against a clock high-water mark that never decreases, so a backward clock step cannot re-admit an evicted token;
 - the clock is injected, so the high-water mark is tested in-process. No Compose test can step one container's wall clock, and stepping the WSL VM's clock is flaky, because Hyper-V time sync resets it (RV2);
 - `jti` and nonces come from `/dev/urandom`;
-- verified Episode Tokens are cached by a hash of their bytes, with `exp`, idle and `end_episode` re-checked on every use.
+- verified Episode Tokens are cached by a hash of their bytes, with `exp`, idle, `end_episode` and `peer_uid` re-checked on every use. End and idle state are keyed by eid, so a malleated or re-encoded copy of an ended token is still ended (RV3 A7);
+- the sizing assumes no episode churn and no restart within 62 s. A full cache costs only availability (it rejects), never a replay (RV3 F12).
 
 ### L1. Lockfile v1 content
 The unsigned lockfile v1 payload is also the config's `pins` section from step 7, so there is one pins format. Step 10 adds the DSSE envelope and drift checks around it instead of replacing a second format (RV2). L1 therefore closes in step 2. The source is Five-Track §4.2, mapped onto the engine's `ToolPins`.
+
+- **Full definitions (RV3 D1).** The payload carries each server's full canonical `tools/list` definitions and its `server/discover` result, pinned `instructions` included, and the digests are computed from them.
+  - Step 7 serves them (M1), so it does not wait for step 10's poller.
+  - Lockfile review reads the actual text. That is how a description that shadows another server's tool from the start (#25) gets caught.
 
 - **Epochs:**
   - The payload carries only `release_epoch`.
@@ -504,7 +573,7 @@ The unsigned lockfile v1 payload is also the config's `pins` section from step 7
   Each intent's `SeqPolicy` goes in the config's `intents` entry, because `PepEngine::new` takes it apart from the intent and the pins. Every tool it names must be pinned.
 - **Payment tools** must declare a `currency` argument. This closes the Week 1 code review's open item. A payment tool without one is a load error.
 - **Two schemas per tool:**
-  - the upstream definition's digest, for drift;
+  - the upstream definition, stored in full, with its digest for drift;
   - a strict subset for enforcement (F-13): `type`, `properties`, `required`, `additionalProperties: false`, `enum`, and length and range limits. Any other keyword is rejected.
 
   At load, the strict schema and the `args` list must declare the same argument pointers with compatible types, and a mismatch is a load error:
@@ -525,8 +594,11 @@ The unsigned lockfile v1 payload is also the config's `pins` section from step 7
   - **signatures in DER only.** Raw r‖s is rejected, because accepting both would give one signature two encodings. DER keeps cosign compatibility open (AP item 4; RV2).
 - **Drift detection:**
   - The PEP polls each server's `server/discover` and every `tools/list` page through the broker, every `drift_poll_ms` (5,000, ±20% jitter). There is no upstream `subscriptions/listen` stream (RV2).
-  - Any mismatch quarantines the tool, and the agent's `tools/list` is served from the cached, verified view (M1).
-  - **Detection window T = 10 s** (two poll intervals). G2 requires every mutation to be quarantined within T, with no call forwarded to a drifted tool after detection.
+  - Each poll has a deadline, `drift_poll_deadline_ms` (3,000), covering every page.
+  - **The quarantine unit is the whole server (RV3 B2).** Any mismatch quarantines every tool of that server: a changed, added or removed tool, or a changed discover result. Its tools disappear from the agent's `tools/list`, which comes from the lockfile (M1), and their calls are denied with `ToolQuarantined`.
+  - **A failed poll quarantines too (RV3 A5).** A poll that errors, misses its deadline, exceeds its caps, loops its cursor or returns an inconsistent page structure quarantines the whole server. A server that hides its drift behind a failure is treated as drifted.
+  - **Quarantine lasts until a restart with a re-signed lockfile.** A definition that reverts does not lift it (#27).
+  - **Detection window T = 10 s:** the longest interval (6 s, with jitter), plus the poll deadline (3 s), plus 1 s margin. G2 requires every mutation to quarantine its server within T, with no call forwarded to it after detection. The re-check just before each upstream write enforces that (P1).
 - **Tooling:**
   - `pep-sidecar lock-scan` is a subcommand of the PEP binary, run under uid 20002 in the PEP's container, because the broker admits only that uid. It writes the unsigned payload from `server/discover` plus every `tools/list` page, holds no `HostAuthority` and binds no socket.
   - `pepctl lock sign` runs on the host with the signer keys.
@@ -535,9 +607,16 @@ The unsigned lockfile v1 payload is also the config's `pins` section from step 7
 
 ### O1. Latency definition
 - **Scope.** Gate 1's "added latency" is the whole system's (RV2), so G4 measures the PEP plus the broker.
-- **Formula.** Each process records its residence time per call with `Instant`s: (first byte written upstream − first byte read from downstream) + (last byte written downstream − last byte read from upstream). G4 is the p99 of the per-call sum of the PEP's and the broker's residence, joined on `jti`.
+- **Formula.** Each process records its residence time per call with `Instant`s. Its "agent side" is the connection the request arrived on, and its "tool side" the one it was sent on. Residence = (first byte written to the tool side − first byte read from the agent side) + (last byte written to the agent side − last byte read from the tool side). G4 is the p99 of the per-call sum of the PEP's and the broker's residence, joined on `jti`. (RV3 B7: the 3 Nov draft used "downstream" for the agent side, the opposite of §2a and F-16.)
 - **Also reported:** the PEP alone, the broker alone, and an agent-side end-to-end figure. The Unix-socket transit between the PEP and the broker is excluded from G4; the end-to-end figure bounds it.
-- **Load:** open-loop, at fixed arrival rates, because a closed-loop harness hides queueing. A stated mix of reads, payments and lists, at a stated concurrency cap.
+- **Load:** open-loop, at fixed arrival rates, because a closed-loop harness hides queueing. A stated mix of reads, payments, store writes and lists, at a stated concurrency cap. Writes are in the mix because each journals its taint entries (RV3 A9). The journal's fsyncs are on the measured path under R1 (a), and the report says so.
+- **Provisioning (RV3 D3).** The engine's own limits shape the run:
+  - each episode records at most 256 results (`MAX_RECORDS`, engine.rs:26). A call that runs past that can no longer be recorded;
+  - the rate limit allows 5 calls per second per episode;
+  - each payment needs its own fresh lookup;
+  - one intent's budget is shared by its episodes (R1, E1).
+
+  So the 10,500 calls run over at least 41 episodes, one live per intent, with budgets sized for the run, many entities, `per_entity_max_uses` raised for the test intents, and arrival rates under 5 per second per episode. The report states all of these.
 - **Head-of-line case (A1):** one episode recording 1 MiB results while others make small calls, reported separately.
 - **Crypto cost:** on this machine (AMD Ryzen 3 5300U, release, Rust 1.97.1, 2026-11-03), ES256 takes about 0.57 ms to sign and 0.56 ms to verify (mean). So each payment spends about 1.1 ms on crypto across the PEP and the broker.
 - **Exclusions:** step-up calls are excluded, since they wait for a human. 1 MiB requests are measured separately, because hashing cost grows with bytes × depth.
@@ -546,7 +625,8 @@ The unsigned lockfile v1 payload is also the config's `pins` section from step 7
 ### B1. Release build profile
 - **`overflow-checks = true`:** library code already denies unchecked arithmetic; this covers dependencies and binaries.
 - **`panic = "abort"`:** only together with R1 (a). Then a crash fails closed: it voids every token, and the journal keeps every budget. Under R1 (b), keep `panic = "unwind"`.
-- **musl:** add `x86_64-unknown-linux-musl` to `rust-toolchain.toml` only if the images are static (distroless or scratch). Otherwise build in an image whose glibc matches.
+- **musl:** add `x86_64-unknown-linux-musl` to `rust-toolchain.toml` only if the images are static (distroless or scratch), and then to `deny.toml`'s `[graph] targets` as well. Otherwise build in an image whose glibc matches.
+- **Features (RV3 F4).** The release binary builds with default features. `lenient-numbers` changes the request profile the agent faces (jcs.rs:29-32), so it stays a test configuration.
 
 ### U1. Wire shapes of denials and errors
 - **Policy and token denials.** Every one gets the same shape, so the agent cannot tell which guard fired:
@@ -556,24 +636,31 @@ The unsigned lockfile v1 payload is also the config's `pins` section from step 7
   - no `data`.
 
   `PEP_UNAVAILABLE` gets its own single code, and covers rate-limited calls too. Both codes are chosen in step 2 and recorded in SPEC. Expired, idle, ended and declined all get `PEP_DENIED`.
-- **MCP-mandated errors keep their codes**, checked in M1's order:
+- **One total reply order (RV3 B3).** MCP-mandated errors keep their codes. Every request is checked in this order, and the first failing step gives the only reply:
 
-  | Condition | Reply |
-  |---|---|
-  | A missing standard header | -32020, 400 |
-  | A missing `_meta` field, or `clientCapabilities` not an object | -32602, 400 |
-  | A header that differs from the body or `_meta`; any `Mcp-Param-*` header | -32020, 400 |
-  | A present but unsupported version | -32022, 400 |
-  | Unknown method | -32601, 404 |
-  | Any `Origin` | 403 |
-  | GET or DELETE | 405 |
-  | `notifications/cancelled` POST (answered before the checks above) | 202, ignored |
-  | Any other notification POST | 400 |
+  | Step | Check | Reply |
+  |---|---|---|
+  | 1 | HTTP framing (`http.rs`): the request line, headers, `Content-Length`, size caps and deadlines | 400; a missed deadline closes the connection |
+  | 2 | The method is not POST | 405 |
+  | 3 | An `Origin` header is present | 403 |
+  | 4 | `Content-Type` is not `application/json`, or `Accept` lacks `application/json` or `text/event-stream` | 400 |
+  | 5 | The body does not parse under `jcs`'s request profile | 400, -32700 |
+  | 6 | The body is not one JSON-RPC request or notification: a batch, a response, a bad `jsonrpc`, or an id that is neither a safe integer nor 1–64 printable ASCII characters (M1) | 400, -32600 |
+  | 7 | A `notifications/cancelled` notification | 202, ignored |
+  | 8 | Any other notification | 400 |
+  | 9 | A missing standard header | 400, -32020 |
+  | 10 | A missing `_meta` field, or `clientCapabilities` not an object | 400, -32602 |
+  | 11 | A header that differs from the body or `_meta` (`Pep-Episode` included), or any `Mcp-Param-*` header | 400, -32020 |
+  | 12 | A present but unsupported version | 400, -32022 |
+  | 13 | An unknown method | 404, -32601 |
+  | 14 | A missing, invalid, expired, idle or ended Episode Token, on a method that needs one (M1) | 200, `PEP_DENIED` |
+  | 15 | The episode's rate limit | 200, `PEP_UNAVAILABLE` |
+  | 16 | The engine's guards | 200: `PEP_DENIED`, or the result |
 
 ### J1. Result fidelity
 - **Evidence:**
   - The result profile (`NumberMode::EcmaAny`) formats numbers per RFC 8785, so integers beyond ±(2^53−1) are rounded: `18446744073709551615` becomes `18446744073709552000` (WEEK1_PLAN Risks).
-  - `record_result_raw` returns those canonical bytes, and they are all the agent receives (§2a).
+  - Under §2a, `record_result_raw` will return those canonical bytes, and they will be all the agent receives. Today it returns `Result<(), PepError>` (RV3 C2).
   - An agent that copies such an ID into its next call gets the wrong record. Requests still reject the integer itself (F-04), so the copy goes in as a string, and the string is wrong. That costs utility at Gate 2 (RV2).
   - Labels attach to pointers, not bytes, and such integers are never an Amount (`int` is `None`).
   - A JavaScript agent rounds such numbers itself when it parses the result, so only agents that keep big integers exact benefit. Python's parser does, and Week 4's AgentDojo is Python.
@@ -606,7 +693,29 @@ The unsigned lockfile v1 payload is also the config's `pins` section from step 7
     - the Call Proof signing key.
 
     No connection thread holds any of them.
+  - **No `&HostAuthority` on the agent path (RV3 F9).** The agent-message handler's signature never takes `&HostAuthority`; only the host-message handler does. So F-13's compile-time boundary survives inside the actor.
+  - **Upstream workers (P1).** At the point of forwarding the actor hands the call to a worker thread, which makes the upstream call and sends the result back. So a slow upstream leg or a step-up wait never blocks the actor's other calls or its host channel.
   - **Registry.** The eid → agent-channel registry is the only map that connection threads read, and `limits.episodes` bounds the number of actors.
+
+### RV3's questions for step 2
+Each has a recommended answer now. Step 2 confirms or overrides it as the owning decision closes.
+
+| # | Question | Recommended answer | Where |
+|---|---|---|---|
+| 1 | Is each eid fresh, and is it written into `PepIntent.episode_id` and `txn`? May an intent have more than one live episode? How are restored reservations keyed? Is the unresolved-entity set per intent or PEP-wide? | Fresh ULID, written into both; at most one live episode per intent; restored reservations keyed by (eid, rid), apart from new ones; the unresolved-entity set is PEP-wide | E1, R1 |
+| 2 | Does `context_conf` carry across an intent's episodes? Must the agent process restart per episode? | Yes: it is journaled per intent. One agent process per episode, restarted after a PEP restart too | R1, E1 |
+| 3 | Which thread makes the upstream call? What is the point of forwarding? What is re-checked just before it? What does the agent get for a call still upstream after `end_episode`? | A worker the actor hands the call to. The fsync of the `forwarded` record. Quarantine, epoch and episode liveness. `end_episode` stops new calls only: a call already forwarded completes, its outcome applies, and the agent gets its reply if still connected | P1, A1, §2a |
+| 4 | Does the v1 payload carry full definitions and `instructions`? What is quarantined, and for how long? What happens when a poll fails? What should #9, #12 and #16 show? | Yes. The whole server, until a restart with a re-signed lockfile. A failed or late poll quarantines the server. Each shows its server quarantined (§3) | L1, §3 |
+| 5 | Does the PEP reject high-S Episode Tokens? Is revocation keyed by eid? What binds a Call Proof to its server? What does `kid` mean? Must `rid` be present exactly for payments? | Yes; yes; still open (a claim, or the server inside `aud`); the boot key's thumbprint; yes | T1 |
+| 6 | The full reply order and codes, and the two application codes for `PEP_DENIED` and `PEP_UNAVAILABLE` | The order is in U1. The two codes are still chosen in step 2 | U1 |
+| 7 | How does the harness attach the token? Does `subscriptions/listen` need one? | `_meta` on `tools/list` and `tools/call`, plus an optional matching header (tested); no | D2, M1 |
+| 8 | Is `reserve` journaled when the reservation is made? One fsync per call? A journal lock, and truncation of a torn tail? What if replay exceeds the store's capacity? Or does Gate 1 run under R1 (b)? | Yes, all four, with a capacity check before each append. R1 (b) is the last item of the cut list (Risks) | R1, Risks |
+| 9 | Separate `allow` and `outcome` records, flushed before forwarding? A unique `upstream_id`? The log on its own volume? | Yes; a ULID; yes (`pep-log`) | §2a, M1, §4 |
+| 10 | Which tests count toward G1? Do randomized repeats count? | Only bypass attempts the oracle could catch (§3). Repeats add assurance but do not count | S1, §3 |
+| 11 | How is the latency run provisioned? Are writes in the mix? Is fsync on the measured path? | As O1 states; yes; yes, under R1 (a) | O1 |
+| 12 | Does the engine key calls by the agent's id or a PEP-assigned one? | PEP-assigned, which changes SPEC §2's `cid` (§6) | M1 |
+| 13 | Which features does the release binary enable? Is musl in deny's targets? | Default features only; yes, if musl is adopted | B1 |
+| 14 | Does the control socket get its own capacity? Do actors serve the host channel first? | Yes; yes | H1 |
 
 ## 2. Build order
 Every step ends with the CLAUDE.md §2 six-command loop green. Each step's decision IDs must be CLOSED before the step starts.
@@ -618,14 +727,14 @@ The order follows RV2: p256, peer identity and the lock file come before the bin
 | 1 | — | Docker Engine inside WSL Ubuntu (yours: it needs sudo). Not Docker Desktop: its VM kernel differs, and Q1 depends on the kernel. Set `systemd=true` in `/etc/wsl.conf`. Record `uname -r` here: 6.18.54.1-microsoft-standard-WSL2 on 2026-10-31.<br>• Compose runs from a clone on WSL's own filesystem, not from `/mnt/c` (§4).<br>• The broker credential lives outside the repo and outside OneDrive. | `docker run --rm hello-world` works inside WSL | — |
 | 2 | The 14 that block steps 3–7 (D2 CLOSED 2026-11-03) | Close them. Apply the §6 SPEC wording as each decision closes; SPEC keeps CRLF. Hand the CLAUDE.md wording to you. If D1 = A, make the toolchain commit here. | No OPEN decision blocks step 3 | `docs: close Week 2 decisions; SPEC §1/§3/§4` |
 | 3 | D1 | `p256 = { version = "=0.14.0", default-features = false, features = ["ecdsa"] }`. In the same commit:<br>• BSD-3-Clause in `deny.toml`, for `subtle`, the only new licence. Not earlier: an unused allowance makes `cargo deny` warn.<br>• Unsafe-record rows for the 23 new crates, and the changed feature sets of `hybrid-array` and `digest`.<br>• A fail-closed CI check that getrandom is absent. List the whole tree with `cargo tree --target all --prefix none`, fail the job if that command fails, then fail it if any line starts with `getrandom v`. (`cargo tree -i getrandom` exits 101 when nothing matches, so inverting its status would also pass when cargo itself fails.)<br>• Optional bans (getrandom, serde and serde_json until Week 5, openssl, ring), only if `cargo deny check` stays warning-free.<br>• `reports/Week2 crypto crate check.md`, recording the 2026-11-03 probe and prehash test (Appendix A), plus `cargo deny` on the real tree, which the probe could not cover.<br>• Advisory facts (AP item 3):<br>  – RUSTSEC-2026-0387: crypto-bigint timing variability, patched in ≥ 0.7.6 [43]. 0.7.0–0.7.8 are yanked, including the patched 0.7.6–0.7.8, which were yanked for an unrelated semver break. Only 0.7.9 and 0.7.10 are usable, and 0.7.10 resolves [104].<br>  – p256 0.14.0 declares rust-version 1.85, below crypto-bigint's 1.87. A 1.85 toolchain's MSRV-aware resolver would pick the yanked, affected 0.7.5 [46]; 1.97.1 is not affected.<br>  – RUSTSEC-2026-0385: ctutils, patched in ≥ 0.4.4 [105]. crypto-bigint ≥ 0.7.6 requires `^0.4.5` [18], and 0.4.8 resolves.<br>  – The jsonwebtoken crate is rejected. Its latest release, 11.1.0, still takes p256 `^0.13.2` behind its optional `rust_crypto` feature, which pulls crypto-bigint 0.5.5 [52]. | The ES256 surface, already shown to work with exactly `["ecdsa"]` on 1.97.1 (Appendix A):<br>• `Signature::from_slice` for JWS r‖s;<br>• `Signature::from_der` for DSSE;<br>• `VerifyingKey::from_sec1_bytes`;<br>• `Verifier::verify`;<br>• `SigningKey` signing, with `normalize_s`.<br>JWK parsing is hand-rolled, because elliptic-curve 0.14 dropped its `jwk` feature: decode `x` and `y`, check that each is 32 bytes, then build SEC1 `04‖x‖y`; `from_sec1_bytes` rejects off-curve points.<br>`cargo deny` rejects only `subtle` until BSD-3-Clause is allowed, and accepts `ff` and `group`'s `MIT/Apache-2.0` (the old slash syntax) without a warning (checked on the probe, Appendix A).<br>G5 holds | `deps: p256 0.14 (ecdsa only); deny BSD-3-Clause; unsafe record` |
-| 4 | Q1 | `SO_PEERPIDFD`, fail-closed per Q1, and `require_peer(uid, gid)` | C-PID's checks and the C-UID unit tests pass on this kernel; CI branches on its kernel | `peercred: SO_PEERPIDFD fail-closed; gid check` |
-| 5 | — | The lock file:<br>• std `File::try_lock`, not nix `fs`; this supersedes the `Flock` plan in AP, MG and WEEK1_PLAN §1.<br>• `<sock>.lock` is created in the checked parent with mode 0600 and owner euid.<br>• It is opened with `O_NOFOLLOW`, through std's `OpenOptionsExt::custom_flags(nix::libc::O_NOFOLLOW)`. nix re-exports libc unconditionally, so this needs neither nix's `fs` feature nor a new direct dependency (RV2; Appendix A).<br>• An fstat after open requires a regular file, mode 0600, owner euid and `nlink` 1.<br>• The lock is taken before any existing socket is unlinked.<br>• `bind_safe_listener` returns `BoundListener { listener, lock }`.<br>• `socket_is_live` and `PROBE_TIMEOUT` are removed: with the lock held, any existing socket is stale, which also closes the macOS backlog gap.<br>• flock semantics (AP item 2):<br>  – the lock belongs to the open file description, and does not interact with fcntl or OFD locks;<br>  – it works on overlayfs and on local named volumes;<br>  – NFS is forbidden for the socket volume, because flock there is emulated or unreliable. | C-LOCK passes, including "the agent cannot open the lock file" (the agent's group can read `/run/pep`, and flock works on a read-only descriptor) | `peercred: lock file held with the listener` |
-| 6 | T1, R1, E1 | `src/tokens.rs`, shared by the PEP and the stub broker:<br>• ES256 JWS per T1;<br>• the Episode Token;<br>• the Call Proof, on every forwarded call, with `rid` for `Held` payments only;<br>• `prov` as the witness origin hashes (the former step 11);<br>• the replay cache with an injected clock. | Unit vectors:<br>• alg confusion and `typ` swap;<br>• header members outside the allowlist;<br>• the charset, padding and non-zero trailing bits;<br>• expiry and the idle timeout;<br>• a full cache that fails closed;<br>• low-S emitted, and high-S rejected by the broker;<br>• the clock high-water mark under an injected backward step;<br>• the broker's boot-second cutoff | `tokens: Episode Token, Call Proof, ReplayCache, prov` |
-| 7 | D1, D2, M1, M2, P1, R1, E1, H1, U1, J1, L1, A1 | The binary, the stub broker, two stub tool servers, the scripted operator and the engine changes in §2a, plus:<br>• the R1 journal;<br>• the decision logs;<br>• J1's result number mode;<br>• the per-episode rate limit.<br>Conditions:<br>• Pins come from the config's `pins`, which is the unsigned lockfile v1 payload (L1). Step 10 adds the DSSE envelope and drift checks.<br>• Tokens are real from the start (step 6), with no placeholder checks.<br>• The broker credential is a 0400 file owned by uid 20003, outside the repo and OneDrive (§4); Vault is deferred.<br>• Every binary passes the macOS cross-lint, with Linux-only paths behind `cfg`.<br>• Binaries follow the logging rule in §6. | End to end over temp-directory sockets:<br>• a read, a payment, a step-up approval and a refusal;<br>• every P1 row and every router row in M1;<br>• `end_episode`;<br>• a restart that replays the journal | `bin: std-threads sidecar, transport, stubs` (several commits) |
+| 4 | Q1 | `SO_PEERPIDFD`, fail-closed per Q1, and `require_peer(uid, gid)`, for the agent, operator and broker peers alike (RV3 F7).<br>• A CI job that branches on the runner's kernel version and records `uname -r` (moved here from step 9, RV3 D4) | C-PID's checks and the C-UID unit tests pass on this kernel and in that CI job | `peercred: SO_PEERPIDFD fail-closed; gid check` |
+| 5 | — | The lock file:<br>• std `File::try_lock`, not nix `fs`; this supersedes the `Flock` plan in AP, MG and WEEK1_PLAN §1.<br>• `<sock>.lock` is created in the checked parent with mode 0600 and owner euid.<br>• It is opened with `O_NOFOLLOW`, through std's `OpenOptionsExt::custom_flags(nix::libc::O_NOFOLLOW)`. nix re-exports libc unconditionally, so this needs neither nix's `fs` feature nor a new direct dependency (RV2; Appendix A).<br>• An fstat after open requires a regular file, mode 0600, owner euid and `nlink` 1.<br>• The lock is taken before any existing socket is unlinked.<br>• `bind_safe_listener` returns `BoundListener { listener, lock }`.<br>• `socket_is_live` and `PROBE_TIMEOUT` are removed: with the lock held, any existing socket is stale, which also closes the macOS backlog gap. Their test `full_backlog_counts_as_live` (peercred.rs:575) goes too, along with ci.yml's comment and `ulimit` line for it (RV3 D4).<br>• flock semantics (AP item 2):<br>  – the lock belongs to the open file description, and does not interact with fcntl or OFD locks;<br>  – it works on overlayfs and on local named volumes;<br>  – NFS is forbidden for the socket volume, because flock there is emulated or unreliable. | C-LOCK's unit and root tests pass. Its two Compose attacks, among them "the agent cannot open the lock file" (the agent's group can read `/run/pep`, and flock works on a read-only descriptor), run in step 9 (RV3 D4) | `peercred: lock file held with the listener` |
+| 6 | T1, R1, E1 | `src/tokens.rs`, shared by the PEP and the stub broker:<br>• ES256 JWS per T1;<br>• the Episode Token;<br>• the Call Proof, on every forwarded call, with `rid` for `Held` payments only;<br>• `prov` as the witness origin hashes (the former step 11);<br>• the replay cache with an injected clock. | Unit vectors:<br>• alg confusion and `typ` swap;<br>• header members outside the allowlist;<br>• the charset, padding and non-zero trailing bits;<br>• expiry and the idle timeout;<br>• a full cache that fails closed;<br>• low-S emitted, and high-S rejected by the broker and, for Episode Tokens, by the PEP (RV3 A7);<br>• `kid` checked against the current boot's thumbprint;<br>• end and idle state keyed by eid, so a re-encoded copy of an ended token stays ended;<br>• the clock high-water mark under an injected backward step;<br>• the broker's boot-second cutoff | `tokens: Episode Token, Call Proof, ReplayCache, prov` |
+| 7 | D1, D2, M1, M2, P1, R1, E1, H1, U1, J1, L1, A1 | The binary, the stub broker, two stub tool servers, the scripted operator and the engine changes in §2a, plus:<br>• the R1 journal, with its lock, torn-tail truncation and one fsync per call;<br>• the decision logs, as separate `allow` and `outcome` records (§2a);<br>• J1's result number mode;<br>• the per-episode rate limit;<br>• the point of forwarding and the re-check just before it (P1);<br>• fresh eids and one live episode per intent (E1);<br>• the PEP-assigned request ids (M1);<br>• the control socket's own capacity (H1).<br>Conditions:<br>• The engine test that asserts the Episode Token is forwarded (engine.rs:4754) is inverted: the token must never leave the PEP (RV3 C1).<br>• The request bodies the D2 spike logged are replayed through `jcs::parse` with the request profile, so the transport is known to accept what the SDKs send (RV3 E4).<br>• Pins come from the config's `pins`, which is the unsigned lockfile v1 payload (L1). Step 10 adds the DSSE envelope and drift checks.<br>• Tokens are real from the start (step 6), with no placeholder checks.<br>• The broker credential is a 0400 file owned by uid 20003, outside the repo and OneDrive (§4); Vault is deferred.<br>• Every binary passes the macOS cross-lint, with Linux-only paths behind `cfg`.<br>• Binaries follow the logging rule in §6. | End to end over temp-directory sockets:<br>• a read, a payment, a step-up approval and a refusal;<br>• every P1 row and every router row in M1;<br>• `end_episode`;<br>• a restart that replays the journal;<br>• `tools/list` and `server/discover` served from the pins (L1);<br>• the D2 spike's client scenarios run against the real PEP | `bin: std-threads sidecar, transport, stubs` (several commits) |
 | 8 | N1, B1 | `compose.yaml`, Dockerfiles, `seccomp-unix-only.json` and `.gitattributes`, per §4.<br>• `.gitattributes` sets LF for `*.sh`, `Dockerfile*`, `compose.yaml`, `*.nft` and `seccomp*.json`; SPEC and CLAUDE.md keep CRLF.<br>• B1's `Cargo.toml` and toolchain changes land here too. | The topology starts from the WSL-side clone. Volume owners and modes match §4. Posture checks pass. The step 7 flows pass in Compose | `compose: SPEC §1 topology` |
 | 8b | N1 | nftables rules, only if N1 = (b) | Rule-set tests pass | `net: nftables rules` |
-| 9 | S1, O1 | The bypass kit (§3) with expected verdicts, the oracle and the decision-log join (§2a), and the `probe` service. Also:<br>• the open-loop latency harness (PEP plus broker);<br>• a CI job that runs the checks and branches on kernel version;<br>• if they can run without fixture tools, the official MCP conformance suite's 2026-07-28 server scenarios [100], against the PEP in CI through a test-only TCP bridge. Its schema check validates every message on the wire. | The kit runs in CI, and the attack run passes in Compose on this machine. The first latency report exists | `test: Gate 1 kit and harness` |
-| 10 | L1 | `src/lockfile.rs` (DSSE around the step 7 payload), `pep-sidecar lock-scan` and `pepctl lock sign`.<br>• Drift hashing uses the result number profile (J1) with larger caps; the request profile rejects ordinary schema values such as `"minimum": 0.5` and caps 8,192 nodes.<br>• Definitions with integers beyond ±(2^53−1) are quarantined only if J1 = (a).<br>• Every upstream page is fetched.<br>• The drift poller (L1).<br>• The strict argument schema, per-tool step-up, and a review of the F-13 read-only exception. | The 25 mutations, each quarantined within T, and the negatives (§3) | `lockfile: DSSE verify, drift quarantine, lock-scan and sign` |
+| 9 | S1, O1 | The bypass kit (§3) with expected verdicts, the oracle and the decision-log join (§2a), and the `probe` service. Also:<br>• the open-loop latency harness (PEP plus broker);<br>• a CI job that runs the checks (the kernel branching comes from step 4);<br>• **the G3 replay harness (RV3 D2):** the stub broker, in a test-only mode, writes each Call Proof it receives to its log, and an `injector` service, running as uid 20002 with the broker socket mounted, replays captured proofs and tokens. Neither exists in a release image;<br>• C-UID's probes each hold a live Episode Token minted for uid 20001, a stolen token, so a broken `require_peer` would execute a call the oracle can see (RV3 A10);<br>• if they can run without fixture tools, the official MCP conformance suite's 2026-07-28 server scenarios [100], against the PEP in CI through a test-only TCP bridge that also attaches an Episode Token (RV3 D5). Its schema check validates every message on the wire. | The kit runs in CI, and the attack run passes in Compose on this machine. The first latency report exists | `test: Gate 1 kit and harness` |
+| 10 | L1 | `src/lockfile.rs` (DSSE around the step 7 payload), `pep-sidecar lock-scan` and `pepctl lock sign`.<br>• Drift hashing uses the result number profile (J1) with larger caps; the request profile rejects ordinary schema values such as `"minimum": 0.5` and caps 8,192 nodes.<br>• Definitions with integers beyond ±(2^53−1) are quarantined only if J1 = (a).<br>• Every upstream page is fetched.<br>• The drift poller (L1), with the poll deadline, whole-server quarantine and the failed-poll rule (RV3 A5, B2).<br>• The strict argument schema, per-tool step-up, and a review of the F-13 read-only exception. | The 27 mutations, each quarantining its server within T; the step-up timing case; and the negatives (§3) | `lockfile: DSSE verify, drift quarantine, lock-scan and sign` |
 | 11 | All G-criteria | The Gate 1 suite, run on the release profile in Compose | G1–G6 | `gate1: results` |
 
 ## 2a. Interfaces (proposals)
@@ -633,18 +742,27 @@ The order follows RV2: p256, peer identity and the lock file come before the bin
 - **Forwarding (F-16).**
   - `Allowed` and `PendingApproval` replace `canonical_request` with `tool: String` and canonical `arguments: JcsValue`.
   - A new `forward::tools_call_request(upstream_id, tool, arguments, meta) -> Vec<u8>` builds the only bytes sent downstream, from the same pair that `action_digest` hashes, so the broker recomputes the same digest.
-  - The agent's id and `_meta` never leave the PEP.
+  - The agent's id and `_meta` never leave the PEP, the Episode Token included. The engine test that today asserts the token is forwarded (engine.rs:4754) is inverted (RV3 C1).
 - **Results (M2, J1).**
   - `record_result_raw(..) -> Result<Vec<u8>, PepError>` requires `resultType == "complete"`. Otherwise, absent included, it returns a new `PepError::IncompleteResult`, which maps to `PEP_UNAVAILABLE`.
   - It drops the result's top-level `_meta` before labelling.
   - It returns exactly the canonical bytes it recorded, under J1's number mode. Those are the only result bytes the agent receives.
 - **Quarantine.** G_pin denies a tool in a shared `Arc<QuarantineSet>` (new `PolicyError::ToolQuarantined`). Because it is a guard, F-09's ratchet still runs.
-- **Reconcile check (P1).** `g_budget` denies a payment whose entity (after NFC) matches a `NeedsReconcile` reservation's `entity`, with a new `PolicyError::ReconcilePending`. `Reservation` already stores the entity. This is pure validation, so F-06 holds.
+- **Re-check before forwarding (P1, RV3 A4).** A new `PepEngine::recheck_before_forward(call_id)` re-runs G_pin's quarantine and epoch checks for a call already allowed or approved. The actor calls it just before the point of forwarding, and checks the episode's liveness itself. On a failure it calls `abort(DefinitelyNotExecuted)`.
+- **Reconcile check (P1).** `g_budget` denies a payment, with a new `PolicyError::ReconcilePending`, when its entity (after NFC) matches either:
+  - a `NeedsReconcile` reservation's `entity`;
+  - an entity in the restored, PEP-wide unresolved set (R1, RV3 A1).
+
+  `Reservation` already stores the entity. This is pure validation, so F-06 holds.
 - **Ledger restore (R1).** `PepEngine::new` takes, behind `&HostAuthority`, the intent's journaled ledger:
   - committed spend;
   - calls;
   - entity uses;
-  - unresolved reservations, inserted as `NeedsReconcile` with no funding witness.
+  - the restored unresolved reservations, counted in `reserved`. They are kept in a separate set keyed by (eid, rid), never in `reservations`, whose new ids start at 1, and they have no funding witness (RV3 A1);
+  - the PEP-wide set of entities with an unresolved payment;
+  - the intent's ratchet level, as the starting `context_conf` (RV3 A3);
+  - the episode's fresh eid, in `PepIntent.episode_id` (E1, RV3 A2).
+- **Batched taint (RV3 A9).** `LabelStore` gains `record_all(entries)`, and `apply` passes one call's taint entries in a single call (today it calls `record` once per index, engine.rs:1617-1619). So the journal-backed store writes them as one record, with one fsync.
 - **Step 10:**
   - `ToolPolicy.step_up_over_minor: Option<u64>`, used by `g_stepup` as the smaller of the intent's and the tool's thresholds;
   - the strict argument schema, checked in `g_canon` (new `PolicyError::SchemaViolation`).
@@ -658,8 +776,8 @@ The order follows RV2: p256, peer identity and the lock file come before the bin
 
 | Module | Role |
 |---|---|
-| `src/http.rs` | The strict HTTP/1.1 subset (kept from AP):<br>• request line plus headers ≤ 16 KiB and ≤ 64 fields;<br>• an exact `Content-Length` only;<br>• reject `Transfer-Encoding`, duplicate or conflicting `Content-Length`, `Content-Encoding`, obs-fold, bare CR or LF, HTTP/1.0 and HTTP/2 prefaces;<br>• one request per connection (`Connection: close`);<br>• body ≤ 1 MiB;<br>• header and body deadlines through `set_read_timeout`. |
-| `src/mcp.rs` | Header↔body checks, `_meta` checks in M1's order, the method router, error bodies (U1), and the one SSE writer (`subscriptions/listen`). There is no SSE reader: the broker answers JSON only. |
+| `src/http.rs` | The strict HTTP/1.1 subset (kept from AP):<br>• request line plus headers ≤ 16 KiB and ≤ 64 fields;<br>• an exact `Content-Length` only;<br>• reject `Transfer-Encoding`, duplicate or conflicting `Content-Length`, `Content-Encoding`, obs-fold, bare CR or LF, HTTP/1.0 and HTTP/2 prefaces;<br>• one request per connection (`Connection: close`);<br>• body ≤ 1 MiB;<br>• absolute header and body deadlines: before each read, the timeout is set to the time left until the deadline, so a sender that trickles one byte per interval cannot hold a connection open (RV3 F1);<br>• reject a duplicated `MCP-Protocol-Version`, `Mcp-Method`, `Mcp-Name`, `Pep-Episode`, `Content-Type` or `Host`; whitespace before a header's colon; and any request target other than the endpoint's plain path. Header names compare case-insensitively (RV3 F5). |
+| `src/mcp.rs` | Header↔body checks, `_meta` checks in U1's order, the method router, error bodies (U1), and the one SSE writer (`subscriptions/listen`). There is no SSE reader: the broker answers JSON only. |
 | `src/forward.rs` | Upstream request bodies and headers, and the JSON-only upstream response reader |
 | `src/config.rs` | The config, parsed with `jcs` |
 | `src/control.rs` | Control-socket messages |
@@ -667,7 +785,7 @@ The order follows RV2: p256, peer identity and the lock file come before the bin
 | `src/decision_log.rs` | Decision-log records (schema below) |
 | `src/tokens.rs` | Step 6 |
 | `src/lockfile.rs` | Payload parsing (step 7), then DSSE and drift (step 10) |
-| `src/main.rs` | The `pep-sidecar` binary:<br>• std threads with a bounded connection count;<br>• one actor thread per episode (A1);<br>• connection threads verify Episode Tokens, apply the rate limit, and send agent messages to the episode's actor;<br>• the control thread sends host messages;<br>• a `lock-scan` subcommand (L1). |
+| `src/main.rs` | The `pep-sidecar` binary:<br>• std threads, with two bounded connection pools: the agent's, and the control socket's (H1);<br>• one actor thread per episode (A1), plus an upstream worker per forwarded call (P1);<br>• connection threads verify Episode Tokens, apply the rate limit, and send agent messages to the episode's actor;<br>• the control thread sends host messages;<br>• a `lock-scan` subcommand (L1). |
 | `src/bin/pepctl.rs` | `lock sign` and key generation (keys from `/dev/urandom`); Week 6 adds `explain` and `replay` |
 | `src/bin/` stubs | The stub broker, the stub tool server and the scripted operator, under the same lints |
 
@@ -676,27 +794,28 @@ The order follows RV2: p256, peer identity and the lock file come before the bin
 | Section | Fields |
 |---|---|
 | `agent` | `uid`, `gid`, `socket` |
-| `operator` | `uid`, `socket` |
-| `broker` | `uid`, `socket` |
+| `operator` | `uid`, `gid`, `socket` (RV3 F7) |
+| `broker` | `uid`, `gid`, `socket` (RV3 F7) |
 | `pep` | `spiffe_id`, `pubkey_dir` |
 | `lockfile` | `path`, `signers` (`role`, `key`), `min_accepted_epoch` (the rollback floor) |
-| `journal` | `path` (R1) |
+| `journal` | `path`, `lock` (R1) |
+| `log` | `path` (on `pep-log`), `max_bytes` (RV3 B4) |
 | `intents` | name → `PepIntent` plus its `SeqPolicy`; the Week 2 stand-in for RAR |
-| `limits` | `connections`, `header_bytes`, `body_bytes`, `read_timeout_ms`, `upstream_timeout_ms`, `step_up_timeout_ms` (≤ 50,000), `episode_idle_ms`, `episodes`, `call_burst`, `call_rate_per_s`, `clock_skew_ms`, `replay_cache_entries`, `drift_poll_ms` |
+| `limits` | `connections`, `control_connections` (H1), `header_bytes`, `body_bytes`, `read_timeout_ms`, `upstream_timeout_ms` (10,000), `step_up_timeout_ms` (45,000; the two together ≤ 55,000, checked at load, P1), `episode_idle_ms`, `episodes`, `call_burst`, `call_rate_per_s`, `clock_skew_ms`, `replay_cache_entries`, `drift_poll_ms`, `drift_poll_deadline_ms` (L1) |
 | `pins` | The unsigned lockfile v1 payload (L1). Step 10 replaces it with the signed lockfile at `lockfile.path` |
 
-**Control protocol** (H1, E1). The same HTTP subset carries one JSON request per connection, and the peer uid must be 20004.
+**Control protocol** (H1, E1). The same HTTP subset carries one JSON request per connection, and the peer's uid and gid must be 20004.
 
 | Call | Parameters | Result |
 |---|---|---|
-| `start_episode` | `intent` | `eid`, `episode_token`, `exp`. Refused once `limits.episodes` are live |
-| `end_episode` | `eid` | —. Every later call with its token gets `PEP_DENIED`. `AwaitingStepUp` reservations get `abort(DefinitelyNotExecuted)`. In-flight upstream legs finish, and their outcomes apply. The journal keeps unresolved entries |
+| `start_episode` | `intent` | `eid` (a fresh ULID), `episode_token`, `exp`. Refused while the intent has a live episode, and once `limits.episodes` are live (E1) |
+| `end_episode` | `eid` | —. Every later call with its token gets `PEP_DENIED`. `AwaitingStepUp` reservations get `abort(DefinitelyNotExecuted)`. In-flight upstream legs finish, and their outcomes apply; the episode counts as live until the last one does (E1). The journal keeps unresolved entries |
 | `trusted_input` | `eid`, `input_id`, `value`, `conf` | — |
 | `pending` | — | Awaiting approvals: `eid`, `rid`, `tool`, `arguments`, `action_digest`, `amount_minor` |
 | `approve` / `decline` | `eid`, `rid`, `action_digest`, `amount_minor`, all matched against the `AwaitingStepUp` reservation | — |
 
 **PEP↔broker.**
-- **Transport:** Streamable HTTP over `/run/broker/broker.sock`, JSON only in both directions, with mutual peer-uid checks (the broker requires 20002, the PEP requires 20003); SPIFFE is deferred.
+- **Transport:** Streamable HTTP over `/run/broker/broker.sock`, JSON only in both directions, with mutual peer checks on uid and gid (the broker requires 20002, the PEP requires 20003); SPIFFE is deferred.
 - **What it carries:**
   - `tools/call`, always with a Call Proof (T1);
   - proof-less `tools/list` and `server/discover`, for drift polls and `lock-scan`.
@@ -710,12 +829,12 @@ The order follows RV2: p256, peer identity and the lock file come before the bin
   - forward to the tool server over `tools_net`, keeping the PEP-assigned JSON-RPC id;
   - answer the PEP with JSON only;
   - write its log (schema below).
-- **Outcomes.** For payments, the broker adds `_meta["dev.pep-sidecar/outcome"]` (`executed`, `refused` or `unknown`), after stripping any `dev.pep-sidecar/*` key the tool server sent. A Call Proof the broker rejects gets `refused` with no tool result.
+- **Outcomes.** For payments, the broker adds `_meta["dev.pep-sidecar/outcome"]` (`executed`, `refused` or `unknown`, mapped as P1 says), after stripping any `dev.pep-sidecar/*` key the tool server sent. A Call Proof the broker rejects gets `refused` with no tool result.
 
 **Stub tool servers** (two servers, for mutations #12 and #25):
 - **Tools:** the Week 1 test set: a bound lookup (`get_invoice`), a payment (`pay_invoice`), a sink, and a store writer.
 - **Replies:** JSON only.
-- **Payment status.** Payment results carry an explicit `status` (`executed`, `declined` or `pending`), which the broker maps to the outcome.
+- **Payment status.** Payment results carry an explicit `status` (`executed`, `declined` or `pending`), which the broker maps as P1 says: `pending`, a missing status, or anything ambiguous, becomes `unknown` (RV3 B6).
 - **Bookkeeping:**
   - `Idempotency-Key` dedupe, in a store on the server's own volume that survives PEP and broker restarts;
   - a JSONL execution log (schema below).
@@ -727,11 +846,15 @@ The order follows RV2: p256, peer identity and the lock file come before the bin
   - definition changes between polls, including changes on page 2 only;
   - `x-mcp-header` annotations, for #19.
 
-**Decision logs.** Each component writes JSONL, one JCS-canonical object per line with `"v": 1`, to a file on its own volume. The oracle reads them through read-only mounts. The PEP's record is also what Week 6's receipts build on.
+**Decision logs.** Each component writes JSONL, one JCS-canonical object per line with `"v": 1`, to a file on its own volume. The oracle reads them through read-only mounts. The PEP's records are also what Week 6's receipts build on.
+- **The PEP's log has its own volume,** `pep-log`: tmpfs, size-capped, and rotated at `log.max_bytes`. It is never on `pep-state`, so a flood of logged protocol errors cannot fill the journal's disk (RV3 B4).
+- **Two records per forwarded call (RV3 A6).** An `allow` record is written and flushed before the upstream write, and an `outcome` record after the leg ends. A PEP killed between the two (C-OUT's restart test) still leaves the `allow` for the oracle to join.
+- **`upstream_id` is a ULID,** unique across boots and episodes, so joins are never ambiguous (M1).
 
 | Log | Fields |
 |---|---|
-| PEP decision | `ts_ms`, `eid`, `seq`, `peer_uid`, `method`, `tool`, `action_digest`, `verdict` (`allow`, `deny`, `step_up`, `unavailable` or `protocol_error`), `reason` (the guard or error variant; host-side only, never sent to the agent), `rid`, `amount_minor`, `currency`, `entity`, `jti`, `idempotency_key`, `upstream_id`, `outcome` (`executed`, `refused`, `unknown`, `abandoned` or `not_forwarded`), `pep_us` |
+| PEP decision (written before any upstream write) | `ts_ms`, `eid`, `seq`, `peer_uid`, `method`, `tool`, `action_digest`, `verdict` (`allow`, `deny`, `step_up`, `unavailable` or `protocol_error`), `reason` (the guard or error variant; host-side only, never sent to the agent), `rid`, `amount_minor`, `currency`, `entity`, `jti`, `idempotency_key`, `upstream_id` |
+| PEP outcome (after the upstream leg) | `ts_ms`, `eid`, `upstream_id`, `jti`, `outcome` (`executed`, `refused`, `unknown`, `released`, `abandoned` or `not_forwarded`), `pep_us` |
 | Broker | `ts_ms`, `jti`, `server_id`, `method`, `upstream_id`, `action_digest` (recomputed), `idempotency_key`, `verdict` (`forwarded` or `rejected`), `reason`, `outcome`, `broker_us` |
 | Tool server | `ts_ms`, `server_id`, `upstream_id`, `tool`, `action_digest` (recomputed with the shared `jcs`), `idempotency_key`, `executed` (`false` for a dedupe hit) |
 
@@ -749,36 +872,47 @@ No log ever holds raw tokens, proofs, keys, credentials, or argument values othe
   - an execution that does not join through the broker log to a PEP `allow`;
   - more executions than the test declares;
   - a payment whose `Idempotency-Key` is not the F-07 key of a reservation the PEP held;
+  - an execution whose tool-side `action_digest` differs from the digest the PEP allowed for that `jti`, which catches rewritten arguments on calls that have no Idempotency-Key (RV3 A6);
   - for attacks that execute nothing (C-NET, C-PROC, C-LOCK, C-CRED, C-CTL), the attempt succeeding.
 
 ## 3. Gate 1 suite
-### Containment (62 attack tests count toward G1; 45 checks run in CI)
+### Containment (54 attack tests count toward G1; 74 checks run in CI)
 Only the attack column counts toward G1's ≥ 50, and only when run in Compose on this machine (RV2).
-- **Attacks** are bypass attempts. The C-UID probes run from the `probe` service with group 20001, so each one passes the socket's 0660 mode and reaches `accept()`.
-- **Checks** are conformance tests, posture checks, and tests that need a test hook, an injected error or an older kernel. They run in CI, and in Compose where they can. They must pass, but they don't count.
+- **Attacks** are bypass attempts whose success the oracle, or the attempt itself, would show: a call that executes but should not, money moving outside the intent, data reaching a sink it should not, or a containment boundary crossed.
+  - The C-UID probes run from the `probe` service with group 20001, so each one passes the socket's 0660 mode and reaches `accept()`.
+  - Each probe holds a live Episode Token minted for uid 20001, a stolen token. So a broken `require_peer` would execute a call the oracle can see (RV3 A10).
+- **Checks** are conformance, robustness and posture tests, and tests that need a test hook, an injected error or an older kernel. They run in CI, and in Compose where they can. They must pass, but they don't count.
+- **Why the HTTP, MCP-header and JSON tests are checks (RV3 A10).** There is one HTTP hop, and F-16 forwards only the PEP's own parse of a request. So malformed HTTP, header and body mismatches, and malformed JSON cannot make the engine allow what it would deny. The 3 Nov draft counted those 24 tests as attacks. C-ENG's end-to-end engine attacks replace them.
 
 | Category | Attacks (count toward G1) | Checks (not counted) |
 |---|---|---|
-| C-UID | 4, from the `probe` service:<br>• wrong uid (`20009:20001`);<br>• root (`0:20001`);<br>• overflow uid 65534 (`65534:20001`);<br>• uid right but gid wrong (`20001:20009`, with group 20001 supplementary), rejected under Q1 | 1:<br>• socketpair self-connect (unit) |
+| C-UID | 4, from the `probe` service, each holding a stolen live token:<br>• wrong uid (`20009:20001`);<br>• root (`0:20001`);<br>• overflow uid 65534 (`65534:20001`);<br>• uid right but gid wrong (`20001:20009`, with group 20001 supplementary), rejected under Q1 | 1:<br>• socketpair self-connect (unit) |
 | C-PID | — | 6:<br>• a getsockopt error rejects (injected errno);<br>• fdinfo `Pid: -1` rejects (fdinfo parser);<br>• the peer exits between accept and check (test hook);<br>• `Pid: 0` is handled per Q1;<br>• `ENOPROTOOPT` rejects (injected errno: this needs a kernel older than 6.5);<br>• no pidfd leaks (cloexec) |
 | C-LOCK | 2:<br>• the agent cannot open the lock file;<br>• the agent cannot create or replace an entry in `/run/pep`, such as a planted symlink | 5:<br>• a second instance is blocked;<br>• a stale socket is replaced only under the lock;<br>• the lock is released on a crash;<br>• a read-only lock directory fails;<br>• a symlink planted at the socket path is refused (`UnsafePath`) |
 | C-NET | 7, from the agent:<br>• no route;<br>• no DNS;<br>• no way into `tools_net` (the broker and the tool servers);<br>• no IPv6;<br>• raw and packet sockets fail;<br>• UDP/53 fails;<br>• DoH (TCP/443 to a resolver) fails | 1:<br>• only `lo` is present |
 | C-PROC | 3:<br>• ptrace of the PEP fails, or, under Q1 (i), the PEP pid is not visible;<br>• `/proc/<pep>/mem` is unreadable;<br>• the PEP's argv and env hold no key or credential | 1:<br>• the agent's argv and env hold no Episode Token (E1: it arrives on stdin) |
-| C-POSTURE | — | 5:<br>• every container has CapEff 0;<br>• NoNewPrivs 1;<br>• Seccomp 2, with the AF_UNIX-only profile on the agent, the PEP, the operator and the probe;<br>• no container mounts `docker.sock`;<br>• the agent's `pids_limit`, memory limit and private `/tmp` are in effect |
-| C-HTTP | 12:<br>• CL+TE;<br>• TE only;<br>• duplicate CL;<br>• CL mismatch;<br>• obs-fold;<br>• bare LF;<br>• header over the cap;<br>• body over the cap;<br>• slowloris headers;<br>• slow body;<br>• a pipelined second request;<br>• `Content-Encoding` | 5:<br>• HTTP/1.0;<br>• an HTTP/2 preface;<br>• GET → 405;<br>• DELETE → 405;<br>• a notification POST → 400, except `notifications/cancelled` → 202, ignored |
-| C-MCP | 6:<br>• the version header differs from `_meta` → -32020;<br>• `Mcp-Method` differs from the body → -32020;<br>• `Mcp-Name` differs from the body → -32020;<br>• a base64-sentinel `Mcp-Name` mismatch → -32020;<br>• a batch array body → 400;<br>• any `Mcp-Param-*` header → -32020 | 11:<br>• missing `MCP-Protocol-Version` → -32020;<br>• a JSON-RPC response as the body → 400;<br>• any `Origin` → 403;<br>• an unsupported version → -32022;<br>• `Accept` without `text/event-stream` → 400;<br>• missing `_meta` `protocolVersion` → -32602;<br>• missing `_meta` `clientCapabilities` → -32602;<br>• `server/discover` answered without upstream `instructions`;<br>• `subscriptions/listen` acknowledged first (subscription id, empty filter), then completed and closed, with no `notifications/cancelled`;<br>• `Mcp-Name` base64 with NFC compared correctly;<br>• every PEP result carries `resultType`, and discover and list results carry `ttlMs` and `cacheScope` as M1 sets them |
-| C-FWD | 3:<br>• no agent header (`Authorization`, `Idempotency-Key`, `Mcp-Param-*`, `Pep-Episode`) reaches upstream;<br>• upstream `_meta` holds only PEP-built keys (the agent's `traceparent`, `logLevel`, `progressToken` and unknown keys are absent);<br>• the upstream id is PEP-assigned | 1:<br>• the upstream body equals the `forward::tools_call_request` output byte for byte |
-| C-RES | 3:<br>• an `outcome` key forged by the tool server is stripped and never trusted;<br>• a response id mismatch;<br>• two responses in one body | 3:<br>• an unknown or absent `resultType`;<br>• `input_required` is not recorded, and a payment's reservation becomes `NeedsReconcile`;<br>• an SSE reply from the broker is invalid |
-| C-JSON | 6:<br>• duplicate keys (`name` twice), checked against the forwarded body;<br>• NaN or Infinity;<br>• lone surrogates;<br>• a depth bomb;<br>• a huge number;<br>• a BOM | — |
-| C-EPI | 8, Episode Token:<br>• missing;<br>• malformed (charset, padding, non-zero trailing bits);<br>• a header member outside `alg`, `typ` and `kid`;<br>• forged signature;<br>• expired or idle;<br>• `peer_uid` mismatch (replacing AP's "wrong `aud`": the token has no `aud`);<br>• a Call Proof presented as an Episode Token;<br>• the token of an ended episode | — |
+| C-POSTURE | — | 6:<br>• every container has CapEff 0;<br>• NoNewPrivs 1;<br>• Seccomp 2, with the AF_UNIX-only profile on the agent, the PEP, the operator and the probe;<br>• `io_uring_setup` fails under that profile: `IORING_OP_SOCKET` would create a socket without calling `socket()` (RV3 F10);<br>• no container mounts `docker.sock`;<br>• the agent's `pids_limit`, memory limit and private `/tmp` are in effect |
+| C-HTTP | — | 18:<br>• CL+TE;<br>• TE only;<br>• duplicate CL;<br>• CL mismatch;<br>• obs-fold;<br>• bare LF;<br>• header over the cap;<br>• body over the cap;<br>• slowloris headers, including one byte per interval (RV3 F1);<br>• slow body;<br>• a pipelined second request;<br>• `Content-Encoding`;<br>• HTTP/1.0;<br>• an HTTP/2 preface;<br>• GET → 405;<br>• DELETE → 405;<br>• a notification POST → 400, except `notifications/cancelled` → 202, ignored;<br>• a duplicated `MCP-Protocol-Version`, `Mcp-Method`, `Mcp-Name`, `Pep-Episode`, `Content-Type` or `Host`, whitespace before a colon, or a request target other than the plain path → 400 (RV3 F5) |
+| C-MCP | — | 17:<br>• the version header differs from `_meta` → -32020;<br>• `Mcp-Method` differs from the body → -32020;<br>• `Mcp-Name` differs from the body → -32020;<br>• a base64-sentinel `Mcp-Name` mismatch → -32020;<br>• a batch array body → 400;<br>• any `Mcp-Param-*` header → -32020;<br>• missing `MCP-Protocol-Version` → -32020;<br>• a JSON-RPC response as the body → 400;<br>• any `Origin` → 403;<br>• an unsupported version → -32022;<br>• `Accept` without `text/event-stream` → 400;<br>• missing `_meta` `protocolVersion` → -32602;<br>• missing `_meta` `clientCapabilities` → -32602;<br>• `server/discover` answered without upstream `instructions`;<br>• `subscriptions/listen` acknowledged first (subscription id, empty filter), then completed and closed, with no `notifications/cancelled`;<br>• `Mcp-Name` base64 with NFC compared correctly;<br>• every PEP result carries `resultType`, and discover and list results carry `ttlMs` and `cacheScope` as M1 sets them |
+| C-FWD | 3:<br>• no agent header (`Authorization`, `Idempotency-Key`, `Mcp-Param-*`, `Pep-Episode`) reaches upstream;<br>• upstream `_meta` holds only PEP-built keys: the agent's Episode Token (today it is forwarded: Context), `traceparent`, `logLevel`, `progressToken` and unknown keys are absent (RV3 C1);<br>• the upstream id is PEP-assigned | 1:<br>• the upstream body equals the `forward::tools_call_request` output byte for byte |
+| C-RES | 3:<br>• an `outcome` key forged by the tool server is stripped and never trusted;<br>• a response id mismatch;<br>• two responses in one body | 3:<br>• an unknown or absent `resultType`;<br>• `input_required` is not recorded, and a payment's reservation follows the broker's outcome (P1);<br>• an SSE reply from the broker is invalid |
+| C-JSON | — | 6:<br>• duplicate keys (`name` twice), checked against the forwarded body;<br>• NaN or Infinity;<br>• lone surrogates;<br>• a depth bomb;<br>• a huge number;<br>• a BOM |
+| C-EPI | 7, Episode Token:<br>• missing;<br>• malformed (charset, padding, non-zero trailing bits);<br>• a header member outside `alg`, `typ` and `kid`;<br>• forged signature;<br>• expired or idle;<br>• a Call Proof presented as an Episode Token;<br>• the token of an ended episode | 1:<br>• `peer_uid` mismatch (a unit test: in Compose any other uid fails `require_peer` first, RV3 A10) |
 | C-CRED | 1:<br>• the agent and the PEP cannot read the broker credential | 1:<br>• the tool server rejects calls without it (from a probe on `tools_net`) |
-| C-CTL | 1:<br>• the agent cannot reach `/run/pep-ctl` | 4:<br>• an approval with any of (eid, rid, `action_digest`, amount) mismatched is refused;<br>• a declined step-up leaves the reservation `Released`, and the agent gets `PEP_DENIED`;<br>• an approval that arrives after the agent disconnected is refused;<br>• after `end_episode`, later calls are denied and in-flight legs finish |
-| C-OUT | 6:<br>• an agent disconnect after forwarding never releases the reservation;<br>• a `notifications/cancelled` naming a forwarded payment's id never releases the reservation;<br>• a retry after `Unknown` with a changed `/memo` (a new `action_digest`) → `ReconcilePending`;<br>• a PEP restart mid-payment: the next episode of that intent starts with the reservation `NeedsReconcile` (R1 (a));<br>• an agent write before a PEP restart is still tainted after it (R1 (a));<br>• a burst over the per-episode bucket is refused and issues no Call Proof | 1:<br>• denials from every guard have identical wire bytes apart from the id |
+| C-CTL | 1:<br>• the agent cannot reach `/run/pep-ctl` | 6:<br>• an approval with any of (eid, rid, `action_digest`, amount) mismatched is refused;<br>• a declined step-up leaves the reservation `Released`, and the agent gets `PEP_DENIED`;<br>• an approval that arrives after the agent disconnected is refused;<br>• after `end_episode`, later calls are denied and in-flight legs finish;<br>• `start_episode` is refused while the intent has a live episode (E1, RV3 A2);<br>• `end_episode` lands promptly while the agent saturates its socket (H1, RV3 A11) |
+| C-OUT | 8:<br>• an agent disconnect after the point of forwarding never releases the reservation;<br>• a `notifications/cancelled` naming a forwarded payment's id never releases the reservation;<br>• a retry after `Unknown` with a changed `/memo` (a new `action_digest`) → `ReconcilePending`;<br>• a PEP restart mid-payment: the next episode of that intent starts with the reservation `NeedsReconcile` (R1 (a));<br>• with entity X unresolved, after a restart or after `end_episode` and `start_episode`, a payment to Y and then a retry of X → `ReconcilePending` (R1 (a), RV3 A1);<br>• an agent write before a PEP restart is still tainted after it (R1 (a));<br>• read Secret data, end the episode, start the intent's next one, send to a Public sink → denied (R1 (a), RV3 A3);<br>• a burst over the per-episode bucket is refused and issues no Call Proof | 1:<br>• denials from every guard have identical wire bytes apart from the id |
+| C-ENG | 15, end to end through the engine (RV3 A10), each expected `deny`:<br>• a payment to an entity id that looks like an allowed one (a homoglyph or an NFD variant);<br>• a payment to an entity outside the intent;<br>• an amount taken from an unbound result field instead of the bound lookup (F-14);<br>• a funding lookup laundered through a store write (F-08);<br>• a value the agent wrote in one episode, used as a witness in the next (F-08);<br>• Secret data sent to a Public sink (F-09);<br>• a payment split into smaller ones to dodge step-up;<br>• two concurrent payments funded by the same lookup;<br>• a payment over `per_call_max_minor`, or past the cumulative cap;<br>• an undeclared nested argument (F-13);<br>• a tool name under the reserved `pep/` prefix;<br>• a call to an unpinned tool;<br>• a call to a tool of a quarantined server;<br>• a control method (`approve`, `start_episode`) sent on the agent socket;<br>• a forged `dev.pep-sidecar/call-proof` or `dev.pep-sidecar/outcome` member in the agent's `_meta` | — |
 
-Under R1 (b), the two restart attacks are dropped and the accepted risk recorded instead, which leaves 60.
+Under R1 (b), the four journal attacks in C-OUT (the restart, the unresolved retry, the taint and the ratchet) are dropped and the accepted risk recorded instead. That leaves exactly 50, so (b) has no margin.
 
 ### Rug-pull mutations (G2: every one quarantined within T)
-Each mutation must lead to quarantine within T (L1): the tool is hidden from `tools/list`, its calls are denied (`ToolQuarantined`), and no call reaches it after detection.
+Each mutation must quarantine the mutated server within T (L1). The quarantine unit is the whole server (RV3 B2), so the observable is the same for every mutation:
+- every pinned tool of that server is hidden from `tools/list`;
+- its calls are denied with `ToolQuarantined`;
+- no call reaches it after detection, re-checked just before each upstream write (P1);
+- it stays quarantined until a restart with a re-signed lockfile.
+
+A tool the mutation adds is never served, because it is unpinned, and a call to it gets `ToolNotPinned`.
 
 The model is Invariant Labs' "MCP Security Notification: Tool Poisoning Attacks" (2025-04-01) [101], which defines three attacks:
 - **tool poisoning:** hidden instructions in a tool's description, such as an `<IMPORTANT>` block;
@@ -797,11 +931,11 @@ Its mitigation for rug pulls is pinning tool descriptions "using a hash or check
 9. tool added;
 10. tool removed;
 11. tool renamed;
-12. the same name on a second server: a name collision. This is not Invariant's shadowing (that is #25). A name pinned on two servers is a load error (L1), and a server that later adds a colliding name has an unpinned tool, which is hidden and denied. This needs two stub servers and per-server identity in the lockfile;
+12. the same name on a second server: a name collision. This is not Invariant's shadowing (that is #25). A name pinned on two servers is a load error (L1). A server that later adds a colliding name has drifted (a tool added), so it is quarantined, and the new tool is never served. This needs two stub servers and per-server identity in the lockfile;
 13. `readOnlyHint` true→false;
 14. `destructiveHint` false→true;
 15. `idempotentHint` or `openWorldHint` flipped;
-16. Cyrillic homoglyph in the name. The ASCII-name rule rejects it at load;
+16. Cyrillic homoglyph in the name. Under drift it shows as #10 plus #9, a tool removed and one added, so the server is quarantined. At `lock-scan`, the ASCII-name rule rejects it;
 17. zero-width joiner in the description;
 18. bidi override in the description;
 19. `x-mcp-header` annotation added. Week 2 rejects the annotation at load, so the definition digest changes and the tool is quarantined. The stub emits it;
@@ -813,6 +947,10 @@ Its mitigation for rug pulls is pinning tool descriptions "using a hash or check
 25. cross-server shadowing, in Invariant's sense. After pinning, a tool on server B gains description text that tells the agent how to use server A's `pay_invoice`, for example to pay another recipient. That is a description change on B, so B's tool is quarantined.
     - A description that shadows from the start is not drift. Lockfile review must catch it.
     - G_entity, F-14 and the sink clearances limit what a redirected call can do, which is Invariant's third mitigation, "Cross-Server Protection".
+26. the tool list times out, or returns errors, after the server mutates. A failed poll quarantines the server (RV3 A5);
+27. mutate, then revert before the next poll, or after detection. A revert after detection does not lift the quarantine; one before detection is not drift (RV3 A5).
+
+**The step-up timing case (RV3 A4).** Mutate a server while a payment to it waits for step-up, then approve: the re-check just before forwarding denies it, nothing is forwarded, and the agent gets `PEP_DENIED`.
 
 **Negatives**, which must not trigger drift:
 - key reordering;
@@ -822,7 +960,9 @@ Its mitigation for rug pulls is pinning tool descriptions "using a hash or check
 - the same list split across pages differently.
 
 ### Replays (G3: 0 of 1,000 accepted)
-Captured Episode Tokens and Call Proofs, for reads as well as payments, are replayed in Compose:
+Split by token type (RV3 A7). An Episode Token is a reusable bearer token with no `jti`, so its own peer reusing it while it is live is by design, not a replay. The 1,000 attempts are spread across these classes, in Compose, using step 9's harness: the stub broker logs the proofs it receives, and the `injector` service replays them as uid 20002.
+
+**Call Proofs** (reads as well as payments), replayed to the broker:
 - verbatim;
 - after `exp`;
 - against a different `rid`;
@@ -832,7 +972,17 @@ Captured Episode Tokens and Call Proofs, for reads as well as payments, are repl
 - concurrently from N threads, where exactly one first use is accepted;
 - after a PEP restart, with a key from the previous boot;
 - after a broker restart, with a proof issued before the broker booted, including one issued in the broker's boot second;
-- with `typ` and key confused: an Episode Token presented as a Call Proof, and the reverse.
+- an Episode Token presented as a Call Proof.
+
+**Episode Tokens**, misused at the PEP:
+- after `exp`;
+- after the idle timeout;
+- after `end_episode`;
+- after a PEP restart (a previous boot's key and `kid`);
+- from another peer: a probe with a different uid, holding the token;
+- re-encoded with padding, the standard alphabet, or non-zero trailing bits;
+- with a malleated high-S signature, which the PEP rejects (T1);
+- a Call Proof presented as an Episode Token.
 
 **In-process, beside G3:** after the clock is stepped back, against the replay cache's injected clock (step 6).
 
@@ -884,7 +1034,8 @@ services:
       - { type: volume, source: pep-ctl,     target: /run/pep-ctl, volume: { nocopy: true } }
       - { type: volume, source: pep-pub,     target: /run/pep-pub, volume: { nocopy: true } }
       - { type: volume, source: broker-sock, target: /run/broker,  volume: { nocopy: true } }
-      - { type: volume, source: pep-state,   target: /var/lib/pep }   # R1 journal, decision log
+      - { type: volume, source: pep-state,   target: /var/lib/pep }   # R1 journal; only the PEP mounts it
+      - { type: volume, source: pep-log,     target: /var/log/pep }   # decision log (RV3 B4)
       - { type: bind, source: ./config/pep, target: /etc/pep, read_only: true }
   broker:
     user: "20003:20003"
@@ -897,6 +1048,16 @@ services:
       - { type: volume, source: pep-pub,      target: /run/pep-pub,    read_only: true, volume: { nocopy: true } }
       - { type: volume, source: broker-state, target: /var/lib/broker }   # broker log
       - { type: bind, source: "${PEP_SECRETS_DIR:?set PEP_SECRETS_DIR}/broker-credential", target: /run/credential, read_only: true }
+  injector:                    # G3 only: replays captured proofs and tokens (RV3 D2); never in a release image
+    profiles: [gate1]
+    user: "20002:20002"        # the broker admits only the PEP's uid
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true", "seccomp=./seccomp-unix-only.json"]
+    network_mode: "none"
+    volumes:
+      - { type: volume, source: broker-sock,  target: /run/broker,     volume: { nocopy: true } }
+      - { type: volume, source: broker-state, target: /var/lib/broker, read_only: true }   # the captured proofs
   operator:                    # scripted operator (H1)
     user: "20004:20004"
     read_only: true
@@ -925,6 +1086,7 @@ volumes:
   pep-ctl:      { driver: local, driver_opts: { type: tmpfs, device: tmpfs, o: "uid=20002,gid=20004,mode=2750" } }
   pep-pub:      { driver: local, driver_opts: { type: tmpfs, device: tmpfs, o: "uid=20002,gid=20003,mode=2750" } }
   pep-state:    {}             # on disk; owner 20002 and mode 0700 come from the image's /var/lib/pep
+  pep-log:      { driver: local, driver_opts: { type: tmpfs, device: tmpfs, o: "uid=20002,gid=20002,mode=0750,size=256m" } }
   broker-state: {}
   tool-a-state: {}
   tool-b-state: {}
@@ -936,6 +1098,8 @@ networks:
   - **Why named volumes.** A tmpfs-backed *named* volume is shared between containers. A per-service `tmpfs:` entry would give each container a private copy, which is what the agent's `/tmp` wants.
   - **`nocopy: true`.** It stops Docker copying image contents into a fresh volume. Some engines also copy the image directory's owner and mode even when it is empty, so step 8 checks owner and mode at start.
 - **State volumes.** `pep-state` and the other `*-state` volumes are on disk, not tmpfs, so the journal and the tool servers' dedupe stores survive restarts. They take their owner and mode from the image's directory on first use, which step 8 checks.
+- **The log volume (RV3 B4).** `pep-log` is a size-capped tmpfs that the oracle reads through a read-only mount. It survives a PEP container restart, which the restart tests need, but not a host reboot. `pep-state` stays private to the PEP.
+- **The injector (RV3 D2).** The stub broker's test-only mode writes each Call Proof it receives to `broker-state`. The `injector` service, in the `gate1` profile, replays them through the broker socket as uid 20002. It and that mode exist only for G3.
 - **Images:**
   - a real `/run` owned by root and not a symlink, because `bind_safe_listener` checks every ancestor;
   - B1 decides between static musl and a glibc-matched base.
@@ -949,13 +1113,13 @@ networks:
 ## 5. Forward constraints (decided now so Week 2 does not paint later weeks into a corner)
 - **Week 3:**
   - Tokio reuses the sans-IO modules of §2a, and A1's per-episode actors become `EpisodeActor`s, so the std-threads binary is not rewritten.
-  - SQLite replaces the R1 journal and the in-memory label store.
+  - SQLite replaces the R1 journal and the in-memory label store. It keeps what RV3 added: restored reservations keyed by (eid, rid), the PEP-wide unresolved-entity set, and the per-intent ratchet.
   - Reconciliation of `NeedsReconcile` replaces the P1 entity check.
 - **Week 4:**
   - The agent reaches its LLM through N1's Unix-socket model proxy.
   - AgentDojo has its own tool runtime, so it needs an adapter.
   - The agent harness builds TypeScript clients pinned to `2026-07-28`, with undici's own `fetch` and `Agent`, and Python clients on an httpx2 `uds` transport with `trust_env=False` (D2).
-  - Step-up approvals longer than 50 s need one of two things from the agent's client. Either it raises its request timeout, or it opts into `resetTimeoutOnProgress` and sends a `progressToken` that the PEP answers with progress notifications. `:` keep-alives alone do not stop the TypeScript SDK's 60 s timer (P1).
+  - Step-up approvals longer than 45 s need one of two things from the agent's client. Either it raises its request timeout, or it opts into `resetTimeoutOnProgress` and sends a `progressToken` that the PEP answers with progress notifications. `:` keep-alives alone do not stop the TypeScript SDK's 60 s timer (P1).
   - J1's choice shows up in Gate 2's utility figure.
 - **Week 5:**
   - The PEP reaches the Txn-Token service and the PDP through N1's chosen egress path.
@@ -984,9 +1148,13 @@ Nothing here is applied by this document.
   - "The agent, the PEP and the operator run under an AF_UNIX-only seccomp profile."
   - "Vault credential injection is deferred; the Week 2 broker reads a credential file."
   - "The PEP rejects an upstream result with no `resultType`. This departs from MCP 2026-07-28's client rule for earlier-revision servers, because every pinned server implements 2026-07-28." (M2)
-  - Append to the `pep` sidecar bullet: "Speaks MCP `2026-07-28` Streamable HTTP to the agent over that socket: a hand-rolled HTTP/1.1 subset (POST only, exact `Content-Length`, one request per connection), with no TCP listener; the Episode Token travels in `_meta` (§3.3)." (D2; applied 2026-11-03)
+  - Append to the `pep` sidecar bullet: "Speaks MCP `2026-07-28` Streamable HTTP to the agent over that socket, with no TCP listener: a hand-rolled HTTP/1.1 subset with one request per connection. Requests are POSTs with an exact `Content-Length`; any other method gets 405. JSON replies carry `Content-Length`, the one SSE reply (`subscriptions/listen`) ends when the connection closes, and every reply sends `Connection: close`. The Episode Token travels in `_meta` (§3.3)." (D2; applied 2026-11-03, and tightened the same day after RV3 E2)
+  - "The PEP's decision log is on its own size-capped volume; the journal's volume is mounted only by the PEP." (RV3 B4)
+- **§2, `cid` (M1, RV3 F6):** "`cid`: the JCS serialization of the PEP-assigned JSON-RPC id (a ULID string). The agent's own id is only echoed on the reply." 
 - **§3.3, Episode Token (E1, R1):**
   - "Minted by the PEP on the host `start_episode` call and revoked by `end_episode`; idle timeout 30 minutes; signed with a per-boot key, so a PEP restart invalidates every token; delivered to the agent on stdin."
+  - "Each `start_episode` mints a fresh `eid`, which is also `txn` (§3.2) and the engine's `episode_id`. An intent has at most one live episode. Revocation and idle state are keyed by `eid`. The PEP rejects high-S signatures." (RV3 A2, A7)
+  - "A token is delivered only to a freshly started agent process; the agent is restarted with every episode, and after a PEP restart." (RV3 A3)
   - "No `iss`, `aud`, `jti` or `nbf`: the PEP is the only issuer and verifier; the `typ` and key differ from the Call Proof's, which makes the two validations mutually exclusive."
 - **§3.4, Call Proof (T1, R1):**
   - Replace "Call Proofs are issued only for `Held` reservations (…)" with "Every forwarded `tools/call` carries a Call Proof. Payment proofs add `rid` and are issued only for `Held` reservations (never for `AwaitingStepUp`, `Released` or `NeedsReconcile`)."
@@ -994,9 +1162,9 @@ Nothing here is applied by this document.
   - "The protected header holds only `alg`, `typ` and `kid`; tokens are decoded as strict base64url."
   - Give concrete `iss` and `aud`, the server binding, and definitions of `budget`, `tool_schema_digest` and `prov` (the witness origin hashes).
   - List the checks the broker performs.
-  - "Signatures use low-S; the broker rejects high-S."
+  - "Signatures use low-S; the broker rejects high-S, and requires `rid` exactly when the tool is a payment."
   - "The broker rejects proofs whose `iat` is not after its boot second."
-  - "The replay cache's capacity follows from the per-episode rate limit and the episode cap."
+  - "The replay cache's capacity follows from the per-episode rate limit and the episode cap; a full cache rejects."
   - "`tth` is added in Week 5."
 - **§4:**
   - **Week 2:** replace "Call Proof with `rid` for `Held` reservations only" with "Call Proof on every forwarded `tools/call`, with `rid` on payments, which must be `Held`". Week 2 also gains:
@@ -1016,9 +1184,9 @@ Nothing here is applied by this document.
 **CLAUDE.md** (wording for you to apply):
 - **§2 (once `compose.yaml` exists):** add `docker compose config --quiet` to the loop.
 - **§3, new rule "Binaries":** "Binaries log with `writeln!` to a locked `stderr` handle and return `std::process::ExitCode` from `main`. `print_stdout`, `print_stderr` and `exit` stay denied. Never log raw tokens, proofs or keys."
-- **Two-Phase Budget, append (R1 (a)):** "Journal and fsync each payment reservation and each F-08 taint record before the call is forwarded; at boot, unresolved reservations return as `NeedsReconcile` and count against their intent."
+- **Two-Phase Budget, append (R1 (a)):** "Journal each payment reservation when it is made, and fsync its `forwarded` record and the call's F-08 taint and F-09 ratchet records before the call is forwarded. At boot, truncate a torn tail under the journal lock; reservations forwarded without a final outcome return as `NeedsReconcile`, keyed by their original (eid, rid), and count against their intent."
 - **F-11/F-12, append:** "Before unlinking or binding, take an exclusive `File::try_lock` on `<socket>.lock`, opened with `O_NOFOLLOW` (`nix::libc::O_NOFOLLOW` through `custom_flags`) and checked by fstat (regular file, mode 0600, owner euid, `nlink` 1), and hold it for the listener's lifetime."
-- **F-13, replace the second sentence:** "Agent connection threads never hold `HostAuthority`; they send an episode's actor messages that cannot express approve, trusted input, end or abort. `approve_step_up`, `record_trusted_input` and `end_episode` run only for control-socket messages from the operator uid, and abort outcomes come only from the upstream leg." At step 10, also replace "(until the Week 2 lockfile pins full argument schemas)" with the rule the strict schemas set.
+- **F-13, replace the second sentence:** "Agent connection threads never hold `HostAuthority`; they send an episode's actor messages that cannot express approve, trusted input, end or abort. `approve_step_up`, `record_trusted_input` and `end_episode` run only for control-socket messages from the operator uid. No agent message changes a reservation: an agent disconnect releases one only before its point of forwarding, and after that point a reservation ends only through the broker's explicit outcome or an upstream timeout." (Corrected after RV3 B1: the 3 Nov wording, "abort outcomes come only from the upstream leg", contradicted P1's own rows.) At step 10, also replace "(until the Week 2 lockfile pins full argument schemas)" with the rule the strict schemas set.
 - **F-16, replace:** "Only bytes built by `forward::tools_call_request` from the engine's canonical tool name and arguments, with a PEP-built `_meta`, are sent downstream; never the agent's wire bytes, id or `_meta`."
 - **§1:** change only if D1 = A.
 
@@ -1032,7 +1200,7 @@ Nothing here is applied by this document.
 - **Week 4:**
   - the AgentDojo benchmark;
   - the model-provider egress proxy (chosen in N1, built in Week 4);
-  - step-up approvals longer than 50 s (P1).
+  - step-up approvals longer than 45 s (P1).
 - **Week 5:**
   - RAR and ID-JAG exchange;
   - the Txn-Token service and `tth`;
@@ -1051,14 +1219,20 @@ Nothing here is applied by this document.
   - dynamic sinks (`clearance_lookup`) and `role_contracts` (L1).
 
 ## Risks
-- **Schedule.** RV2 sized the 31 Oct draft at two to three weeks of work. This draft adopts RV2's four cuts and adds the journal, so it is still more than one week. The order puts the security foundations first (steps 3–6), so a slip delays Gate 1 rather than weakening it.
+- **Schedule.** RV2 sized the 31 Oct draft at two to three weeks of work. This draft adopts RV2's four cuts and adds the journal and RV3's fixes, so it is still more than one week, and step 7 is most of it. The order puts the security foundations first (steps 3–6), so a slip delays Gate 1 rather than weakening it.
+  - **Cut list (RV3 D6),** in the order to apply it if the schedule slips, least Gate 1 impact first:
+    1. the MCP conformance suite in CI (step 9) becomes optional;
+    2. J1 moves to Week 4: Week 2's results keep RFC 8785 rounding, and J1 (b) lands before Gate 2;
+    3. if the journal's fixes (RV3 A1, A9, B5) cannot close in time, Gate 1 runs under R1 (b). Its four journal attacks are dropped and the risk is recorded. That leaves exactly 50 attacks, so this cut uses up G1's whole margin.
+  - Week 3's SQLite store replaces the journal, so the journal is deliberately minimal.
 - **User namespaces.** Under userns-remap or rootless Docker, uids are translated, so `require_peer` must compare uids as the PEP's user namespace sees them. The cross-namespace test showed this: a peer with uid 1000 appeared as uid 0 to a listener in a user namespace that maps 1000 to 0 (Appendix A). Test on the actual runtime (AP's Q2).
-- **HTTP smuggling.** Only the strict parser stands between the agent and request smuggling, so any regression there is a security bug (C-HTTP).
+- **HTTP smuggling.** Only the strict parser stands between the agent and request smuggling. With one hop and F-16 forwarding only the PEP's own parse, a parser bug is a robustness failure rather than a bypass (RV3 A10), but it still blocks Gate 1, because the C-HTTP checks must pass.
 - **A young MCP revision.** 2026-07-28 is three months old, and SDKs and servers may diverge from it, for example on the `subscriptions/listen` reply or on `resultType`. The spec itself is ambiguous on whether a server-closed subscription also needs `notifications/cancelled`; both SDKs misread a server that sends it (M1). The TypeScript SDK v2 still defaults to the 2025 handshake (D2). Re-check the Appendix A pages before Gate 1.
 - **Restarts.**
-  - Under R1 (a), a restart keeps budgets and taint, but voids every token, so the operator must start episodes again.
-  - Under R1 (b), a restart refunds every budget, forgets every `NeedsReconcile` and in-flight payment, and forgets agent-write taint. That is an accepted Gate 1 risk, in those words.
-- **Step-up timeouts.** Approvals that take longer than 50 s fail in Week 2 (P1).
+  - Under R1 (a), a restart keeps budgets, taint and the ratchet, but voids every token, so the operator must start episodes again, each in a fresh agent process (E1).
+  - Under R1 (b), a restart refunds every budget, forgets every `NeedsReconcile` and in-flight payment, forgets agent-write taint, and resets the confidentiality ratchet. That is an accepted Gate 1 risk, in those words.
+- **Step-up timeouts.** Approvals that take longer than 45 s fail in Week 2, because the step-up wait plus the upstream call must stay under the TypeScript SDK's 60 s (P1).
+- **Journal throughput.** One fsync per call, with group commit, puts disk latency on the payment and write path. G4 measures it (O1); if it breaks 25 ms, the fallback is a larger group-commit window, not skipping the fsync.
 - **Result fidelity.** JavaScript agents round big integers themselves, whatever J1 decides, and NFD strings cannot round-trip through the PEP (F-05).
 - **The seccomp profile.** Blocking non-`AF_UNIX` sockets may break an SDK, or a library in the PEP's image, that opens an inet socket at start-up. The profile returns `EAFNOSUPPORT`, so such failures are visible.
 - **Kernel drift.** CI's runner kernel (7.0, azure) is newer than this machine's (6.18.54) (Q1). Tests branch on version and record `uname -r`. `ubuntu-latest` moves to Ubuntu 26.04 in November 2026 [99]. CI pins `ubuntu-24.04`, so a kernel change there is a deliberate edit.
@@ -1096,7 +1270,7 @@ Nothing here is applied by this document.
 | `g_budget` | `src/engine.rs:2425-2485` |
 | `g_stepup` uses only the intent's threshold | `src/engine.rs:2545` |
 | `witness_prov` yields at most two hashes (amount, currency) | `src/engine.rs:2550` |
-| A non-reserved `_meta` member (`progressToken`) is forwarded | `src/engine.rs:4754` (test) |
+| The agent's `_meta` is forwarded, the Episode Token included: `is_reserved_meta` exempts `dev.pep-sidecar/episode`, and a test asserts the token appears in `canonical_request` (corrected after RV3 C1) | `src/engine.rs:2225-2227`; `src/engine.rs:4754-4761` (test) |
 | `require_peer_uid` checks the uid only | `src/peercred.rs:177` |
 | `bind_safe_listener` | `src/peercred.rs:204` |
 | The probe's two gaps, which a lock would close | `src/peercred.rs:307-318` |
@@ -1112,7 +1286,7 @@ Nothing here is applied by this document.
 **Dependencies:**
 - **nix 0.31.3:**
   - `sockopt::PeerPidfd` is at `src/sys/socket/sockopt.rs:687`, and there is no `SO_PASSRIGHTS` sockopt;
-  - `OFlag` requires the `fs` or `term` feature (`src/fcntl.rs:116-119`), but `O_NOFOLLOW` does not need it: nix re-exports libc unconditionally (`src/lib.rs:107`, `pub use libc;`), so `nix::libc::O_NOFOLLOW` works with std's `custom_flags`.
+  - `OFlag` requires the `fs` or `term` feature, or `fanotify` on Linux (the cfg is at `src/fcntl.rs:111-115`, corrected after RV3 F11), but `O_NOFOLLOW` does not need it: nix re-exports libc unconditionally (`src/lib.rs:107`, `pub use libc;`), so `nix::libc::O_NOFOLLOW` works with std's `custom_flags`.
 - **base64 0.23.1:** `URL_SAFE_NO_PAD` uses the `NO_PAD` config, which decodes with `DecodePaddingMode::RequireNone` (`src/engine/general_purpose/mod.rs:499-501`) and "does not allow trailing bits when decoding" (its doc).
 - **p256 0.14.0 [78]:**
   - `default` = `arithmetic`, `ecdsa`, `pem`, `precomputed-tables` and `std`;
@@ -1200,7 +1374,7 @@ Not done: `cargo deny` on a scratch copy of the repo with p256 added. The comman
 
 | Result | Sources |
 |---|---|
-| Resolves and supports its claim | [1] (with the two notes below), [2], [4]–[19], [23]–[30], [32]–[43], [45]–[50], [52]–[64]. Most GitHub items are small projects' own issues and PRs: they show what others met, not independent proof |
+| Resolves and supports its claim | [1] (with the two notes below), [2], [4]–[19], [23]–[30], [32]–[43], [45]–[50], [52]–[55], [57]–[64]. Most GitHub items are small projects' own issues and PRs: they show what others met, not independent proof |
 | Supports, through a fallback | [20] (socket.dev refused; p256's README says "has never been independently audited"); [21] (crates.io page empty; the API gives 0.14.0, 2026-07-03); [44] (vulners refused; the OSV record gives "fixed 0.7.6") |
 | Supports in part | [3]: `-1` means reaped, with no task attached, not just exited. The page is also a snapshot from before the EREMOTE change. [56]: names the 6.18.14 and 6.19.10 backports, but the LTP patch itself was contested and not shown merged. [51]: a fork of [50]'s repo, last pushed in 2022, so [50] is the one to cite |
 | Does not support the claim | [22]: it supports the advisory floor, but never mentions the 1.87 MSRV, so D1 now cites [23][104]. [31]: the commit changes `ESRCH` to `ENODATA` for an unconnected or non-AF_UNIX socket, and says nothing of reaped peers. Q1's errno list is corrected |
@@ -1233,6 +1407,7 @@ Notes that changed or sharpened the plan:
   | Acknowledgement, then `notifications/cancelled`, then the completion result | `SubscriptionLost`: "ended without the server's graceful close; re-listen and refetch" |
 
 - **Other results:** the SDK also accepted a discover result with no `serverInfo` field.
+- **The Episode Token** (`py-token-plain-202`, added after RV3 E1). The client used `httpx2.AsyncClient(headers={"Pep-Episode": …})`, and `meta=` on `list_tools` and `call_tool`. The stand-in saw the header on all four requests, and `_meta` on `tools/list` and `tools/call`, beside the SDK's own keys. `Client.listen()` takes no `meta`.
 
 **SDK runs, part 2: the MCP TypeScript SDK 2.4.0 over a Unix socket.**
 - **Setup:**
@@ -1246,13 +1421,27 @@ Notes that changed or sharpened the plan:
 | Default options (no `versionNegotiation`) | The client sent a 2025 `initialize` with no `MCP-Protocol-Version` header, no `Mcp-Method` and no `_meta`. It got 404 and -32601, and `connect()` failed with `CLIENT_HTTP_NOT_IMPLEMENTED` |
 | Pinned to `2026-07-28` | `server/discover` (id `"server-discover-probe-1"`), then `tools/list`, `tools/call` and `subscriptions/listen` (id `"listen:0"`), all over the socket. Every request carried `Accept: application/json, text/event-stream`, `MCP-Protocol-Version`, `Mcp-Method`, `Mcp-Name` on `tools/call`, and `_meta` with `protocolVersion`, `clientCapabilities: {}` and `clientInfo`. None of M1's checks fired |
 | `subscriptions/listen`, acknowledgement then completion | `honoredFilter` was `{}`, and `closed` resolved `'graceful'`. No re-listen came in the next 2 s |
-| `subscriptions/listen`, with `notifications/cancelled` before the completion | `closed` resolved `'remote'` (an unexpected disconnect), and `onerror` reported "Received a response for an unknown message ID" for the completion result |
+| `subscriptions/listen`, with `notifications/cancelled` before the completion | `closed` resolved `'remote'` (an unexpected disconnect). In some runs `onerror` also reported "Received a response for an unknown message ID" for the completion result; whether it does depends on timing |
+| The Episode Token (`token`, added after RV3 E1) | With `requestInit: { headers: { 'Pep-Episode': … } }`, and `_meta` in the `listTools` and `callTool` params, the stand-in saw the header on all four requests, the `server/discover` probe included, and `_meta` on `tools/list` and `tools/call`. `listen()` takes no `_meta`. No `Pep-Episode`/`_meta` mismatch occurred |
 | A `tools/call` with a 1 s timeout against `slow` | `REQUEST_TIMEOUT`. The client aborted its HTTP request and sent no `notifications/cancelled`. The next call worked |
 | `listChanged` configured | No subscription was auto-opened, because the PEP advertises no list-changed capability |
 | The client closes an open subscription itself | It POSTs `notifications/cancelled` `{"requestId": "listen:0"}` with `MCP-Protocol-Version` but no `Mcp-Method`. Answered with 202: clean. Answered with 400: `onerror` fires ("Error POSTing to endpoint"), but `close()` resolves, `closed` is `'local'`, and later calls work |
-| Node's built-in `fetch` with the undici 8.12.3 `Agent` | Failed: `UND_ERR_INVALID_ARG` "invalid onRequestStart method". Node 24.22.2 bundles undici 7.30.1 |
+| Node's built-in `fetch` with the undici 8.12.3 `Agent` | Failed. The saved cause chain is `TypeError: fetch failed <- UND_ERR_INVALID_ARG: invalid onRequestStart method` (RV3 E3: the 3 Nov results did not show the cause). Node 24.22.2 bundles undici 7.30.1 |
 
-The stand-in, the clients and their pinned SDKs are in `spikes/d2-transport/`, and its `run.sh` reproduces every scenario. The original logs were lost with the session scratchpad; the spike's `results/` come from a `run.sh` run the same day, which matched every outcome above. Step 7's tests should rebuild the same checks against the real PEP.
+The stand-in, the clients and their pinned SDKs are in `spikes/d2-transport/`, and its `run.sh` reproduces all 11 scenarios. The original logs were lost with the session scratchpad. The spike's `results/` come from a `run.sh` run on 2026-11-03 at 12:49 UTC, after RV3's additions, which matched every outcome above. Step 7's tests should rebuild the same checks against the real PEP.
+
+**RV3's code claims, verified 2026-11-03 before folding in:**
+- `next_reservation_id: 1` per engine (engine.rs:1023), and `reservations.insert` replaces an entry with the same id (engine.rs:1637);
+- the F-07 key is built from `self.state.intent.episode_id` (engine.rs:1475-1479, 1665-1668);
+- `context_conf` starts at `Confidentiality::Public` (engine.rs:1016), and `g_label` compares it with the sink's clearance (engine.rs:2517-2530);
+- `approve_step_up` only sets the state to `Held` (engine.rs:1439-1455);
+- `apply` calls `record` once per taint index (engine.rs:1617-1619);
+- `abort` never lowers `calls` (engine.rs:1792-1835);
+- `canonical_call_id` accepts strings and safe integers (engine.rs:1989-1999), and `DuplicateCallId` spans the episode (engine.rs:2208);
+- `MAX_RECORDS` is 256 (engine.rs:26, checked at 1316);
+- `RESERVED_TOOL_PREFIX` is `pep/` (engine.rs:61);
+- `full_backlog_counts_as_live` is `#[ignore]`d (peercred.rs:575), and ci.yml's `ignored-tests` job raises `ulimit` for it;
+- `lenient-numbers` switches the request profile to `EcmaSafe` (jcs.rs:29-32).
 
 **Week 1 verified plan:** "pep-sidecar Week 1_ Verified Plan and Partial Rust Code for JCS, Policy Engine and Peer Credentials" is at `C:\Users\mitam\AI & Cybersecurity\`, not in the parent folder. Its "Appendix: Gate 1 containment testbed (outline)" (lines 231–245) lists:
 - TCP egress from uid 20001;
@@ -1301,7 +1490,7 @@ The stand-in, the clients and their pinned SDKs are in `spikes/d2-transport/`, a
 |---|---|---|
 | `cargo deny` on the real tree with p256 | The probe tree passes the repo policy once BSD-3-Clause is allowed, and none of its 23 crates is already in the lock. A run on a scratch copy of the repo was refused here | Step 3 |
 | Engines copying an image directory's owner and mode into an empty volume (RV, from moby [84][85]); `*-state` volumes taking the image's owner | Docker is not installed yet: step 1 needs your sudo | Step 8 |
-| Whether the MCP conformance suite can run against the PEP | It takes an HTTP URL, and its scenarios may need fixture tools | Step 9 |
+| Whether the MCP conformance suite can run against the PEP | It takes an HTTP URL, its scenarios may need fixture tools, and the bridge must attach an Episode Token to `tools/list` and `tools/call` (RV3 D5) | Step 9 |
 | Source [65] | No reachable mirror; the plan does not rely on it | — |
 
 Settled on 2026-11-03 and removed from this table (Appendix A):
@@ -1375,6 +1564,28 @@ Settled on 2026-11-03 and removed from this table (Appendix A):
   - **D1's MSRV citation** used [22], which never mentions the MSRV.
   - **D2** called the 405 for GET or DELETE a rule; it is a SHOULD.
   - **U1** answered every notification POST with 400. The TypeScript SDK posts `notifications/cancelled` when it closes a subscription, and a 400 surfaces there as a client error. That one notification now gets 202 and is ignored, and C-OUT gains an attack test proving it never releases a reservation.
+- **Corrected by RV3 (2026-11-03), each verified against `src/` first (Appendix A):**
+  - **The Context row** said only `_meta` members outside `dev.pep-sidecar/` are forwarded. The Episode Token is forwarded too, and a test asserts it (C1).
+  - **J1** presented §2a's proposed return value of `record_result_raw` as current behaviour (C2).
+  - **D2's consequence** said string ids were new. `tools/call` already accepts them (C3).
+  - **D2's closure** claimed the spike sent "every header and `_meta` field M1 checks", but no token had been attached. The token runs now show both carriers (E1). SPEC §1's sentence was tightened (E2), and the global-fetch error's cause is now saved (E3).
+  - **P1 and the proposed F-13 wording** said outcomes come only from upstream, which contradicted P1's own rows (B1).
+  - **G1's count of 62 attacks** included 24 tests that cannot reveal a bypass (A10).
+  - **G3** listed replays an Episode Token accepts by design (A7).
+  - **O1** used "downstream" for the agent side (B7).
+- **Where this draft departs from RV3's suggested fixes:**
+  - **A1:** of RV3's two keyings, this draft keeps restored reservations in a separate set keyed by (eid, rid), rather than re-keying every reservation, so the engine's own reservation map is unchanged.
+  - **A2:** RV3 left the scope of the unresolved-entity set open. This draft makes it PEP-wide, because two intents may name the same invoice.
+  - **A3:** RV3 offered journaling the ratchet and a one-process-per-episode rule. This draft adopts both: the rule is primary, and the journal is the backstop.
+  - **A5:** the poll deadline is 3 s, so T = 10 s holds by arithmetic. Quarantine is permanent until restart, as RV3 suggested.
+  - **A10:** the 24 HTTP, MCP and JSON tests become checks, as RV3 said. C-FWD's three tests stay attacks, though: a failure there leaks agent material, such as the bearer token, upstream, which is what today's code does. C-ENG adds RV3's ten engine attacks plus five more, for 54 in all. Randomized repeats do not count.
+  - **D2 (the G3 harness):** proofs are captured by the stub broker's test-only mode, not by a tap in the PEP, so the PEP image has nothing test-only in it.
+  - **D3:** RV3 suggested `g_budget` refuse a call whose result could not be recorded. This draft records the limit in O1's provisioning instead; a call that runs past `MAX_RECORDS` is abandoned, as P1 already says.
+  - **E1:** RV3's fallback, amending SPEC §3.3 to accept the token from `Pep-Episode` alone, is not needed. Both SDKs can set `_meta` on the two methods that need a token, and `subscriptions/listen` needs none.
+  - **F2:** the 55 s budget is split 45 s for step-up and 10 s for the upstream call.
+  - **F6:** the PEP substitutes its own id in the transport, so the engine's keying is unchanged.
+  - **B3:** a wrong `Content-Type` gets 400 rather than 415, which keeps the set of statuses small.
+  - **T1:** RV3 asked what `kid` means. This draft makes it required: the thumbprint of the current boot's key.
 - **Where this draft departs from RV2's wording:**
   - **The getrandom check:** fail-closed, instead of an inverted exit status, which would also pass when cargo itself fails.
   - **`O_NOFOLLOW`:** taken through nix's libc re-export instead of a direct libc dependency, so `Cargo.toml` doesn't change.
@@ -1382,7 +1593,56 @@ Settled on 2026-11-03 and removed from this table (Appendix A):
   - **J1:** NFC cannot be fixed on the result side, and (b) helps only agents that parse big integers exactly.
   - **Decision timing:** RV2 had T1, L1 and Q1 closing later. Its own reordering moves them into step 2.
   - **`tokens.rs`:** it moves before the binary along with p256, so that step 7 has no placeholder token checks.
-  - **Step-up waits:** a 50 s cap rather than SSE keep-alives, which reset transport timers but not an SDK's request timer.
+  - **Step-up waits:** a cap rather than SSE keep-alives, which reset transport timers but not an SDK's request timer. The cap was 50 s; after RV3 F2 the step-up wait and the upstream call share 55 s (45 s + 10 s).
+
+**Disposition of RV3:**
+
+| RV3 item | Where it went |
+|---|---|
+| A1 restored reservation ids collide | R1 (restored set keyed by (eid, rid)); §2a ledger restore and reconcile check; C-OUT |
+| A2 episode identity and concurrency | E1 (fresh eid, one live episode per intent); §2a control protocol; C-CTL; §6 SPEC §3.3 |
+| A3 the F-09 ratchet resets | R1 (journaled per intent); E1 (one agent process per episode); §2a ledger restore; C-OUT; §6 SPEC §3.3 |
+| A4 quarantine checked only at evaluation | P1 (re-check before forwarding); §2a `recheck_before_forward`; §3 step-up timing case |
+| A5 drift fails open on a failed poll | L1 (poll deadline, failed-poll quarantine, permanent quarantine, T arithmetic); mutations 26–27 |
+| A6 the oracle: restart joins, rewritten arguments, ambiguous ids | §2a decision logs (two records, ULID ids, `pep-log`) and bypass oracle (digest-mismatch rule) |
+| A7 Episode Token replays and high-S | T1; G3; §3 replays (split by token type); step 6 vectors |
+| A8 the point of forwarding is undefined | P1; A1 (upstream workers); R1 (`forwarded` record) |
+| A9 journal mechanics | R1 (lock, torn-tail truncation, capacity check, one fsync per call); §2a batched taint; O1; Risks |
+| A10 G1's attack count | §3 (reclassified; stolen-token probes; C-ENG); G1; Appendix C departures |
+| A11 the agent can delay revocation | H1 (own capacity, host channel first); §2a config; C-CTL |
+| B1 "outcomes only from upstream" | P1 outcome sources; §6 F-13 wording |
+| B2 G2's observable for #9, #12 and #16 | L1 (whole-server quarantine); §3 mutations |
+| B3 no total reply order | U1 (one total order); M1 |
+| B4 the decision log on `pep-state` | §2a decision logs; §4 (`pep-log`); R1; §6 SPEC §1 |
+| B5 calls refunded across a restart | R1 (`reserve` at creation, `released` outcome) |
+| B6 M2 against P1 precedence; `pending` | M2; P1 broker outcome mapping; M1 upstream responses; §2a stubs |
+| B7 upstream and downstream swapped | O1 |
+| C1 the Episode Token is forwarded today | Context; Appendix A; §2a forwarding; step 7; C-FWD |
+| C2 J1 wording | J1 |
+| C3 string ids already accepted | D2 decision block |
+| D1 step 7 cannot serve `tools/list` | L1 (full definitions); M1 router; step 7 acceptance |
+| D2 no replay harness | Step 9; §4 (`injector`); §3 replays |
+| D3 G4 provisioning | O1 |
+| D4 steps 4 and 5 depend on later work | Steps 4 and 5 |
+| D5 the conformance suite needs tokens | Step 9; Appendix B |
+| D6 scope | Risks (cut list) |
+| E1 the spike never sent a token | `spikes/d2-transport/` (token runs); D2 decision block; Appendix A |
+| E2 SPEC §1 wording | SPEC.md §1 (tightened); §6 |
+| E3 the `UND_ERR_INVALID_ARG` claim | `spikes/d2-transport/` (cause chain saved); Appendix A |
+| E4 bodies not parsed by `jcs` | Step 7 |
+| F1 slowloris | §2a `http.rs`; C-HTTP |
+| F2 step-up plus upstream over 60 s | P1; §2a config; §5; Risks |
+| F3 the charset typo | T1 |
+| F4 release features and musl | B1 |
+| F5 more HTTP parser rules | §2a `http.rs`; C-HTTP |
+| F6 id normalization and `DuplicateCallId` | M1 (PEP-assigned ids); U1; §6 SPEC §2 |
+| F7 gid checks for every peer | H1; M1; §2a config and control protocol; step 4 |
+| F8 token cache and `subscriptions/listen` | M1; T1 |
+| F9 `HostAuthority` on the agent path | A1 |
+| F10 io_uring | C-POSTURE |
+| F11 sources | Appendix A (the [56] range, `OFlag` cfg); Sources [81]–[83] |
+| F12 replay cache assumptions | T1 |
+| The 14 questions for step 2 | §1, "RV3's questions for step 2" |
 
 **Disposition of RV2:**
 
@@ -1602,9 +1862,9 @@ Sources [1]–[65] are carried from AP. All were re-checked on 2026-11-03 (Appen
 78. [p256 0.14.0 feature flags (docs.rs)](https://docs.rs/crate/p256/0.14.0/features)
 79. [elliptic-curve feature flags (docs.rs, 0.14.3)](https://docs.rs/crate/elliptic-curve/latest/features)
 80. [Docker Compose services reference](https://docs.docker.com/reference/compose-file/services/)
-81. [LWN: SO_PEERCGROUPID patch series](https://lwn.net/Articles/1013591/) (from RV; not re-checked)
-82. [uapi `socket.h` commit log](https://git.zx2c4.com/wireguard-linux/log/include/uapi/asm-generic/socket.h?showmsg=1) (from RV; not re-checked)
-83. [httpcore developer interface (`uds`)](https://httpcore.readthedocs.io/en/latest/api.html)
+81. [LWN: SO_PEERCGROUPID patch series](https://lwn.net/Articles/1013591/) (from RV; not re-checked; no longer cited: [98] replaced it)
+82. [uapi `socket.h` commit log](https://git.zx2c4.com/wireguard-linux/log/include/uapi/asm-generic/socket.h?showmsg=1) (from RV; not re-checked; no longer cited: [98] replaced it)
+83. [httpcore developer interface (`uds`)](https://httpcore.readthedocs.io/en/latest/api.html) (no longer cited: [102] replaced it)
 84. [moby #40046: Compose secrets permissions](https://www.github.com/moby/moby/issues/40046) (from RV; not re-checked)
 85. [moby `volumes_unix.go` (mirror)](https://git.causa-arcana.com/kotovalexarian-likes-github/moby--moby/raw/commit/26855c780184c528446957bd77821c6f4c74b343/daemon/volumes_unix.go) (from RV; not re-checked)
 86. [time_namespaces(7), Linux manual page](https://man7.org/linux/man-pages/man7/time_namespaces.7.html)

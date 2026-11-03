@@ -67,6 +67,7 @@ run() {
   echo "===== $name   stand-in: $variant, notifications -> $status   client: $*"
   local rc=0
   timeout "$CLIENT_TIMEOUT" "$@" >"$out" 2>&1 || rc=$?
+  sed -i "s#$HOME#~#g" -- "$out"            # tracebacks carry home paths; keep usernames out of results
   sleep 1                                   # let the stand-in log anything still in flight
   kill "$srv"
   wait "$srv" 2>/dev/null || true
@@ -104,6 +105,12 @@ run py-plain plain 202 \
 run py-cancelled cancelled 202 \
   "SubscriptionLost: subscription 'listen-1' ended without the server's graceful close; re-listen and refetch" "!M1 check" \
   -- "${PY[@]}"
+# Added after RV3 (E1): can the caller attach the Episode Token? Header on every request, _meta on list and call.
+run py-token-plain-202 plain 202 \
+  "server/discover id=1 [token: header]" "tools/list id=2 [token: header+meta]" "tools/call id=3 [token: header+meta]" \
+  "subscriptions/listen id=listen-1 [token: header]" "listen ended gracefully; events: []" "client closed cleanly" \
+  "!M1 check" \
+  -- "${PY[@]}" token
 
 # Appendix A, part 2: the MCP TypeScript SDK.
 run ts-default-plain-202 plain 202 \
@@ -116,13 +123,18 @@ run ts-main-plain-202 plain 202 \
   "1*subscriptions/listen" "!notifications/cancelled" "!client.onerror" "!M1 check" \
   -- "${TS[@]}" main
 run ts-global-fetch-plain-202 plain 202 \
-  "global fetch failed:" "fetch failed" "!server/discover" \
+  "global fetch failed:" "fetch failed" "cause chain:" "!server/discover" \
   -- "${TS[@]}" global-fetch
+run ts-token-plain-202 plain 202 \
+  "server/discover id=server-discover-probe-1 [token: header]" "tools/list id=0 [token: header+meta]" \
+  "tools/call id=1 [token: header+meta]" "subscriptions/listen id=listen:0 [token: header]" \
+  "listen closed: graceful" "client closed cleanly" "!M1 check" "!client.onerror" \
+  -- "${TS[@]}" token
 run ts-listchanged-plain-202 plain 202 \
   "server/discover id=server-discover-probe-1" "autoOpenedSubscription: none" "!subscriptions/listen" \
   -- "${TS[@]}" listchanged
 run ts-main-cancelled-202 cancelled 202 \
-  "listen closed: remote" "Received a response for an unknown message ID" "call after the timeout: invoice INV-2" "!M1 check" \
+  "listen closed: remote" "call after the timeout: invoice INV-2" "!M1 check" \
   -- "${TS[@]}" main
 run ts-clientclose-hold-202 hold 202 \
   'notifications/cancelled notification params={"requestId": "listen:0"}' \
@@ -139,4 +151,4 @@ if ((${#FAILED[@]})); then
   echo "DIFFERS from the recorded outcome: ${FAILED[*]}"
   exit 1
 fi
-echo "All 9 runs reproduce the recorded outcomes. Logs and client output: $WORK/results/"
+echo "All 11 runs reproduce the recorded outcomes. Logs and client output: $WORK/results/"

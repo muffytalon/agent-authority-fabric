@@ -12,9 +12,9 @@ tools/list: ['get_invoice']
 tools/call: invoice INV-1 isError: False
 listen acknowledged, honored: {}
   + Exception Group Traceback (most recent call last):
-  |   File "~/.cache/pep-d2-spike/py_client.py", line 24, in <module>
-  |     anyio.run(main, sys.argv[1])
-  |     ~~~~~~~~~^^^^^^^^^^^^^^^^^^^
+  |   File "~/.cache/pep-d2-spike/py_client.py", line 33, in <module>
+  |     anyio.run(main, sys.argv[1], sys.argv[2] if len(sys.argv) > 2 else "plain")
+  |     ~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
   |   File "~/.cache/pep-d2-spike/pyenv/lib/python3.14/site-packages/anyio/_core/_eventloop.py", line 83, in run
   |     return async_backend.run(func, args, {}, backend_options)
   |            ~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -30,7 +30,7 @@ listen acknowledged, honored: {}
   |   File "~/.cache/pep-d2-spike/pyenv/lib/python3.14/site-packages/anyio/_backends/_asyncio.py", line 2604, in wrapper
   |     return await func(*args)
   |            ^^^^^^^^^^^^^^^^^
-  |   File "~/.cache/pep-d2-spike/py_client.py", line 11, in main
+  |   File "~/.cache/pep-d2-spike/py_client.py", line 20, in main
   |     async with Client(streamable_http_client("http://pep.local/mcp", http_client=http)) as client:
   |                ~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
   |   File "~/.cache/pep-d2-spike/pyenv/lib/python3.14/site-packages/mcp/client/client.py", line 480, in __aexit__
@@ -67,7 +67,7 @@ listen acknowledged, honored: {}
     | ExceptionGroup: unhandled errors in a TaskGroup (1 sub-exception)
     +-+---------------- 1 ----------------
       | Traceback (most recent call last):
-      |   File "~/.cache/pep-d2-spike/py_client.py", line 19, in main
+      |   File "~/.cache/pep-d2-spike/py_client.py", line 28, in main
       |     events = [e async for e in sub]
       |              ^^^^^^^^^^^^^^^^^^^^^^
       |   File "~/.cache/pep-d2-spike/pyenv/lib/python3.14/site-packages/mcp/client/subscriptions.py", line 187, in __anext__

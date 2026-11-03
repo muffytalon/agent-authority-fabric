@@ -76,6 +76,9 @@ class Handler(BaseHTTPRequestHandler):
             problems.append("_meta clientCapabilities missing or not an object")
         if hdr.get("mcp-protocol-version") not in (None, meta.get("io.modelcontextprotocol/protocolVersion")):
             problems.append("MCP-Protocol-Version header differs from _meta")
+        token_meta = meta.get("dev.pep-sidecar/episode")
+        if "pep-episode" in hdr and token_meta is not None and hdr["pep-episode"] != token_meta:
+            problems.append("Pep-Episode header differs from _meta")
         if problems:
             log(kind="m1-check", method=method, problems=problems)
 

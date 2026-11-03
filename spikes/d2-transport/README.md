@@ -7,6 +7,10 @@ Evidence for decision D2 in `WEEK2_PLAN.md` (agent-facing transport), closed on 
   - TypeScript: `@modelcontextprotocol/client` with undici's `fetch` and `Agent({ connect: { socketPath } })`;
   - Python: `mcp` with an `httpx2.AsyncHTTPTransport(uds=…)` client, passed as `http_client`.
 - **Each runs the 2026-07-28 sequence** (`server/discover`, `tools/list`, `tools/call`, `subscriptions/listen`), with no `initialize`, and sends every header and `_meta` field M1 checks. Request ids may be strings.
+- **Each lets the caller attach the Episode Token** (added after RV3's finding E1):
+  - a client-wide `Pep-Episode` header reaches every request, the SDK's own `server/discover` probe and `subscriptions/listen` included;
+  - `_meta["dev.pep-sidecar/episode"]` can be set on `tools/list` and `tools/call`, and survives next to the SDK's own `_meta` keys;
+  - neither SDK takes caller `_meta` on `subscriptions/listen`, so the header is the only carrier there.
 - **How each SDK takes M1's `subscriptions/listen` reply:** acknowledgement then completion closes gracefully; a `notifications/cancelled` before the completion reads as an unexpected close.
 - **How the TypeScript SDK reacts** to a 202 or a 400 for its own `notifications/cancelled`, and to a client-side timeout.
 - **The conditions D2 puts on agents:**
@@ -44,7 +48,8 @@ bash spikes/d2-transport/run.sh
 - **What it does:**
   - copies the spike into a work directory, `~/.cache/pep-d2-spike` by default (`SPIKE_WORK=…` overrides it);
   - creates a virtualenv there from `requirements.txt`, and runs `npm ci`;
-  - runs the nine scenarios below, and checks each against its recorded outcome;
+  - runs the eleven scenarios below, and checks each against its recorded outcome;
+  - replaces `$HOME` with `~` in client output, so tracebacks carry no username;
   - writes `results/<run>.log` (the stand-in's JSONL log) and `results/<run>.client.txt` (the client's output) in the work directory.
 - **It needs** `python3` with `venv`, `node`, `npm`, and network access to PyPI and the npm registry.
 - **The work directory must be outside the repo.** The repo is in OneDrive, which would sync `node_modules`; `run.sh` refuses a work directory inside it.
@@ -62,9 +67,11 @@ bash spikes/d2-transport/run.sh
 |---|---|---|
 | `py-plain` | `plain 202` | `py_client.py` |
 | `py-cancelled` | `cancelled 202` | `py_client.py` |
+| `py-token-plain-202` | `plain 202` | `py_client.py … token` |
 | `ts-default-plain-202` | `plain 202` | `ts_client.mjs … default` |
 | `ts-main-plain-202` | `plain 202` | `ts_client.mjs … main` |
 | `ts-global-fetch-plain-202` | `plain 202` | `ts_client.mjs … global-fetch` |
+| `ts-token-plain-202` | `plain 202` | `ts_client.mjs … token` |
 | `ts-listchanged-plain-202` | `plain 202` | `ts_client.mjs … listchanged` |
 | `ts-main-cancelled-202` | `cancelled 202` | `ts_client.mjs … main` |
 | `ts-clientclose-hold-202` | `hold 202` | `ts_client.mjs … clientclose` |
@@ -73,15 +80,15 @@ bash spikes/d2-transport/run.sh
 ## Files
 | File | What it is |
 |---|---|
-| `pep_standin.py` | Standard-library stand-in for the PEP's agent endpoint. `pep_standin.py SOCKET LOGFILE [plain\|cancelled\|hold] [202\|400]`: the `subscriptions/listen` variant, and the status for notification POSTs. Its tool `slow` answers after 3 s |
-| `py_client.py` | MCP Python SDK v2 client over `httpx2.AsyncHTTPTransport(uds=…)`. `py_client.py SOCKET` |
-| `ts_client.mjs` | MCP TypeScript SDK v2 client over undici. `node ts_client.mjs SOCKET SCENARIO`, with scenarios `default`, `main`, `global-fetch`, `listchanged` and `clientclose` |
-| `summarize.py` | Prints a stand-in log as a readable sequence |
+| `pep_standin.py` | Standard-library stand-in for the PEP's agent endpoint. `pep_standin.py SOCKET LOGFILE [plain\|cancelled\|hold] [202\|400]`: the `subscriptions/listen` variant, and the status for notification POSTs. Its tool `slow` answers after 3 s. It also flags a `Pep-Episode` header that differs from `_meta` |
+| `py_client.py` | MCP Python SDK v2 client over `httpx2.AsyncHTTPTransport(uds=…)`. `py_client.py SOCKET [token]` |
+| `ts_client.mjs` | MCP TypeScript SDK v2 client over undici. `node ts_client.mjs SOCKET SCENARIO`, with scenarios `default`, `main`, `global-fetch`, `token`, `listchanged` and `clientclose` |
+| `summarize.py` | Prints a stand-in log as a readable sequence, marking which carrier (`header`, `meta`) brought an Episode Token |
 | `run.sh` | Reproduces every run (above) |
 | `package.json`, `package-lock.json`, `requirements.txt` | The pinned SDKs |
 | `results/` | The output of `run.sh` on 2026-11-03 (Provenance) |
 
-The scripts are kept exactly as they ran. The stand-in's docstring still says U1 answers notifications with 400; the plan changed that after these runs (M1: `notifications/cancelled` gets 202).
+The stand-in's docstring still says U1 answers notifications with 400; the plan changed that after the first runs (M1: `notifications/cancelled` gets 202).
 
 ## Results
 Copied from `WEEK2_PLAN.md`, Appendix A.
@@ -105,6 +112,7 @@ Copied from `WEEK2_PLAN.md`, Appendix A.
   | Acknowledgement, then `notifications/cancelled`, then the completion result | `SubscriptionLost`: "ended without the server's graceful close; re-listen and refetch" |
 
 - **Other results:** the SDK also accepted a discover result with no `serverInfo` field.
+- **The Episode Token** (`py-token-plain-202`): with `httpx2.AsyncClient(headers={"Pep-Episode": …})` and `meta=` on `list_tools` and `call_tool`, the stand-in saw the header on all four requests and `_meta` on `tools/list` and `tools/call`. `Client.listen()` takes no `meta`.
 
 **SDK runs, part 2: the MCP TypeScript SDK 2.4.0 over a Unix socket.**
 - **Setup:**
@@ -118,11 +126,12 @@ Copied from `WEEK2_PLAN.md`, Appendix A.
 | Default options (no `versionNegotiation`) | The client sent a 2025 `initialize` with no `MCP-Protocol-Version` header, no `Mcp-Method` and no `_meta`. It got 404 and -32601, and `connect()` failed with `CLIENT_HTTP_NOT_IMPLEMENTED` |
 | Pinned to `2026-07-28` | `server/discover` (id `"server-discover-probe-1"`), then `tools/list`, `tools/call` and `subscriptions/listen` (id `"listen:0"`), all over the socket. Every request carried `Accept: application/json, text/event-stream`, `MCP-Protocol-Version`, `Mcp-Method`, `Mcp-Name` on `tools/call`, and `_meta` with `protocolVersion`, `clientCapabilities: {}` and `clientInfo`. None of M1's checks fired |
 | `subscriptions/listen`, acknowledgement then completion | `honoredFilter` was `{}`, and `closed` resolved `'graceful'`. No re-listen came in the next 2 s |
-| `subscriptions/listen`, with `notifications/cancelled` before the completion | `closed` resolved `'remote'` (an unexpected disconnect), and `onerror` reported "Received a response for an unknown message ID" for the completion result |
+| `subscriptions/listen`, with `notifications/cancelled` before the completion | `closed` resolved `'remote'` (an unexpected disconnect). In some runs `onerror` also reported "Received a response for an unknown message ID" for the completion result: whether it does depends on timing |
+| The Episode Token (`token`) | With `requestInit: { headers: { 'Pep-Episode': … } }` and `_meta` in the `listTools` and `callTool` params, the stand-in saw the header on all four requests, the `server/discover` probe included, and `_meta` on `tools/list` and `tools/call`. `listen()` takes no `_meta` |
 | A `tools/call` with a 1 s timeout against `slow` | `REQUEST_TIMEOUT`. The client aborted its HTTP request and sent no `notifications/cancelled`. The next call worked |
 | `listChanged` configured | No subscription was auto-opened, because the PEP advertises no list-changed capability |
 | The client closes an open subscription itself | It POSTs `notifications/cancelled` `{"requestId": "listen:0"}` with `MCP-Protocol-Version` but no `Mcp-Method`. Answered with 202: clean. Answered with 400: `onerror` fires ("Error POSTing to endpoint"), but `close()` resolves, `closed` is `'local'`, and later calls work |
-| Node's built-in `fetch` with the undici 8.12.3 `Agent` | Failed: `UND_ERR_INVALID_ARG` "invalid onRequestStart method". Node 24.22.2 bundles undici 7.30.1 |
+| Node's built-in `fetch` with the undici 8.12.3 `Agent` | Failed. The cause chain is `TypeError: fetch failed <- UND_ERR_INVALID_ARG: invalid onRequestStart method`. Node 24.22.2 bundles undici 7.30.1 |
 
 ## Provenance
 - **The recorded runs** (Appendix A) were made on 2026-11-03, between 07:05 and 07:14 UTC, in a session scratchpad under `/tmp`.
@@ -131,5 +140,8 @@ Copied from `WEEK2_PLAN.md`, Appendix A.
 - **The pins were regenerated** on 2026-11-03 at 11:50 UTC, with the same top-level versions.
   - The original installs were unpinned, so most transitive versions were not recorded. The original `pip list` did record `httpcore2` 2.16.0, `anyio` 4.16.0 and `pydantic` 2.14.2, so those were pinned to match.
   - The npm tree has 14 packages, as the original install did.
-- **`results/` is the output of `run.sh`** on 2026-11-03 at 11:53 UTC, with these pins. Every run reproduced its recorded outcome.
-- **One line is new.** In this run, the Python `cancelled` client also logs "Error parsing SSE message" (an `anyio.BrokenResourceError`) before it raises `SubscriptionLost`. The recorded run kept only the last 15 lines of its output, so whether that line appeared then is unknown.
+- **A first `run.sh` run,** on 2026-11-03 at 11:53 UTC with these pins, reproduced every recorded outcome.
+- **After RV3** (the same day), the spike gained the two `token` runs, the cause chain on `global-fetch`, the `Pep-Episode`/`_meta` check in the stand-in, and the `$HOME` scrub.
+  - The "unknown message ID" error in `ts-main-cancelled-202` proved intermittent: it was missing from one run and present in the next. `run.sh` no longer requires it. The stable outcome, `closed: remote`, is still checked.
+- **`results/` is the output of `run.sh`** on 2026-11-03 at 12:49 UTC. All 11 runs reproduced their outcomes.
+- **One line is new since the recorded runs.** The Python `cancelled` client also logs "Error parsing SSE message" (an `anyio.BrokenResourceError`) before it raises `SubscriptionLost`. The recorded run kept only the last 15 lines of its output, so whether that line appeared then is unknown.

@@ -9,12 +9,20 @@ const viaUndici = (url, init) => undiciFetch(url, { ...init, dispatcher: agent }
 const viaGlobal = (url, init) => globalThis.fetch(url, { ...init, dispatcher: agent });
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const pin = { versionNegotiation: { mode: { pin: '2026-07-28' } } };
+const TOKEN = 'eyJ.spike.token';                     // a placeholder; the stand-in never verifies it
 
-function makeClient(options, fetchFn) {
+function makeClient(options, fetchFn, transportOptions = {}) {
   const client = new Client({ name: 'pep-d2-spike', version: '0.0.1' }, options);
   client.onerror = (e) => console.log('  client.onerror:', e?.code ?? e?.name, String(e?.message ?? e).slice(0, 160));
-  const transport = new StreamableHTTPClientTransport(new URL('http://pep.local/mcp'), { fetch: fetchFn });
+  const transport = new StreamableHTTPClientTransport(new URL('http://pep.local/mcp'), { fetch: fetchFn, ...transportOptions });
   return { client, transport };
+}
+
+// The error's cause chain, so a failure deep inside fetch is not reduced to "fetch failed".
+function causes(e) {
+  const out = [];
+  for (let c = e?.cause, depth = 0; c && depth < 5; c = c.cause, depth += 1) out.push(`${c.code ?? c.name}: ${String(c.message).slice(0, 120)}`);
+  return out.length ? out.join(' <- ') : 'none';
 }
 
 async function main() {
@@ -28,8 +36,22 @@ async function main() {
   if (scenario === 'global-fetch') {                  // Node's built-in fetch with the undici package's Agent
     const { client, transport } = makeClient(pin, viaGlobal);
     try { await client.connect(transport); const t = await client.listTools(); console.log('global fetch: tools', t.tools.map((x) => x.name)); }
-    catch (e) { console.log('global fetch failed:', e?.code ?? e?.name, String(e?.message).slice(0, 200)); }
+    catch (e) { console.log('global fetch failed:', e?.code ?? e?.name, String(e?.message).slice(0, 200)); console.log('  cause chain:', causes(e)); }
     await client.close().catch(() => {});
+    return;
+  }
+  if (scenario === 'token') {                         // the Episode Token: Pep-Episode header everywhere, _meta where the API allows
+    const { client, transport } = makeClient(pin, viaUndici, { requestInit: { headers: { 'Pep-Episode': TOKEN } } });
+    const meta = { 'dev.pep-sidecar/episode': TOKEN };
+    await client.connect(transport);
+    const tools = await client.listTools({ _meta: meta });
+    console.log('tools/list:', tools.tools.map((t) => t.name));
+    const r = await client.callTool({ name: 'get_invoice', arguments: { invoice_id: 'INV-1' }, _meta: meta });
+    console.log('tools/call:', r.content[0].text, 'isError:', r.isError);
+    const sub = await client.listen({ toolsListChanged: true });
+    console.log('listen closed:', await Promise.race([sub.closed, sleep(5000).then(() => 'still open after 5 s')]));
+    await client.close();
+    console.log('client closed cleanly');
     return;
   }
   if (scenario === 'listchanged') {                   // listChanged configured: does connect auto-open a subscription?
