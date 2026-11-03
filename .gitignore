@@ -14,3 +14,6 @@
 # ...except the logs a spike keeps as evidence.
 !/spikes/*/results/*.log
 !/spikes/*/results/*.client.txt
+
+# Backstop only: credentials live in $PEP_SECRETS_DIR, outside the repo and OneDrive (WEEK2_PLAN.md section 4).
+secrets/
