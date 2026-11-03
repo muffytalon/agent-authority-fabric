@@ -1,0 +1,10 @@
+{
+  "name": "pep-d2-transport-spike",
+  "version": "0.0.0",
+  "private": true,
+  "description": "D2 spike: MCP TypeScript SDK v2 client over a Unix socket, against a stand-in for the pep-sidecar agent endpoint (WEEK2_PLAN.md D2, Appendix A).",
+  "dependencies": {
+    "@modelcontextprotocol/client": "2.4.0",
+    "undici": "8.12.3"
+  }
+}

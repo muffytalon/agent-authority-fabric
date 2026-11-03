@@ -1,1 +1,16 @@
 /target/
+
+# Spikes: never commit installed packages, virtualenvs, sockets or run outputs.
+# Each spike's run.sh works outside the repo; these catch anything run in place.
+/spikes/**/node_modules/
+/spikes/**/.venv/
+/spikes/**/venv/
+/spikes/**/pyenv/
+/spikes/**/__pycache__/
+/spikes/**/*.sock
+/spikes/**/*.err
+/spikes/**/*.log
+/spikes/**/*.client.txt
+# ...except the logs a spike keeps as evidence.
+!/spikes/*/results/*.log
+!/spikes/*/results/*.client.txt

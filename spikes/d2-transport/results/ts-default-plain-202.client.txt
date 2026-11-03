@@ -1,0 +1,2 @@
+  client.onerror: CLIENT_HTTP_NOT_IMPLEMENTED Error POSTing to endpoint: {"jsonrpc": "2.0", "id": 0, "error": {"code": -32601, "message": "Method not found"}}
+connect failed: CLIENT_HTTP_NOT_IMPLEMENTED Error POSTing to endpoint: {"jsonrpc": "2.0", "id": 0, "error": {"code": -32601, "message": "Method not found"}}

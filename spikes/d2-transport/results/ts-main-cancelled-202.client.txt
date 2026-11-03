@@ -1,0 +1,9 @@
+connected (pinned 2026-07-28)
+tools/list: [ 'get_invoice' ]
+tools/call: invoice INV-1 isError: false
+listen acknowledged, honoredFilter: {}
+  client.onerror: Error Received a response for an unknown message ID: {"jsonrpc":"2.0","id":"listen:0","result":{"_meta":{"io.modelcontextprotocol/subscriptionId":"listen:0"},"resultT
+listen closed: remote
+slow call (1 s timeout): REQUEST_TIMEOUT Request timed out
+call after the timeout: invoice INV-2
+client closed cleanly

@@ -1,0 +1,1 @@
+global fetch failed: ERA_NEGOTIATION_FAILED Version negotiation probe failed: fetch failed

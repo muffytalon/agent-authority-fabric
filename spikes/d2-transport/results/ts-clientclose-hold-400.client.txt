@@ -1,0 +1,6 @@
+listen acknowledged; closing it from the client
+  client.onerror: CLIENT_HTTP_NOT_IMPLEMENTED Error POSTing to endpoint: 
+sub.close() resolved
+closed: local
+call after close: invoice INV-3
+client closed cleanly

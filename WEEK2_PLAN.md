@@ -1,6 +1,6 @@
 # WEEK2_PLAN.md: pep-sidecar Week 2 (Gate 1)
 
-Status: draft for review, 2026-11-03. Every decision in §1 stays OPEN until it closes, just before the step it blocks (§1). This plan supersedes two earlier drafts:
+Status: draft for review, 2026-11-03. D2 is CLOSED (2026-11-03). The other 17 decisions in §1 stay OPEN until each closes, just before the step it blocks; step 2 still closes the 13 others that block steps 3–7 (§1). This plan supersedes two earlier drafts:
 - **AP:** the attached Week 2 plan, "pep-sidecar Week 2 Plan: Toolchain, MCP Transport and Gate 1 Readiness", in the parent folder;
 - **MG:** the 29 Oct merge notes.
 
@@ -25,7 +25,7 @@ RV2's repo claims were re-checked on 2026-11-03, and its p256 build was reproduc
   - `tokens.rs`.
 
   The crypto crate, peer identity, the lock file and `tokens.rs` come first (§2), so the binary is never built against placeholder security checks. The binary comes next, then Compose, so every later step is tested in the real topology.
-- **Open decisions:** 18 (§1). Each closes just before the step it blocks: step 2 closes 14 of them, and N1, B1, S1 and O1 close later. The largest are:
+- **Open decisions:** 17 (§1). D2 is CLOSED (2026-11-03). Each of the rest closes just before the step it blocks: step 2 closes 13 of them, and N1, B1, S1 and O1 close later. The largest are:
   - **M1:** the MCP 2026-07-28 surface beyond `tools/call`;
   - **M2:** results that are not `complete`;
   - **P1:** payment outcomes under MCP's rule that a disconnect is a cancellation;
@@ -86,8 +86,8 @@ Gate 1 is evaluated on the release profile in the Compose topology (§4), not in
 | G6 | Decisions | Every §1 decision CLOSED, with its rationale recorded |
 
 ## 1. Decision register
-Status: all OPEN. Each closes just before the step it blocks:
-- **Step 2** closes the 14 that block steps 3–7.
+Status: D2 is CLOSED (2026-11-03); the other 17 are OPEN. Each closes just before the step it blocks:
+- **Step 2** closes the 14 that block steps 3–7. D2 is closed, and 13 remain.
 - **N1 and B1** close before step 8.
 - **S1 and O1** close before step 9.
 
@@ -96,7 +96,7 @@ RV2 had T1, L1 and Q1 closing after step 2. RV2's own reordering (§2) moves the
 | ID | Decision | Recommendation | Blocks step | Closes |
 |---|---|---|---|---|
 | D1 | Rust toolchain | B: stay on 1.97.1 | 3 | Step 2 |
-| D2 | Agent-facing transport | (a) Streamable HTTP, as a POST/JSON subset over the Unix socket | 7 | Step 2 |
+| D2 | Agent-facing transport | Decided: (a) Streamable HTTP, as a POST/JSON subset over the Unix socket | 7 | CLOSED 2026-11-03 |
 | N1 | Network model | (a) `network_mode: none` for the agent, the PEP and the operator, with the broker on an internal network | 8 | Before step 8 |
 | Q1 | Peer identity across PID namespaces; peer gid | (i) cross-namespace pidfd mode, plus a gid check | 4 | Step 2 |
 | S1 | Deployment profiles in Gate 1 | Compose only | 9 | Before step 9 |
@@ -153,7 +153,7 @@ RV2 had T1, L1 and Q1 closing after step 2. RV2's own reordering (§2) moves the
 - **Recommendation:** (a), hand-rolled (§2a), with no HTTP crate.
   - The Episode Token stays in `_meta["dev.pep-sidecar/episode"]`.
   - `Pep-Episode` is optional, and a mismatch gets 400 and -32020.
-- **Closes when** a spike reaches a throwaway Unix-socket HTTP server with custom headers from:
+- **Closing condition (met 2026-11-03):** a spike reaches a throwaway Unix-socket HTTP server with custom headers from:
   - **the TypeScript SDK v2:** a custom `fetch` with an undici `Agent({ connect: { socketPath } })`.
     - **Run on 2026-11-03, and it works (Appendix A).** `@modelcontextprotocol/client` 2.4.0 connected over a Unix socket and ran the same four methods.
     - **Two conditions.** The client must be built with `versionNegotiation: { mode: { pin: '2026-07-28' } }`: the SDK's default is `'legacy'`, which sends a 2025 `initialize` that the PEP answers with 404.
@@ -166,6 +166,20 @@ RV2 had T1, L1 and Q1 closing after step 2. RV2's own reordering (§2) moves the
     - **Run on 2026-11-03, and it works (Appendix A).** The MCP Python SDK 2.3.0 with httpx2 2.16.0 connected over a Unix socket. It ran `server/discover`, `tools/list`, `tools/call` and `subscriptions/listen` against a stand-in for the PEP, so the Python half of D2 is closed.
 
   The SDK timeouts that bound P1's step-up wait are already verified (P1).
+
+**Decision: CLOSED 2026-11-03, option (a).**
+- **Decided:** MCP 2026-07-28 Streamable HTTP over the Unix socket, as a hand-rolled POST/JSON subset (`src/http.rs`, `src/mcp.rs`), with no HTTP crate.
+  - The Episode Token stays in `_meta["dev.pep-sidecar/episode"]`.
+  - `Pep-Episode` is optional, and a mismatch gets 400 and -32020.
+- **Why:** the closing condition is met. Both SDK v2 lines ran `server/discover`, `tools/list`, `tools/call` and `subscriptions/listen` against the stand-in, sending every header and `_meta` field M1 checks.
+- **Conditions on agents** (the Gate 1 harness, and Week 4's, §5):
+  - TypeScript needs `versionNegotiation: { mode: { pin: '2026-07-28' } }`, and `fetch` and `Agent` from the same `undici` package;
+  - Python needs an `httpx2.AsyncHTTPTransport(uds=…)` client with `trust_env=False`, passed as `http_client`.
+- **Consequences for other decisions:**
+  - M1: the PEP must accept string JSON-RPC ids;
+  - `notifications/cancelled` handling belongs to U1, which stays open.
+- **Evidence:** `spikes/d2-transport/`.
+- **SPEC:** §1 and §4 updated (§6).
 
 ### N1. Network model
 - **Evidence:**
@@ -602,7 +616,7 @@ The order follows RV2: p256, peer identity and the lock file come before the bin
 | Step | Decisions | Deliverables | Acceptance | Commit |
 |---|---|---|---|---|
 | 1 | — | Docker Engine inside WSL Ubuntu (yours: it needs sudo). Not Docker Desktop: its VM kernel differs, and Q1 depends on the kernel. Set `systemd=true` in `/etc/wsl.conf`. Record `uname -r` here: 6.18.54.1-microsoft-standard-WSL2 on 2026-10-31.<br>• Compose runs from a clone on WSL's own filesystem, not from `/mnt/c` (§4).<br>• The broker credential lives outside the repo and outside OneDrive. | `docker run --rm hello-world` works inside WSL | — |
-| 2 | The 14 that block steps 3–7 | Close them. Apply the §6 SPEC wording as each decision closes; SPEC keeps CRLF. Hand the CLAUDE.md wording to you. If D1 = A, make the toolchain commit here. | No OPEN decision blocks step 3 | `docs: close Week 2 decisions; SPEC §1/§3/§4` |
+| 2 | The 14 that block steps 3–7 (D2 CLOSED 2026-11-03) | Close them. Apply the §6 SPEC wording as each decision closes; SPEC keeps CRLF. Hand the CLAUDE.md wording to you. If D1 = A, make the toolchain commit here. | No OPEN decision blocks step 3 | `docs: close Week 2 decisions; SPEC §1/§3/§4` |
 | 3 | D1 | `p256 = { version = "=0.14.0", default-features = false, features = ["ecdsa"] }`. In the same commit:<br>• BSD-3-Clause in `deny.toml`, for `subtle`, the only new licence. Not earlier: an unused allowance makes `cargo deny` warn.<br>• Unsafe-record rows for the 23 new crates, and the changed feature sets of `hybrid-array` and `digest`.<br>• A fail-closed CI check that getrandom is absent. List the whole tree with `cargo tree --target all --prefix none`, fail the job if that command fails, then fail it if any line starts with `getrandom v`. (`cargo tree -i getrandom` exits 101 when nothing matches, so inverting its status would also pass when cargo itself fails.)<br>• Optional bans (getrandom, serde and serde_json until Week 5, openssl, ring), only if `cargo deny check` stays warning-free.<br>• `reports/Week2 crypto crate check.md`, recording the 2026-11-03 probe and prehash test (Appendix A), plus `cargo deny` on the real tree, which the probe could not cover.<br>• Advisory facts (AP item 3):<br>  – RUSTSEC-2026-0387: crypto-bigint timing variability, patched in ≥ 0.7.6 [43]. 0.7.0–0.7.8 are yanked, including the patched 0.7.6–0.7.8, which were yanked for an unrelated semver break. Only 0.7.9 and 0.7.10 are usable, and 0.7.10 resolves [104].<br>  – p256 0.14.0 declares rust-version 1.85, below crypto-bigint's 1.87. A 1.85 toolchain's MSRV-aware resolver would pick the yanked, affected 0.7.5 [46]; 1.97.1 is not affected.<br>  – RUSTSEC-2026-0385: ctutils, patched in ≥ 0.4.4 [105]. crypto-bigint ≥ 0.7.6 requires `^0.4.5` [18], and 0.4.8 resolves.<br>  – The jsonwebtoken crate is rejected. Its latest release, 11.1.0, still takes p256 `^0.13.2` behind its optional `rust_crypto` feature, which pulls crypto-bigint 0.5.5 [52]. | The ES256 surface, already shown to work with exactly `["ecdsa"]` on 1.97.1 (Appendix A):<br>• `Signature::from_slice` for JWS r‖s;<br>• `Signature::from_der` for DSSE;<br>• `VerifyingKey::from_sec1_bytes`;<br>• `Verifier::verify`;<br>• `SigningKey` signing, with `normalize_s`.<br>JWK parsing is hand-rolled, because elliptic-curve 0.14 dropped its `jwk` feature: decode `x` and `y`, check that each is 32 bytes, then build SEC1 `04‖x‖y`; `from_sec1_bytes` rejects off-curve points.<br>`cargo deny` rejects only `subtle` until BSD-3-Clause is allowed, and accepts `ff` and `group`'s `MIT/Apache-2.0` (the old slash syntax) without a warning (checked on the probe, Appendix A).<br>G5 holds | `deps: p256 0.14 (ecdsa only); deny BSD-3-Clause; unsafe record` |
 | 4 | Q1 | `SO_PEERPIDFD`, fail-closed per Q1, and `require_peer(uid, gid)` | C-PID's checks and the C-UID unit tests pass on this kernel; CI branches on its kernel | `peercred: SO_PEERPIDFD fail-closed; gid check` |
 | 5 | — | The lock file:<br>• std `File::try_lock`, not nix `fs`; this supersedes the `Flock` plan in AP, MG and WEEK1_PLAN §1.<br>• `<sock>.lock` is created in the checked parent with mode 0600 and owner euid.<br>• It is opened with `O_NOFOLLOW`, through std's `OpenOptionsExt::custom_flags(nix::libc::O_NOFOLLOW)`. nix re-exports libc unconditionally, so this needs neither nix's `fs` feature nor a new direct dependency (RV2; Appendix A).<br>• An fstat after open requires a regular file, mode 0600, owner euid and `nlink` 1.<br>• The lock is taken before any existing socket is unlinked.<br>• `bind_safe_listener` returns `BoundListener { listener, lock }`.<br>• `socket_is_live` and `PROBE_TIMEOUT` are removed: with the lock held, any existing socket is stale, which also closes the macOS backlog gap.<br>• flock semantics (AP item 2):<br>  – the lock belongs to the open file description, and does not interact with fcntl or OFD locks;<br>  – it works on overlayfs and on local named volumes;<br>  – NFS is forbidden for the socket volume, because flock there is emulated or unreliable. | C-LOCK passes, including "the agent cannot open the lock file" (the agent's group can read `/run/pep`, and flock works on a read-only descriptor) | `peercred: lock file held with the listener` |
@@ -970,6 +984,7 @@ Nothing here is applied by this document.
   - "The agent, the PEP and the operator run under an AF_UNIX-only seccomp profile."
   - "Vault credential injection is deferred; the Week 2 broker reads a credential file."
   - "The PEP rejects an upstream result with no `resultType`. This departs from MCP 2026-07-28's client rule for earlier-revision servers, because every pinned server implements 2026-07-28." (M2)
+  - Append to the `pep` sidecar bullet: "Speaks MCP `2026-07-28` Streamable HTTP to the agent over that socket: a hand-rolled HTTP/1.1 subset (POST only, exact `Content-Length`, one request per connection), with no TCP listener; the Episode Token travels in `_meta` (§3.3)." (D2; applied 2026-11-03)
 - **§3.3, Episode Token (E1, R1):**
   - "Minted by the PEP on the host `start_episode` call and revoked by `end_episode`; idle timeout 30 minutes; signed with a per-boot key, so a PEP restart invalidates every token; delivered to the agent on stdin."
   - "No `iss`, `aud`, `jti` or `nbf`: the PEP is the only issuer and verifier; the `typ` and key differ from the Call Proof's, which makes the two validations mutually exclusive."
@@ -986,7 +1001,7 @@ Nothing here is applied by this document.
 - **§4:**
   - **Week 2:** replace "Call Proof with `rid` for `Held` reservations only" with "Call Proof on every forwarded `tools/call`, with `rid` on payments, which must be `Held`". Week 2 also gains:
     - the binary;
-    - the transport (D2);
+    - the transport (D2; applied 2026-11-03);
     - Compose;
     - the stub broker and tool servers;
     - `pep-sidecar lock-scan` and `pepctl lock sign`;
@@ -1237,7 +1252,7 @@ Notes that changed or sharpened the plan:
 | The client closes an open subscription itself | It POSTs `notifications/cancelled` `{"requestId": "listen:0"}` with `MCP-Protocol-Version` but no `Mcp-Method`. Answered with 202: clean. Answered with 400: `onerror` fires ("Error POSTing to endpoint"), but `close()` resolves, `closed` is `'local'`, and later calls work |
 | Node's built-in `fetch` with the undici 8.12.3 `Agent` | Failed: `UND_ERR_INVALID_ARG` "invalid onRequestStart method". Node 24.22.2 bundles undici 7.30.1 |
 
-The stand-in, the clients and their logs are in the session scratchpad. Step 7's tests should rebuild the same checks against the real PEP.
+The stand-in, the clients and their pinned SDKs are in `spikes/d2-transport/`, and its `run.sh` reproduces every scenario. The original logs were lost with the session scratchpad; the spike's `results/` come from a `run.sh` run the same day, which matched every outcome above. Step 7's tests should rebuild the same checks against the real PEP.
 
 **Week 1 verified plan:** "pep-sidecar Week 1_ Verified Plan and Partial Rust Code for JCS, Policy Engine and Peer Credentials" is at `C:\Users\mitam\AI & Cybersecurity\`, not in the parent folder. Its "Appendix: Gate 1 containment testbed (outline)" (lines 231–245) lists:
 - TCP egress from uid 20001;

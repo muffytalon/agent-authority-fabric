@@ -1,0 +1,5 @@
+listen acknowledged; closing it from the client
+sub.close() resolved
+closed: local
+call after close: invoice INV-3
+client closed cleanly

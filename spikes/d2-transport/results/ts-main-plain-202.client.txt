@@ -1,0 +1,8 @@
+connected (pinned 2026-07-28)
+tools/list: [ 'get_invoice' ]
+tools/call: invoice INV-1 isError: false
+listen acknowledged, honoredFilter: {}
+listen closed: graceful
+slow call (1 s timeout): REQUEST_TIMEOUT Request timed out
+call after the timeout: invoice INV-2
+client closed cleanly

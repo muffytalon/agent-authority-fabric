@@ -3,7 +3,7 @@
 ## 1. Core Architecture & OS Containment Boundary
 - **Process & UID Isolation:**
   - `agent` container/process: `UID 20001:20001`, read-only rootfs, `cap_drop: [ALL]`, `no-new-privileges: true`, zero direct IPv4/IPv6 egress (`nftables` drops all packets from `skuid 20001`; no loopback TCP holes).
-  - `pep` sidecar: `UID 20002:20002`, listens on `unix:///run/pep/mcp.sock` (parent `/run/pep` owned by `20002:20001` mode `2750` (setgid, so the socket inherits group `20001`); `mcp.sock` `20002:20001` mode `0660`). Verifies peer identity via `SO_PEERCRED` + `SO_PEERPIDFD` (Linux) or `getpeereid` + `LOCAL_PEERPID` (macOS).
+  - `pep` sidecar: `UID 20002:20002`, listens on `unix:///run/pep/mcp.sock` (parent `/run/pep` owned by `20002:20001` mode `2750` (setgid, so the socket inherits group `20001`); `mcp.sock` `20002:20001` mode `0660`). Verifies peer identity via `SO_PEERCRED` + `SO_PEERPIDFD` (Linux) or `getpeereid` + `LOCAL_PEERPID` (macOS). Speaks MCP `2026-07-28` Streamable HTTP to the agent over that socket: a hand-rolled HTTP/1.1 subset (POST only, exact `Content-Length`, one request per connection), with no TCP listener; the Episode Token travels in `_meta` (§3.3).
   - `broker` egress proxy: `UID 20003:20003`, accepts calls only from the PEP's SPIFFE ID carrying a valid ES256 Call Proof, recomputes `action_digest` with the same `JCS_strict_NFC` profile pinned to Unicode 18.0.0 (§2), recomputes the F-07 `Idempotency-Key` from `eid`, `rid`, and its own `action_digest`, and injects vaulted credentials + `Idempotency-Key`.
 
 ## 2. Cryptographic Digest Conventions (`src/jcs.rs`)
@@ -61,7 +61,7 @@
 
 ## 4. Six-Week Roadmap & Go/Kill Gates
 - **Week 1 (Complete, 2026-10-28):** `src/jcs.rs`, `src/engine.rs`, `src/peercred.rs`, `src/lib.rs`, strict Clippy verification.
-- **Week 2 (Gate 1):** `SO_PEERPIDFD` upgrade, `src/lockfile.rs` (`PinnedToolLockfile` v1 DSSE verifier & MCP `2026-07-28` drift quarantine; per-tool lockfile fields include `trusted_fields`, `amount_binding`, and store URI/key policy; security-role signature required for payment tools, external sinks, and any read-only tool entry that can authorize payment amounts via `Trusted` output, `trusted_fields`, or `amount_binding`), `src/tokens.rs` (Episode Token, Call Proof with `rid` for `Held` reservations only, bounded `ReplayCache`), Gate 1 containment suite.
+- **Week 2 (Gate 1):** the agent-facing transport (MCP `2026-07-28` Streamable HTTP over the Unix socket; D2), `SO_PEERPIDFD` upgrade, `src/lockfile.rs` (`PinnedToolLockfile` v1 DSSE verifier & MCP `2026-07-28` drift quarantine; per-tool lockfile fields include `trusted_fields`, `amount_binding`, and store URI/key policy; security-role signature required for payment tools, external sinks, and any read-only tool entry that can authorize payment amounts via `Trusted` output, `trusted_fields`, or `amount_binding`), `src/tokens.rs` (Episode Token, Call Proof with `rid` for `Held` reservations only, bounded `ReplayCache`), Gate 1 containment suite.
   - *Gate 1 Criteria:* 0 bypasses across >=50 containment tests; 100% of 20 rug-pull mutations quarantined; 0/1,000 replays accepted; p99 added latency <= 25 ms.
 - **Week 3:** `src/automaton.rs` (Sapien Thompson NFA with `Shuffle` and `Defer(LookupSpec)` holes), `src/store.rs` (SQLite WAL persistence, single-writer Tokio `EpisodeActor`, and reconciliation of `NeedsReconcile` reservations).
 - **Week 4 (Gate 2):** `agentdojo-payments` benchmark (`agentdojo==0.1.35`, 14 tools, 40 tasks, 8 injection classes).
