@@ -12,6 +12,11 @@
 //! process's effective group already is that group), so `/run/pep` should be mode `2750`. The
 //! bind fails otherwise, rather than leaving a socket the agent's group cannot open.
 //!
+//! A second instance is kept out by an exclusive `flock` on `<socket>.lock`, taken before
+//! anything at the socket path is unlinked or bound, and held for the listener's lifetime
+//! ([`BoundListener`]). With the lock held, any socket already at the path is stale. The
+//! kernel releases the lock when the holder dies, so a crashed instance never blocks a restart.
+//!
 //! [`require_peer`] admits a peer only if both its uid and its gid are the expected ones (Q1).
 //! On Linux it also takes the peer's pidfd (`SO_PEERPIDFD`, Linux 6.5 and later) and requires
 //! the pidfd's fdinfo `Pid:` to be at least 0.
@@ -25,26 +30,28 @@
 //! PIDs from `SO_PEERCRED` and `LOCAL_PEERPID` stay advisory. macOS has no pidfd, so there the
 //! check is the uid and gid alone.
 
-use std::fs::{self, Metadata, Permissions};
+use std::fs::{self, File, Metadata, OpenOptions, Permissions, TryLockError};
 use std::io;
 use std::os::fd::AsFd;
 #[cfg(target_os = "linux")]
 use std::os::fd::{AsRawFd as _, OwnedFd};
-use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _, PermissionsExt as _};
-use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::fs::{
+    FileTypeExt as _, MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _,
+};
+use std::os::unix::net::UnixListener;
 use std::path::{Component, Path};
-use std::sync::mpsc::{self, RecvTimeoutError};
-use std::thread;
-use std::time::Duration;
 
 use nix::sys::socket::{getsockopt, sockopt};
 use nix::unistd::geteuid;
 
 /// Mode of the bound socket.
 pub const SOCKET_MODE: u32 = 0o660;
-/// How long the probe of an existing socket may wait for its connect before the socket counts
-/// as live.
-pub const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+/// Suffix of the lock file kept next to the socket: `/run/pep/mcp.sock` is guarded by
+/// `/run/pep/mcp.sock.lock`.
+pub const LOCK_SUFFIX: &str = ".lock";
+/// Mode of the lock file. The agent's group can list the socket directory, but cannot open this
+/// file, so it cannot take the lock.
+pub const LOCK_MODE: u32 = 0o600;
 /// Parent-directory permission bits that must be clear: group write and everything for others.
 pub const FORBIDDEN_PARENT_BITS: u32 = 0o027;
 /// Ancestor permission bits that must be clear unless the ancestor is sticky: group write and
@@ -144,9 +151,35 @@ pub enum PeerError {
         /// The socket's owner.
         actual: u32,
     },
-    /// A process is still listening on the existing socket (for example another PEP instance).
-    #[error("a live socket already exists at the path")]
-    SocketInUse,
+    /// Another process (for example a second PEP instance) holds the socket's lock file.
+    #[error("another process holds the socket's lock")]
+    LockHeld,
+    /// The lock file path is a symbolic link (`O_NOFOLLOW` refused it).
+    #[error("the lock file is a symlink")]
+    LockIsSymlink,
+    /// Something other than a regular file exists at the lock file path.
+    #[error("the lock file is not a regular file")]
+    LockNotRegularFile,
+    /// The lock file is owned by another user.
+    #[error("lock file owner {actual} is not {expected}")]
+    LockOwnerMismatch {
+        /// The effective uid.
+        expected: u32,
+        /// The lock file's owner.
+        actual: u32,
+    },
+    /// The lock file's mode is not 0600.
+    #[error("lock file mode {mode:o} is not 0600")]
+    LockModeMismatch {
+        /// The lock file's permission bits.
+        mode: u32,
+    },
+    /// The lock file has more than one name (a hard link to it exists).
+    #[error("lock file has {nlink} links, not 1")]
+    LockLinkCount {
+        /// The lock file's link count.
+        nlink: u64,
+    },
     /// The bound socket does not have mode 0660 or is not ours.
     #[error("bound socket mode {mode:o} is not 0660")]
     SocketModeMismatch {
@@ -298,15 +331,27 @@ fn pidfd_alive(pid: i32) -> Result<(), PeerError> {
 ///    none of [`FORBIDDEN_PARENT_BITS`] set. Every ancestor of the parent's canonical path must
 ///    be a directory owned by root or the effective uid, with none of
 ///    [`FORBIDDEN_ANCESTOR_BITS`] set unless it is sticky.
-/// 3. An existing file at `path` is unlinked only if it is a socket owned by the effective uid
-///    that no process is listening on.
-/// 4. The socket is bound under the parent's canonical path, set to [`SOCKET_MODE`], and checked
+/// 3. Before anything at `path` is unlinked or bound, it takes an exclusive lock on
+///    `<path>.lock` ([`LOCK_SUFFIX`]) in the canonical parent. That file is opened with
+///    `O_NOFOLLOW` and checked by fstat: a regular file, mode [`LOCK_MODE`], owned by the
+///    effective uid, with one link. If another process holds the lock, this fails with
+///    [`PeerError::LockHeld`].
+/// 4. An existing file at `path` is unlinked only if it is a socket owned by the effective uid.
+///    With the lock held no other instance can be listening on it, so it is stale.
+/// 5. The socket is bound under the parent's canonical path, set to [`SOCKET_MODE`], and checked
 ///    again, including that it carries the parent's group.
+///
+/// The lock lasts as long as the returned [`BoundListener`], and the kernel releases it if the
+/// process dies. `flock` locks belong to the open file description, so a child process forked
+/// while the lock is held shares it until the child execs (std opens the file close-on-exec),
+/// and a release can lag by that window. The lock file itself is never removed: unlinking it would let two instances
+/// lock two different files. `flock` needs a local filesystem (tmpfs, overlayfs or a local
+/// volume), so the socket directory must never be on NFS.
 ///
 /// # Errors
 ///
 /// Returns a [`PeerError`] describing the first check that failed, or an I/O error.
-pub fn bind_safe_listener(path: &Path) -> Result<UnixListener, PeerError> {
+pub fn bind_safe_listener(path: &Path) -> Result<BoundListener, PeerError> {
     if !path.is_absolute() {
         return Err(PeerError::PathNotAbsolute);
     }
@@ -330,6 +375,9 @@ pub fn bind_safe_listener(path: &Path) -> Result<UnixListener, PeerError> {
         return Err(PeerError::ParentChanged);
     }
     let socket = real_parent.join(name);
+    let mut lock_name = name.to_os_string();
+    lock_name.push(LOCK_SUFFIX);
+    let lock = take_lock(&real_parent.join(lock_name), euid)?;
     check_existing(&socket, euid)?;
     let listener = UnixListener::bind(&socket)?;
     let finished = fs::set_permissions(&socket, Permissions::from_mode(SOCKET_MODE))
@@ -343,7 +391,94 @@ pub fn bind_safe_listener(path: &Path) -> Result<UnixListener, PeerError> {
         drop(fs::remove_file(&socket));
         return Err(error);
     }
-    Ok(listener)
+    Ok(BoundListener {
+        listener,
+        _lock: lock,
+    })
+}
+
+/// A listener bound by [`bind_safe_listener`], with the lock that guards its path.
+#[derive(Debug)]
+pub struct BoundListener {
+    /// Declared first, so it is dropped first: the socket closes before the lock is released.
+    listener: UnixListener,
+    /// Never read. The lock lasts as long as this file stays open.
+    _lock: File,
+}
+
+impl BoundListener {
+    /// The listening socket.
+    #[must_use]
+    pub const fn listener(&self) -> &UnixListener {
+        &self.listener
+    }
+}
+
+/// Opens the lock file at `path` and takes an exclusive, non-blocking lock on it.
+fn take_lock(path: &Path, euid: u32) -> Result<File, PeerError> {
+    let file = open_lock_file(path)?;
+    check_lock_file(&file.metadata()?, euid)?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(TryLockError::WouldBlock) => Err(PeerError::LockHeld),
+        Err(TryLockError::Error(error)) => Err(PeerError::Io(error)),
+    }
+}
+
+/// Opens the lock file, creating it if needed.
+/// - `O_NOFOLLOW` refuses a symlink at the path.
+/// - `O_NONBLOCK` makes the open of a FIFO planted there fail at once instead of blocking.
+/// - A file this call creates is set to exactly [`LOCK_MODE`], whatever the umask. An existing
+///   file must already have that mode ([`check_lock_file`]).
+///
+/// std opens every file close-on-exec, so a child process never inherits the lock.
+fn open_lock_file(path: &Path) -> Result<File, PeerError> {
+    let mut options = OpenOptions::new();
+    options
+        .write(true)
+        .mode(LOCK_MODE)
+        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK);
+    match options.clone().create_new(true).open(path) {
+        Ok(file) => {
+            file.set_permissions(Permissions::from_mode(LOCK_MODE))?;
+            Ok(file)
+        }
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            options.open(path).map_err(lock_open_error)
+        }
+        Err(error) => Err(lock_open_error(error)),
+    }
+}
+
+fn lock_open_error(error: io::Error) -> PeerError {
+    if error.raw_os_error() == Some(nix::libc::ELOOP) {
+        PeerError::LockIsSymlink
+    } else {
+        PeerError::Io(error)
+    }
+}
+
+/// The fstat checks on the open lock file.
+fn check_lock_file(metadata: &Metadata, euid: u32) -> Result<(), PeerError> {
+    if !metadata.file_type().is_file() {
+        return Err(PeerError::LockNotRegularFile);
+    }
+    if metadata.uid() != euid {
+        return Err(PeerError::LockOwnerMismatch {
+            expected: euid,
+            actual: metadata.uid(),
+        });
+    }
+    let mode = metadata.mode() & 0o7777;
+    if mode != LOCK_MODE {
+        return Err(PeerError::LockModeMismatch { mode });
+    }
+    if metadata.nlink() != 1 {
+        return Err(PeerError::LockLinkCount {
+            nlink: metadata.nlink(),
+        });
+    }
+    Ok(())
 }
 
 fn check_parent(parent: &Path, euid: u32) -> Result<Metadata, PeerError> {
@@ -398,42 +533,12 @@ fn check_existing(path: &Path, euid: u32) -> Result<(), PeerError> {
                     actual: metadata.uid(),
                 });
             }
-            // Only a stale socket may be replaced: unlinking a live one would silently orphan
-            // the instance still listening on it.
-            if socket_is_live(path)? {
-                return Err(PeerError::SocketInUse);
-            }
+            // The caller holds the path's lock, so no other instance is listening here and the
+            // socket is stale. (This replaces the old connect probe, which could not tell a full
+            // backlog from a stale socket on macOS, and raced a second instance.)
             fs::remove_file(path)?;
             Ok(())
         }
-    }
-}
-
-/// Whether a process listens on the socket at `path`. A connection that is refused means the
-/// socket is stale. A connect that neither succeeds nor fails within [`PROBE_TIMEOUT`] means a
-/// listener exists whose backlog is full (the agent's group can fill it), which is live too:
-/// a plain blocking connect would hang here forever. The probe runs on its own thread, which
-/// is left behind if it never returns.
-///
-/// Two gaps remain. On macOS a full backlog is refused at once, so a busy live socket there
-/// still looks stale. And the probe and the unlink are not atomic: two instances of the same
-/// user starting at the same moment on one stale socket can both see it as stale, and the
-/// second unlink then orphans the first listener. An exclusive lock on a sibling lock file,
-/// held for the listener's lifetime (`nix::fcntl::Flock`, behind nix's `fs` feature), would
-/// close both.
-fn socket_is_live(path: &Path) -> Result<bool, PeerError> {
-    let (sender, receiver) = mpsc::channel();
-    let target = path.to_path_buf();
-    thread::Builder::new()
-        .name("pep-socket-probe".to_owned())
-        .spawn(move || drop(sender.send(UnixStream::connect(&target).map(drop))))?;
-    match receiver.recv_timeout(PROBE_TIMEOUT) {
-        Ok(Ok(())) | Err(RecvTimeoutError::Timeout) => Ok(true),
-        Ok(Err(error)) if error.kind() == io::ErrorKind::ConnectionRefused => Ok(false),
-        Ok(Err(error)) => Err(PeerError::Io(error)),
-        Err(RecvTimeoutError::Disconnected) => Err(PeerError::Io(io::Error::other(
-            "socket probe thread failed",
-        ))),
     }
 }
 
@@ -465,9 +570,99 @@ mod tests {
     use nix::unistd::getegid;
     use std::os::unix::net::UnixStream;
     use std::path::PathBuf;
+    use std::process::{Child, Command, Stdio};
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
 
     static COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+    /// Set for a helper run of this test binary: the socket the helper uses.
+    const HELPER_SOCKET: &str = "PEP_PEERCRED_HELPER_SOCKET";
+
+    /// Re-runs this test binary to execute only the ignored helper test `name`.
+    fn helper(name: &str) -> Command {
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command.args(["--exact", name, "--ignored", "--test-threads=1", "--quiet"]);
+        command
+    }
+
+    /// Connects to `path` once a helper process listens there, failing if the helper exits
+    /// first or never binds.
+    fn connect_when_bound(path: &Path, child: &mut Child) -> UnixStream {
+        for _ in 0..400 {
+            if let Ok(stream) = UnixStream::connect(path) {
+                return stream;
+            }
+            if let Some(status) = child.try_wait().unwrap() {
+                panic!("helper exited before binding: {status}");
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+        drop(child.kill());
+        panic!("helper never bound {}", path.display());
+    }
+
+    /// Kills and reaps the helper when dropped, so a failing test never leaves it running.
+    struct KillOnDrop(Child);
+
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            drop(self.0.kill());
+            drop(self.0.wait());
+        }
+    }
+
+    /// The lock file `bind_safe_listener` uses for `socket`.
+    fn lock_path(socket: &Path) -> PathBuf {
+        let mut name = socket.as_os_str().to_os_string();
+        name.push(LOCK_SUFFIX);
+        PathBuf::from(name)
+    }
+
+    /// Opens `socket`'s lock file the way another instance would, and locks it.
+    fn hold_lock(socket: &Path) -> File {
+        let file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(LOCK_MODE)
+            .open(lock_path(socket))
+            .unwrap();
+        file.try_lock().unwrap();
+        file
+    }
+
+    /// Fails unless the helper run succeeded and actually ran its one test. A renamed helper
+    /// would otherwise match no test and exit successfully without doing anything.
+    fn assert_helper_ran(output: &std::process::Output) {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("test result: ok. 1 passed"),
+            "helper failed or ran no test: {}\n{stdout}",
+            output.status
+        );
+    }
+
+    fn is_root() -> bool {
+        geteuid().is_root()
+    }
+
+    /// Binds `path` right after its lock was released. A process another test spawns at that
+    /// moment holds a copy of every open descriptor between its fork and its exec, and `flock`
+    /// locks belong to the open file description, so the lock can outlive its release by that
+    /// window. Retrying `LockHeld` for a bounded time absorbs it; a lock that really leaked
+    /// would never be released, and still fails here.
+    fn bind_after_release(path: &Path) -> BoundListener {
+        for _ in 0..200 {
+            match bind_safe_listener(path) {
+                Err(PeerError::LockHeld) => thread::sleep(Duration::from_millis(25)),
+                other => return other.unwrap(),
+            }
+        }
+        panic!("the lock on {} was never released", path.display());
+    }
 
     /// A unique directory under the system temp dir, removed on drop.
     struct TempDir {
@@ -503,9 +698,9 @@ mod tests {
     fn bind_roundtrip_peer_cred() {
         let dir = TempDir::with_mode(0o750);
         let path = dir.socket();
-        let listener = bind_safe_listener(&path).unwrap();
+        let bound = bind_safe_listener(&path).unwrap();
         let _client = UnixStream::connect(&path).unwrap();
-        let (server, _) = listener.accept().unwrap();
+        let (server, _) = bound.listener().accept().unwrap();
         let (uid, gid) = (geteuid().as_raw(), getegid().as_raw());
         let credentials = peer_cred(&server).unwrap();
         assert_eq!((credentials.uid, credentials.gid), (uid, gid));
@@ -546,28 +741,6 @@ mod tests {
         use super::*;
         use nix::errno::Errno;
         use std::io::Write as _;
-        use std::process::{Child, Command, Stdio};
-
-        /// Set for a helper run of this test binary: the socket the helper uses.
-        const HELPER_SOCKET: &str = "PEP_PEERCRED_HELPER_SOCKET";
-
-        /// Re-runs this test binary to execute only the ignored helper test `name`.
-        fn helper(name: &str) -> Command {
-            let mut command = Command::new(std::env::current_exe().unwrap());
-            command.args(["--exact", name, "--ignored", "--test-threads=1", "--quiet"]);
-            command
-        }
-
-        /// Fails unless the helper run succeeded and actually ran its one test. A renamed helper
-        /// would otherwise match no test and exit successfully without doing anything.
-        fn assert_helper_ran(output: &std::process::Output) {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            assert!(
-                output.status.success() && stdout.contains("test result: ok. 1 passed"),
-                "helper failed or ran no test: {}\n{stdout}",
-                output.status
-            );
-        }
 
         /// `(major, minor, release)` from `/proc/sys/kernel/osrelease`, such as `(6, 18, "6.18.54.1-…")`.
         fn kernel_version() -> (u32, u32, String) {
@@ -770,20 +943,6 @@ mod tests {
             assert_helper_ran(&output);
         }
 
-        fn connect_when_bound(path: &Path, child: &mut Child) -> UnixStream {
-            for _ in 0..400 {
-                if let Ok(stream) = UnixStream::connect(path) {
-                    return stream;
-                }
-                if let Some(status) = child.try_wait().unwrap() {
-                    panic!("namespace helper exited before binding: {status}");
-                }
-                thread::sleep(Duration::from_millis(25));
-            }
-            drop(child.kill());
-            panic!("namespace helper never bound {}", path.display());
-        }
-
         #[test]
         #[ignore = "helper process for cross_namespace_peer_alive_with_pid_zero; does nothing when run on its own"]
         fn helper_namespace_listener() {
@@ -903,17 +1062,265 @@ mod tests {
         ));
     }
 
+    /// C-LOCK: a second instance is blocked while the first holds the lock, and the first's
+    /// socket is left alone.
     #[test]
-    fn live_socket_not_replaced() {
+    fn second_instance_blocked() {
         let dir = TempDir::with_mode(0o750);
         let path = dir.socket();
-        let listener = bind_safe_listener(&path).unwrap();
+        let first = bind_safe_listener(&path).unwrap();
         assert!(matches!(
             bind_safe_listener(&path),
-            Err(PeerError::SocketInUse)
+            Err(PeerError::LockHeld)
         ));
         let _client = UnixStream::connect(&path).unwrap();
-        listener.accept().unwrap();
+        first.listener().accept().unwrap();
+    }
+
+    /// C-LOCK: a stale socket is replaced only under the lock. While another process holds the
+    /// lock, even a stale socket is left in place.
+    #[test]
+    fn stale_socket_replaced_only_under_the_lock() {
+        let dir = TempDir::with_mode(0o750);
+        let path = dir.socket();
+        drop(UnixListener::bind(&path).unwrap());
+        let held = hold_lock(&path);
+        assert!(matches!(
+            bind_safe_listener(&path),
+            Err(PeerError::LockHeld)
+        ));
+        assert!(fs::symlink_metadata(&path).unwrap().file_type().is_socket());
+        drop(held);
+        let bound = bind_after_release(&path);
+        let _client = UnixStream::connect(&path).unwrap();
+        bound.listener().accept().unwrap();
+    }
+
+    /// Dropping the listener releases the lock, so the next instance binds.
+    #[test]
+    fn lock_released_on_drop() {
+        let dir = TempDir::with_mode(0o750);
+        let path = dir.socket();
+        drop(bind_safe_listener(&path).unwrap());
+        let _again = bind_after_release(&path);
+    }
+
+    /// C-LOCK: the lock is released when its holder crashes. The helper binds and is then
+    /// killed with SIGKILL, so no destructor runs; the kernel releases its lock, and the next
+    /// instance replaces the socket it left behind.
+    #[test]
+    fn lock_released_on_crash() {
+        let dir = TempDir::with_mode(0o750);
+        let path = dir.socket();
+        let mut child = KillOnDrop(
+            helper("peercred::tests::helper_hold_listener")
+                .env(HELPER_SOCKET, &path)
+                .stdout(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        // The helper binds only after taking the lock, so a connect means it holds it.
+        drop(connect_when_bound(&path, &mut child.0));
+        assert!(matches!(
+            bind_safe_listener(&path),
+            Err(PeerError::LockHeld)
+        ));
+        child.0.kill().unwrap();
+        child.0.wait().unwrap();
+        assert!(fs::symlink_metadata(&path).unwrap().file_type().is_socket());
+        let bound = bind_safe_listener(&path).unwrap();
+        let _client = UnixStream::connect(&path).unwrap();
+        bound.listener().accept().unwrap();
+    }
+
+    #[test]
+    #[ignore = "helper process for lock_released_on_crash; does nothing when run on its own"]
+    fn helper_hold_listener() {
+        if let Some(path) = std::env::var_os(HELPER_SOCKET) {
+            let _bound = bind_safe_listener(Path::new(&path)).unwrap();
+            // Hold the lock until killed. Give up after a minute, so a lost helper cannot linger.
+            thread::sleep(Duration::from_mins(1));
+        }
+    }
+
+    /// A lock file this call creates is exactly 0600 whatever the umask. The helper runs under
+    /// umask 0277, which would otherwise create it 0400 and fail the mode check.
+    #[test]
+    fn lock_mode_exact_under_restrictive_umask() {
+        let dir = TempDir::with_mode(0o750);
+        let output = Command::new("sh")
+            .args(["-c", "umask 0277 && exec \"$0\" \"$@\""])
+            .arg(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "peercred::tests::helper_bind_under_umask",
+                "--ignored",
+                "--test-threads=1",
+                "--quiet",
+            ])
+            .env(HELPER_SOCKET, dir.socket())
+            .output()
+            .unwrap();
+        assert_helper_ran(&output);
+        let metadata = fs::symlink_metadata(lock_path(&dir.socket())).unwrap();
+        assert_eq!(metadata.mode() & 0o7777, LOCK_MODE);
+    }
+
+    #[test]
+    #[ignore = "helper process for lock_mode_exact_under_restrictive_umask; does nothing when run on its own"]
+    fn helper_bind_under_umask() {
+        if let Some(path) = std::env::var_os(HELPER_SOCKET) {
+            let _bound = bind_safe_listener(Path::new(&path)).unwrap();
+        }
+    }
+
+    /// C-LOCK: a directory the PEP cannot write fails before anything is created or unlinked.
+    /// (Root ignores directory modes, so the check is skipped when the tests run as root.)
+    #[test]
+    fn read_only_directory_fails() {
+        if is_root() {
+            return;
+        }
+        let dir = TempDir::with_mode(0o550);
+        let result = bind_safe_listener(&dir.socket());
+        assert!(
+            matches!(&result, Err(PeerError::Io(error)) if error.kind() == io::ErrorKind::PermissionDenied),
+            "{result:?}"
+        );
+        assert_eq!(fs::read_dir(&dir.path).unwrap().count(), 0);
+    }
+
+    /// C-LOCK: a symlink planted at the socket path is refused, as not a socket, and is left
+    /// in place along with its target.
+    #[test]
+    fn symlink_at_socket_path_refused() {
+        let dir = TempDir::with_mode(0o750);
+        let target = dir.path.join("target");
+        fs::write(&target, b"keep").unwrap();
+        std::os::unix::fs::symlink(&target, dir.socket()).unwrap();
+        assert!(matches!(
+            bind_safe_listener(&dir.socket()),
+            Err(PeerError::ExistingNotSocket)
+        ));
+        assert!(
+            fs::symlink_metadata(dir.socket())
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read(&target).unwrap(), b"keep");
+    }
+
+    /// The lock file is created as a regular file, mode 0600, owned by us, with one link.
+    #[test]
+    fn lock_file_is_private() {
+        let dir = TempDir::with_mode(0o750);
+        let _bound = bind_safe_listener(&dir.socket()).unwrap();
+        let metadata = fs::symlink_metadata(lock_path(&dir.socket())).unwrap();
+        assert!(metadata.file_type().is_file());
+        assert_eq!(metadata.mode() & 0o7777, LOCK_MODE);
+        assert_eq!(metadata.uid(), geteuid().as_raw());
+        assert_eq!(metadata.nlink(), 1);
+    }
+
+    /// `O_NOFOLLOW`: a symlink at the lock path is refused, and its target is never created.
+    #[test]
+    fn symlink_at_lock_path_refused() {
+        let dir = TempDir::with_mode(0o750);
+        let target = dir.path.join("elsewhere");
+        std::os::unix::fs::symlink(&target, lock_path(&dir.socket())).unwrap();
+        assert!(matches!(
+            bind_safe_listener(&dir.socket()),
+            Err(PeerError::LockIsSymlink)
+        ));
+        assert!(fs::symlink_metadata(&target).is_err());
+        assert!(fs::symlink_metadata(dir.socket()).is_err());
+    }
+
+    /// An existing lock file must already be 0600; it is never loosened or tightened.
+    #[test]
+    fn lock_file_with_wrong_mode_refused() {
+        let dir = TempDir::with_mode(0o750);
+        let lock = lock_path(&dir.socket());
+        fs::write(&lock, b"").unwrap();
+        fs::set_permissions(&lock, Permissions::from_mode(0o644)).unwrap();
+        assert!(matches!(
+            bind_safe_listener(&dir.socket()),
+            Err(PeerError::LockModeMismatch { mode: 0o644 })
+        ));
+        assert_eq!(fs::symlink_metadata(&lock).unwrap().mode() & 0o7777, 0o644);
+    }
+
+    /// `nlink` 1: a lock file with a second name is refused.
+    #[test]
+    fn hard_linked_lock_file_refused() {
+        let dir = TempDir::with_mode(0o750);
+        let lock = lock_path(&dir.socket());
+        drop(hold_lock(&dir.socket()));
+        fs::hard_link(&lock, dir.path.join("other-name")).unwrap();
+        assert!(matches!(
+            bind_safe_listener(&dir.socket()),
+            Err(PeerError::LockLinkCount { nlink: 2 })
+        ));
+    }
+
+    /// `O_NONBLOCK`: a FIFO at the lock path makes the bind fail at once instead of hanging.
+    #[test]
+    fn fifo_at_lock_path_does_not_block() {
+        let dir = TempDir::with_mode(0o750);
+        let lock = lock_path(&dir.socket());
+        let status = Command::new("mkfifo").arg(&lock).status().unwrap();
+        assert!(status.success());
+        let (sender, receiver) = mpsc::channel();
+        let socket = dir.socket();
+        thread::spawn(move || drop(sender.send(bind_safe_listener(&socket).map(drop))));
+        let result = receiver
+            .recv_timeout(Duration::from_secs(10))
+            .expect("bind_safe_listener blocked on a FIFO at the lock path");
+        assert!(
+            matches!(
+                result,
+                Err(PeerError::Io(_) | PeerError::LockNotRegularFile)
+            ),
+            "{result:?}"
+        );
+    }
+
+    /// The lock file descriptor is close-on-exec, so a child process cannot keep the lock alive
+    /// after the PEP dies.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn lock_fd_is_cloexec() {
+        let dir = TempDir::with_mode(0o750);
+        let _bound = bind_safe_listener(&dir.socket()).unwrap();
+        let lock = fs::canonicalize(lock_path(&dir.socket())).unwrap();
+        let fd = fs::read_dir("/proc/self/fd")
+            .unwrap()
+            .filter_map(Result::ok)
+            .find(|entry| fs::read_link(entry.path()).is_ok_and(|target| target == lock))
+            .expect("no open descriptor for the lock file")
+            .file_name();
+        let fdinfo = fs::read_to_string(Path::new("/proc/self/fdinfo").join(fd)).unwrap();
+        let flags = fdinfo
+            .lines()
+            .find_map(|line| line.strip_prefix("flags:"))
+            .map(|value| u32::from_str_radix(value.trim(), 8).unwrap())
+            .unwrap();
+        let cloexec = u32::try_from(nix::libc::O_CLOEXEC).unwrap();
+        assert_ne!(flags & cloexec, 0, "lock fd flags {flags:o} lack O_CLOEXEC");
+    }
+
+    #[test]
+    #[ignore = "needs root: creates a lock file owned by another uid"]
+    fn lock_file_owned_by_other_uid_refused() {
+        let dir = TempDir::with_mode(0o750);
+        let lock = lock_path(&dir.socket());
+        drop(hold_lock(&dir.socket()));
+        std::os::unix::fs::chown(&lock, Some(65_534), None).unwrap();
+        assert!(matches!(
+            bind_safe_listener(&dir.socket()),
+            Err(PeerError::LockOwnerMismatch { actual: 65_534, .. })
+        ));
     }
 
     #[test]
@@ -948,10 +1355,10 @@ mod tests {
         fs::set_permissions(&real, Permissions::from_mode(0o750)).unwrap();
         let link = dir.path.join("link");
         std::os::unix::fs::symlink(&dir.path, &link).unwrap();
-        let listener = bind_safe_listener(&link.join("real/mcp.sock")).unwrap();
+        let bound = bind_safe_listener(&link.join("real/mcp.sock")).unwrap();
         let canonical = fs::canonicalize(&real).unwrap().join("mcp.sock");
         assert_eq!(
-            listener.local_addr().unwrap().as_pathname(),
+            bound.listener().local_addr().unwrap().as_pathname(),
             Some(canonical.as_path())
         );
         assert!(
@@ -960,36 +1367,6 @@ mod tests {
                 .file_type()
                 .is_socket()
         );
-    }
-
-    #[test]
-    #[ignore = "opens about 4,100 sockets to fill the listen backlog (needs a high fd limit)"]
-    fn full_backlog_counts_as_live() {
-        let dir = TempDir::with_mode(0o750);
-        let path = dir.socket();
-        let _listener = bind_safe_listener(&path).unwrap();
-        // Queue connections nobody accepts until one no longer gets through.
-        let mut queued = Vec::new();
-        let full = loop {
-            let (sender, receiver) = mpsc::channel();
-            let target = path.clone();
-            thread::spawn(move || drop(sender.send(UnixStream::connect(&target))));
-            match receiver.recv_timeout(Duration::from_millis(500)) {
-                Ok(stream) => queued.push(stream.unwrap()),
-                Err(_) => break true,
-            }
-            if queued.len() > 100_000 {
-                break false;
-            }
-        };
-        assert!(full, "the listen backlog never filled");
-        let (sender, receiver) = mpsc::channel();
-        let target = path.clone();
-        thread::spawn(move || drop(sender.send(bind_safe_listener(&target).map(drop))));
-        let result = receiver
-            .recv_timeout(PROBE_TIMEOUT * 5)
-            .expect("bind_safe_listener hung on a full backlog");
-        assert!(matches!(result, Err(PeerError::SocketInUse)));
     }
 
     #[test]
@@ -1008,7 +1385,8 @@ mod tests {
         // The rejected socket is removed, not left behind with the wrong group.
         assert!(fs::symlink_metadata(dir.socket()).is_err());
         fs::set_permissions(&dir.path, Permissions::from_mode(0o2750)).unwrap();
-        let _listener = bind_safe_listener(&dir.socket()).unwrap();
+        // The failed bind above took and released the lock.
+        let _listener = bind_after_release(&dir.socket());
         assert_eq!(fs::symlink_metadata(dir.socket()).unwrap().gid(), 65_534);
     }
 }

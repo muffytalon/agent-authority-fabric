@@ -121,15 +121,15 @@ jobs:
         run: |
           cargo test --locked --lib peercred:: -- --nocapture
 
-      - name: Run the #[ignore] tests as root
-        # parent_owner_mismatch_rejected and socket_group_must_match_parent need root;
-        # cross_namespace_peer_alive_with_pid_zero needs unshare's user, PID and mount
-        # namespaces, which the runner allows only to root; full_backlog_counts_as_live opens
-        # about 4,100 sockets, hence the fd limit.
+      - name: "Run the #[ignore] tests as root"
+        # parent_owner_mismatch_rejected, socket_group_must_match_parent and
+        # lock_file_owned_by_other_uid_refused need root; cross_namespace_peer_alive_with_pid_zero
+        # needs unshare's user, PID and mount namespaces, which the runner allows only to root.
+        # The helper tests do nothing when run on their own.
         run: |
           sudo env "PATH=$PATH" \
             "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" \
             "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" \
             "RUSTFLAGS=$RUSTFLAGS" \
             "CARGO_TERM_COLOR=$CARGO_TERM_COLOR" \
-            bash -c 'ulimit -n 8192 && cargo test --locked -- --ignored --nocapture'
+            cargo test --locked -- --ignored --nocapture
