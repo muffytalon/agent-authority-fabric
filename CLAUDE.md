@@ -44,6 +44,8 @@ Cargo.toml enforces [lints.rust] and [lints.clippy] with -D warnings. Do NOT wea
 
     No Default on Policy Types: Never derive or implement Default on Budget, Limits, or policy structs. Use explicit constructors like Budget::empty().
 
+    Binaries (print_stdout, print_stderr and exit = "deny"): Log with writeln! to a locked stderr handle and return std::process::ExitCode from main; print_stdout, print_stderr and exit stay denied. Never log raw tokens, proofs, keys or credentials.
+
 ## 4. Non-Negotiable Security Invariants (F-03 to F-16)
 
     Wire-Level JCS Parsing (F-03, F-04, F-05):
@@ -70,6 +72,8 @@ Cargo.toml enforces [lints.rust] and [lints.clippy] with -D warnings. Do NOT wea
 
         AbortOutcome::Unknown (e.g., network timeout) transitions the reservation to ResState::NeedsReconcile and MUST keep the amount counted inside budget.reserved (fail closed).
 
+        Journal each payment reservation when it is made, and fsync its forwarded record and the call's F-08 taint and F-09 ratchet records before the call is forwarded. At boot, truncate a torn tail under the journal lock; reservations forwarded with no outcome, or with outcome unknown, return as NeedsReconcile, keyed by their original (eid, rid), and count against their intent.
+
     Cross-Episode Taint & Causality Laundering (F-08, F-09):
 
         F-08: Agent writes (MutatingInternal tools, StoreWrite arguments) record UntrustedAgentWrite at decision time under the normalized (uri, key) and under content digests of values accepted by is_taint_indexable. Location taint applies to leaves of every type (and trusted tools use location-only taint); bare numbers, booleans, null, and short strings are never content-indexed.
@@ -80,9 +84,11 @@ Cargo.toml enforces [lints.rust] and [lints.clippy] with -D warnings. Do NOT wea
 
         Before unlinking an existing socket or calling UnixListener::bind(path), verify via symlink_metadata that the parent directory is a real directory owned by geteuid() with mode (mode & 0o027) == 0 (0750 or 2750 setgid, or tighter), and any existing file at path is a socket (is_socket()) owned by geteuid(). Set socket permissions to 0660, and verify after bind that the socket is owned by geteuid(), has mode 0660, and has a group (gid) equal to the parent directory's group.
 
+        Before unlinking or binding, take an exclusive File::try_lock on <socket>.lock, opened with O_NOFOLLOW | O_NONBLOCK (from nix::libc, through custom_flags), created if absent with create_new and then set to exactly 0600, and checked by fstat (regular file, mode 0600, owner euid, nlink 1). Hold it for the listener's lifetime, and never remove the lock file.
+
     Trusted Values & Host Authority (F-13):
 
-        Trusted values come only from record_trusted_input (which requires &HostAuthority) or from the signed trusted_fields of a tool pinned as Trusted, with no taint. Code reachable from the agent socket never receives HostAuthority and never calls approve_step_up. Undeclared arguments not present in the tool's pinned argument policy are rejected, at every depth. The one exception is a read-only tool that is not a sink, has no trusted_fields and declares only Data arguments: no guard reads its arguments, so it may take extra flags such as verbose (until the Week 2 lockfile pins full argument schemas).
+        Trusted values come only from record_trusted_input (which requires &HostAuthority) or from the signed trusted_fields of a tool pinned as Trusted, with no taint. Agent connection threads never hold HostAuthority; they send an episode's actor messages that cannot express approve, trusted input, end or abort. Inside the actor, only the host-message handler takes &HostAuthority; the agent-message handler's signature never does. approve_step_up, record_trusted_input and end_episode run only for control-socket messages from the operator uid. No agent message changes a reservation: an agent disconnect releases one only before its point of forwarding, and after that point a reservation ends only through the broker's explicit outcome or an upstream timeout. Undeclared arguments not present in the tool's pinned argument policy are rejected, at every depth. The one exception is a read-only tool that is not a sink, has no trusted_fields and declares only Data arguments: no guard reads its arguments, so it may take extra flags such as verbose (until the Week 2 lockfile pins full argument schemas).
 
     Payment Amount Witness & Binding (F-14):
 
@@ -94,4 +100,4 @@ Cargo.toml enforces [lints.rust] and [lints.clippy] with -D warnings. Do NOT wea
 
     Canonical Forwarding (F-16):
 
-        Only canonical_request is sent downstream, never the agent's original wire bytes.
+        Only bytes built by forward::tools_call_request from the engine's canonical tool name and arguments, with a PEP-built _meta, are sent downstream; never the agent's wire bytes, id or _meta.
