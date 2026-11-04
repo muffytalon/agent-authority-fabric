@@ -1,13 +1,14 @@
 # WEEK2_PLAN.md: pep-sidecar Week 2 (Gate 1)
 
-Status: 2026-11-03. Steps 1 and 2 are done. 14 of the 18 decisions in §1 are CLOSED: D2 before step 2, and the 13 others that block steps 3–7 in step 2, with the §6 SPEC wording applied. N1 and B1 stay OPEN until just before step 8, and S1 and O1 until just before step 9. This plan supersedes two earlier drafts:
+Status: 2026-11-04. Steps 1–6 are done, and RV4's findings are folded in (Appendix C). 14 of the 18 decisions in §1 are CLOSED: D2 before step 2, and the 13 others that block steps 3–7 in step 2, with the §6 SPEC wording applied. N1 and B1 stay OPEN until just before step 8, and S1 and O1 until just before step 9. This plan supersedes two earlier drafts:
 - **AP:** the attached Week 2 plan, "pep-sidecar Week 2 Plan: Toolchain, MCP Transport and Gate 1 Readiness", in the parent folder;
 - **MG:** the 29 Oct merge notes.
 
-It folds in three reviews:
+It folds in four reviews:
 - **RV**, the 31 Oct review of MG;
 - **RV2**, the review of this plan's 31 Oct draft;
 - **RV3**, a review of this plan on 2026-11-03, after D2 closed. Each of its code claims was re-checked against `src/` before it was folded in (Appendix A).
+- **RV4**, a security review on 2026-11-04 of this plan and of steps 1–6. Its engine claims were re-checked against `src/`, and its two engine findings are fixed in code (`fc3b620`). The rest are folded in below; Appendix C maps each one.
 
 Each claim was checked against:
 - this repo at `bb25e27`;
@@ -41,15 +42,19 @@ RV2's repo claims were re-checked on 2026-11-03, and its p256 build was reproduc
   - forwarding to a tool that drifted during a step-up wait (P1);
   - drift hidden by a poll that fails (L1).
 
-  It also showed that about half of the 62 "attacks" could never reveal a bypass. §3 now counts 54 genuine attacks.
-- **The engine needs seven changes** (§2a):
+  It also showed that about half of the 62 "attacks" could never reveal a bypass. §3 now counts 54 genuine attacks, and RV4 adds six, for 60.
+- **The engine needs nine changes** (§2a; RV4 added the last two):
   - forwarded bytes are built by a new `forward` module, so the Episode Token never leaves the PEP;
   - `record_result_raw` accepts only `complete` results;
   - G_pin gains a quarantine check, re-run just before each upstream write;
   - G_budget gains a `NeedsReconcile` check keyed on the entity, over both current and restored reservations;
   - an engine is built from the journaled ledger: restored reservations keyed by (eid, rid), the intent's ratchet level and a fresh eid (R1, E1);
   - one call's taint entries are journaled as one record;
-  - step 10 adds the strict argument schema and per-tool step-up.
+  - step 10 adds the strict argument schema and per-tool step-up;
+  - a `Forwarded` reservation state, with `release_unforwarded` for the agent path and `settle` for upstream outcomes (RV4 #17);
+  - G_prov denies a payment whose witness came from a server that is not `Serving` (RV4 #2).
+
+  The pending-payment check (`PaymentPending`) and the record-slot check (`RecordsExhausted`) are already in the engine (RV4 #1, #18).
 
   `jcs` gains one result number mode (J1).
 - **Scope:** RV2 sized the 31 Oct draft at two to three weeks. This draft adopts its four cuts:
@@ -88,8 +93,8 @@ Gate 1 is evaluated on the release profile in the Compose topology (§4), not in
 
 | # | Criterion | Threshold |
 |---|---|---|
-| G1 | Containment attack tests passing, judged by the bypass oracle (§2a) | ≥ 50 attack tests per deployment profile in S1, run in Compose on this machine, with 0 bypasses. §3 lists 54. Its 74 conformance and robustness checks run in CI and must pass, but don't count |
-| G2 | Rug-pull mutations quarantined | All of ≥ 20 (§3 lists 27), each quarantining the mutated server within the detection window T (L1), with no call forwarded to it after detection (re-checked just before each upstream write), and 0 false positives on the negatives |
+| G1 | Containment attack tests passing, judged by the bypass oracle (§2a) | ≥ 50 attack tests per deployment profile in S1, run in Compose on this machine, with 0 bypasses. §3 lists 60. Its 79 conformance and robustness checks run in CI and must pass, but don't count |
+| G2 | Rug-pull mutations quarantined | All of ≥ 20 (§3 lists 28), each quarantining the mutated server (or, for #26, suspending it) within the detection window T (L1), with no call forwarded to it after detection (re-checked just before each upstream write), and 0 false positives on the negatives |
 | G3 | Replays of captured Call Proofs, and misuses of captured Episode Tokens, rejected | 1,000 of 1,000 in Compose, split across §3's classes, restart replays included. A live Episode Token reused by its own peer is by design, not a replay. Clock steps are tested in-process (step 6) and reported beside G3 |
 | G4 | p99 added latency of the PEP plus the broker, as defined in O1 | ≤ 25 ms, with the PEP-only p99 reported beside it. Release build, in Compose on this machine, with the CPU model recorded |
 | G5 | Supply chain | `cargo deny check` clean, with no ignores. Exactly one crypto-bigint, ≥ 0.7.6. No getrandom anywhere in `cargo tree --target all`, checked fail-closed (step 3). (`cargo audit` is dropped: `cargo deny` reads the same RustSec database.) |
@@ -114,11 +119,11 @@ RV2 had T1, L1 and Q1 closing after step 2. RV2's own reordering (§2) moves the
 | M2 | Results that are not `complete` | Decided: never recorded. A payment's reservation follows the broker's explicit outcome (P1) | 7 | CLOSED 2026-11-03 |
 | P1 | Payment outcome mapping | Decided: the table in P1, with a defined point of forwarding and a re-check just before it. The step-up wait plus the upstream timeout stays at or under 55 s | 7 | CLOSED 2026-11-03 |
 | R1 | Restarts with in-memory state | Decided: (a) per-boot keys, plus a journal of payments, taint and the confidentiality ratchet. Restored reservations are keyed by (eid, rid) | 6, 7 | CLOSED 2026-11-03 |
-| E1 | Episode lifecycle | Decided: `start_episode` mints a fresh eid; at most one live episode per intent; one agent process per episode. `end_episode`, a 30-minute idle timeout, and the token delivered on stdin | 6, 7 | CLOSED 2026-11-03 |
+| E1 | Episode lifecycle | Decided: `start_episode` mints a fresh eid; at most one live episode per intent; one agent container per episode (RV4 #3). `end_episode`, a 30-minute idle timeout, and the token delivered on stdin | 6, 7 | CLOSED 2026-11-03 |
 | H1 | Host control socket | Decided: `/run/pep-ctl` owned 20002:20004 with mode 2750, operator uid 20004, with its own connection capacity, served first | 7 | CLOSED 2026-11-03 |
 | T1 | Token profiles | Decided: rfc8725bis-10 rules with a header allowlist and strict base64url. Call Proof `typ` `pep-callproof+jwt` on every forwarded call, bound to its server by a `server_id` claim, with `aud` the broker. Low-S required on both token types. Revocation keyed by eid. A per-episode rate limit sizes the replay cache | 6 | CLOSED 2026-11-03 |
-| L1 | Lockfile v1 content | Decided: engine-named fields and the full canonical definitions. The unsigned payload is also the config's `pins`. DER signatures only, with a threshold of distinct keys per role (Gate 1: `release` 1, `security` 1). Drift found by polling; any drift or failed poll quarantines the whole server | 7, 10 | CLOSED 2026-11-03 |
-| O1 | Latency definition | PEP plus broker residence time, under open-loop load with stated provisioning, with the PEP alone reported beside it | 9 | Before step 9 |
+| L1 | Lockfile v1 content | Decided: engine-named fields and the full canonical definitions. The unsigned payload is also the config's `pins`. DER signatures only, with a threshold of distinct keys per role (Gate 1: `release` 1, `security` 1). Drift found by polling; any drift quarantines the whole server, and a failed poll suspends it (RV4 #9) | 7, 10 | CLOSED 2026-11-03 |
+| O1 | Latency definition | Agent-side time minus the tool server's own time, under open-loop load with stated provisioning, with PEP and broker residence reported beside it (amended after RV4 #15) | 9 | Before step 9 |
 | B1 | Release build profile | `overflow-checks = true`; `panic = "abort"` only together with R1 (a); the release binary builds with default features | 8 | Before step 8 |
 | U1 | Wire shapes of denials and errors | Decided: one shape for every policy denial (`PEP_DENIED` -31403, `PEP_UNAVAILABLE` -31503); MCP-mandated errors keep their codes; one total reply order | 7 | CLOSED 2026-11-03 |
 | J1 | Result fidelity | Decided: (b) the result profile keeps the exact digits of integers beyond ±(2^53−1) | 7 | CLOSED 2026-11-03 |
@@ -194,7 +199,12 @@ RV2 had T1, L1 and Q1 closing after step 2. RV2's own reordering (§2) moves the
 - **Conditions on agents** (the Gate 1 harness, and Week 4's, §5):
   - TypeScript needs `versionNegotiation: { mode: { pin: '2026-07-28' } }`, and `fetch` and `Agent` from the same `undici` package;
   - Python needs an `httpx2.AsyncHTTPTransport(uds=…)` client with `trust_env=False`, passed as `http_client`;
-  - both attach the token in `_meta` on `tools/list` and `tools/call`, and may also send it as a matching `Pep-Episode` header.
+  - both attach the token in `_meta` on `tools/call`, and set it as a client-wide `Pep-Episode` header, which reaches every request, the SDKs' own `tools/list` included (amended after RV4 #11).
+- **SDK-internal `tools/list` (RV4 #11).**
+  - Python 2.3.0's `call_tool` on a tool the session has not listed runs the call, then `validate_tool_result` sends its own `tools/list` with no `_meta`. The PEP denied it, so the SDK raised `PEP_DENIED` for a call that had executed (its log shows the execution first). A client recreated mid-episode, RV3 F6's case, hits this.
+  - On -32020, the TypeScript source and the Python docstring also re-list, and TypeScript's re-list carries no `_meta`. TypeScript's `callTool` does not list first (tested).
+  - The spike missed it because its stand-in never enforced the token.
+  - Fix: `tools/list`, which is read-only, accepts the token as a `Pep-Episode` header alone, and the harness sets that header client-wide (it reached those requests; tested). SPEC §3.3 says so. A token-enforcing spike run is a step 7 condition.
 - **Consequences for other decisions:**
   - M1: the transport must accept string JSON-RPC ids on every method. The engine already accepts string and safe-integer ids for `tools/call` (`canonical_call_id`). M1 now has the PEP assign its own id (RV3 F6);
   - `notifications/cancelled` handling belongs to U1, which stays open.
@@ -206,13 +216,13 @@ RV2 had T1, L1 and Q1 closing after step 2. RV2's own reordering (§2) moves the
   - SPEC §1's nftables rule (`skuid 20001`) cannot work as a host rule. `skuid` matches only sockets in the network namespace where the rule is loaded, and Compose gives each container its own namespace (close-out note).
   - Compose rejects a file that sets both `network_mode` and `networks` [80].
 - **Options:**
-  - **(a)** `network_mode: none` for the agent, the PEP and the operator; the broker on an internal `tools_net`. Each private namespace has only `lo` with nothing listening, so loopback holes cannot exist. nftables becomes an optional backup, or the rule set for the same-host process deployment.
+  - **(a)** `network_mode: none` for the agent, the PEP and the operator; the broker on one internal network per tool server (`tools_a`, `tools_b`; RV4 #7). Each private namespace has only `lo` with nothing listening, so loopback holes cannot exist. nftables becomes an optional backup, or the rule set for the same-host process deployment.
   - **(b)** the agent shares the PEP's namespace (`network_mode: "service:pep"`), and a helper with `NET_ADMIN` loads the rules there. nftables becomes mandatory, with tests for the rule set.
 - **Decide now as well:**
   - **Week 4 model egress.** The agent needs an LLM, and under (a) it has no network. Recommended: a model proxy on a Unix socket with a host allowlist. The provider is recorded as an accepted exfiltration channel.
   - **Week 5 PEP egress.** The PEP must reach a Txn-Token service and a PDP. Recommended: route them through the broker, so SPEC §1 is amended once.
 - **Containment layers.** Five-Track §3.2–§3.3 lists seccomp, Landlock, Yama, nftables and cgroup-eBPF connect hooks; the Week 1 verified plan's testbed appendix names the cgroup-eBPF `connect4` hook too. Week 2 adopts:
-  - an AF_UNIX-only seccomp profile for the agent, the PEP and the operator (RV2);
+  - an AF_UNIX-only seccomp profile for the agent, the PEP and the operator (RV2), which also drops `socketcall` and empties x86_64's `subArchitectures` (RV4 #6, §4);
   - `pids_limit`, a memory limit and a private `/tmp` for the agent (RV2);
   - `cap_drop: [ALL]`;
   - `no-new-privileges`;
@@ -294,7 +304,7 @@ RV2 had T1, L1 and Q1 closing after step 2. RV2's own reordering (§2) moves the
   | Method | Handling |
   |---|---|
   | `tools/call` | The engine. The transport parses the body once and builds the `ToolCall`. |
-  | `tools/list` | Served by the PEP from the lockfile, never fetched upstream per agent request:<br>• a valid Episode Token is required;<br>• the PEP serves the full canonical definitions the lockfile pins (L1), minus every tool of a quarantined server. It never serves upstream text it has not pinned;<br>• the drift poller (L1) only compares upstream against the pins;<br>• one page, `ttlMs: 0` (a quarantine can change it at any moment), `cacheScope: "private"`. |
+  | `tools/list` | Served by the PEP from the lockfile, never fetched upstream per agent request:<br>• a valid Episode Token is required, in `_meta` or as a `Pep-Episode` header alone (RV4 #11);<br>• the PEP serves the full canonical definitions the lockfile pins (L1), minus every tool of a quarantined server. It never serves upstream text it has not pinned;<br>• the drift poller (L1) only compares upstream against the pins;<br>• one page, `ttlMs: 0` (a quarantine can change it at any moment), `cacheScope: "private"`. |
   | `server/discover` | Answered by the PEP:<br>• no token needed;<br>• `supportedVersions: ["2026-07-28"]`;<br>• `capabilities: {"tools": {}}`;<br>• `ttlMs: 0`, `cacheScope: "public"`;<br>• no upstream `instructions` unless the lockfile pins their text, which it then serves. |
   | `subscriptions/listen` | A PEP-generated SSE stream, the only non-JSON reply. No token is needed: the reply is constant and reveals nothing (RV3 F8):<br>• first `notifications/subscriptions/acknowledged`, with the subscription id and `notifications: {}`, because the PEP supports no notification type;<br>• then the completion result, and the stream closes. Closing gracefully tells the client not to reconnect.<br>The PEP does not also send `notifications/cancelled` (the M1 ambiguity): both SDKs treat it as an unexpected close.<br>Both SDKs (Python 2.3.0, TypeScript 2.4.0) accept this reply, end the subscription gracefully, and never re-listen on their own. |
   | Anything else, `ping` included | 404 and -32601 |
@@ -320,7 +330,7 @@ RV2 had T1, L1 and Q1 closing after step 2. RV2's own reordering (§2) moves the
   - every other agent `_meta` member is dropped and never forwarded;
   - `g_canon` keeps its denial of reserved `dev.pep-sidecar/` members.
 - **Episode Token bindings:**
-  - `tools/list` and `tools/call` require the token, in `_meta["dev.pep-sidecar/episode"]`. A `Pep-Episode` header, if present, must match. `server/discover` and `subscriptions/listen` need none. Both SDKs can attach `_meta` to these two methods (D2);
+  - `tools/call` requires the token in `_meta["dev.pep-sidecar/episode"]`, and a `Pep-Episode` header, if present, must match. `tools/list` accepts it in `_meta` or as a `Pep-Episode` header alone, because the SDKs send their own `tools/list` without caller `_meta`; when both are present they must match (RV4 #11). `server/discover` and `subscriptions/listen` need none;
   - its `eid` selects the episode's actor (A1), and must name a live episode: end and idle are tracked per eid (T1);
   - `peer_uid` must equal the connection's uid, re-checked on every use of a cached token (RV3 F8);
   - `release_epoch` must equal the loaded lockfile's, which must be ≥ the config's `min_accepted_epoch`;
@@ -387,6 +397,11 @@ RV2 had T1, L1 and Q1 closing after step 2. RV2's own reordering (§2) moves the
 | A journal append or fsync fails before forwarding (R1) | `abort(DefinitelyNotExecuted)` | `PEP_UNAVAILABLE` |
 | Any non-payment call | Record and forward. On a timeout or error, `abandon` | `PEP_UNAVAILABLE` on failure |
 
+- **Engine calls (RV4 #17).** Before the point of forwarding, the table's `abort(DefinitelyNotExecuted)` is the crate-private `release_unforwarded`, which needs no `HostAuthority` and refuses a `Forwarded` reservation. After it, every outcome row is `settle`, behind `HostAuthority`. The operator's decline of an `AwaitingStepUp` reservation stays `abort` (§2a).
+- **Detecting a disconnect (RV4 #17).** The connection thread is blocked waiting for the actor's reply, `UnixStream::peek` is unstable on 1.97.1, and nix's `poll` feature is off. So each connection gets a watcher thread on a `try_clone`d stream, blocked in `read` on a one-byte buffer.
+  - A read of 0 bytes (the client closed or half-closed) or of any byte (a pipelined request, which one request per connection forbids) cancels the call. The watcher tells the actor, which calls `release_unforwarded` if the call is not yet forwarded.
+  - A half-close counts as a disconnect. Neither SDK half-closes.
+  - The watcher ends when the reply has been written.
 - **Outcome sources (corrected after RV3 B1):**
   - No agent message changes a reservation. That includes a `notifications/cancelled` naming a forwarded call's id, which the PEP accepts and ignores (M1).
   - An agent disconnect releases a reservation only before its point of forwarding.
@@ -397,8 +412,8 @@ RV2 had T1, L1 and Q1 closing after step 2. RV2's own reordering (§2) moves the
   - The actor then hands the call to a worker thread, which makes the upstream call and reports the result back to the actor.
   - After that point nothing on the agent's side changes the reservation.
 - **Re-check just before forwarding (RV3 A4).**
-  - Immediately before the point of forwarding, the actor re-runs G_pin's checks: the server is not quarantined, and the lockfile epoch is unchanged. It also confirms the episode is still live.
-  - On a failure the call gets `abort(DefinitelyNotExecuted)` and `PEP_DENIED`.
+  - Immediately before the point of forwarding, the actor re-runs G_pin's checks: the tool's server is `Serving` (L1), and the lockfile epoch is unchanged. For a payment, the witness record's server must be `Serving` too, because the lookup server is often not the payment server (RV4 #2). It also confirms the episode is still live.
+  - On a failure the call gets `release_unforwarded` (§2a, RV4 #17) and `PEP_DENIED`.
   - This closes the gap where a payment evaluated before drift was detected waited for step-up, was approved, and reached a drifted tool.
 - **Step-up waits.** The agent's request stays open for up to `step_up_timeout_ms`. Clients give up sooner than a human approval can take (verified 2026-11-03; Appendix A):
   - **TypeScript SDK:** `DEFAULT_REQUEST_TIMEOUT_MSEC` is 60,000 in both v1 (1.32.2) and v2 (`@modelcontextprotocol/client` 2.4.0). It applies whenever the caller passes no `timeout` [93][94]. Only progress notifications reset it, and only when the caller sets `resetTimeoutOnProgress` (default false).
@@ -414,7 +429,7 @@ RV2 had T1, L1 and Q1 closing after step 2. RV2's own reordering (§2) moves the
 - **Late approvals:** if the agent disconnects during a step-up wait, the reservation is released (the "before forwarded" row). A later approval finds no `AwaitingStepUp` reservation and is refused (C-CTL).
 - **Retries after `Unknown`:**
   - A retry gets a new reservation id, and so a new F-07 key that the provider cannot dedupe.
-  - Until Week 3's reconciliation, `g_budget` denies a payment whose entity matches a `NeedsReconcile` reservation (`ReconcilePending`).
+  - Until Week 3's reconciliation, `g_budget` denies a payment whose entity matches a `NeedsReconcile` reservation (`PaymentPending`).
   - **Why the entity, not the `action_digest`:** the agent controls the digest. `pay_invoice` has a free `Data` argument (`/memo`), so changing one byte gives a new digest. G_prov does force a fresh lookup. But if the system of record still shows the amount due because the first payment is pending, a second payment passes, and `per_entity_max_uses` (2 in the test config) allows it (RV2).
   - Entity plus amount and currency was the alternative. The entity alone is stricter.
   - This replaces Five-Track §3.6's (eid, action_digest, idempotency_key) dedupe.
@@ -425,8 +440,9 @@ RV2 had T1, L1 and Q1 closing after step 2. RV2's own reordering (§2) moves the
 - **In-flight accounting:** a unit test checks that `in_flight` drains to zero after a run.
 
 **Decision: CLOSED 2026-11-03, the table above.**
-- **Decided:** the outcome table and its outcome sources. The point of forwarding is the actor's fsync of the `forwarded` record. The re-check just before it covers quarantine, epoch and episode liveness. `step_up_timeout_ms` + `upstream_timeout_ms` ≤ 55,000 is checked at load (defaults 45,000 + 10,000). `ReconcilePending` is keyed by entity. The broker maps the stub's `status` as listed.
+- **Decided:** the outcome table and its outcome sources. The point of forwarding is the actor's fsync of the `forwarded` record. The re-check just before it covers quarantine, epoch and episode liveness. `step_up_timeout_ms` + `upstream_timeout_ms` ≤ 55,000 is checked at load (defaults 45,000 + 10,000). `PaymentPending` is keyed by entity. The broker maps the stub's `status` as listed.
 - **Why:** on Streamable HTTP a disconnect is a cancellation, so no agent-side event may decide a forwarded payment. The TypeScript SDK's 60 s timer bounds the step-up wait.
+- **Amended 2026-11-04 (RV4 #2, #17):** the re-check also covers the witness record's server; the engine gains a `Forwarded` state, `release_unforwarded` and `settle`, so a forwarded payment can end only through `settle`; and a per-connection watcher detects the disconnect.
 - **SPEC:** none. The CLAUDE.md F-13 wording carries the outcome sources (§6).
 
 ### R1. Restarts with in-memory state
@@ -449,11 +465,13 @@ RV2 had T1, L1 and Q1 closing after step 2. RV2's own reordering (§2) moves the
     - The PEP takes an exclusive `File::try_lock` on `journal.lock` before it reads the journal, so a second instance stops before replay.
     - At boot it truncates a torn last line (an append whose fsync never completed, so its call was never forwarded), fsyncs, and only then serves.
     - Any other malformed line stops the PEP from starting.
+    - Before the agent socket binds, every server's first poll completes (RV4 #5). A server whose first poll fails starts `Suspended`, and a mismatch quarantines it. So a server that drifted while the PEP was down is never callable.
   - **Payment records (RV3 B5, A8):**
     - `reserve` {intent, eid, rid, entity, amount_minor, currency, action_digest, idempotency_key}, appended when the reservation is made, step-up waits included;
     - `forwarded` {eid, rid}, appended and fsynced at the point of forwarding (P1), before the upstream write;
     - `outcome` {eid, rid, result}, where the result is `executed`, `refused`, `unknown` or `released`. `released` covers a decline, a step-up timeout, an agent disconnect before forwarding, a failed re-check and `end_episode`.
-  - **Taint and ratchet records.** A journal-backed `LabelStore` takes one call's F-08 entries as a single record (`record_all`). The intent's F-09 ratchet level is journaled whenever it rises (RV3 A3). Both are durable before the call is forwarded.
+  - **Taint and ratchet records.** A journal-backed `LabelStore` takes one call's F-08 entries as a single record (`record_all`). The intent's F-09 ratchet level is journaled whenever it rises (RV3 A3). The taint record is durable before the call is forwarded. A ratchet rise is durable before any reply that depends on it is written: a denial's rise (F-09) before the denial, and a rise in `record_result_raw` before the result bytes reach the agent. That second rise happens after forwarding, so "before the call is forwarded" did not cover it; a crash in between left the agent holding Secret data and restored the lower level (RV4 #4). An intent rises at most three times, so this costs nothing.
+  - **Quarantine records (RV4 #5).** `quarantine` {server_id, lockfile_digest} is appended and fsynced when a server is quarantined (not when it is only suspended, L1). At boot, a server quarantined under the loaded lockfile's digest stays quarantined. Only a lockfile with a different digest lifts it; re-signing an identical payload gives an identical digest, so it does not.
   - **One fsync per call, with group commit (RV3 A9).** A call's records go in one append and one fsync. The shared writer batches appends that arrive together, so one agent write, with its tens of taint entries, cannot stall every episode's payments. G4's load mix includes writes (O1).
   - **Capacity.** The label store's capacity is checked before an append. A write that would exceed it is denied (fail closed), so replay can never overflow the store.
   - **Fail closed:** if an append or fsync fails, a payment gets `abort(DefinitelyNotExecuted)`, a write is denied, and the agent gets `PEP_UNAVAILABLE`. `outcome` records need no fsync: losing one only replays its reservation as unresolved, which fails closed.
@@ -461,10 +479,11 @@ RV2 had T1, L1 and Q1 closing after step 2. RV2's own reordering (§2) moves the
     - Per intent, `committed`, `calls` and entity uses are rebuilt from every `reserve` and its outcome, so released reservations still count in `calls` (SPEC §3.1).
     - Entries that were `forwarded` with no outcome, or with `unknown`, come back as `NeedsReconcile`. They count in `reserved`, in `calls` and in entity uses.
     - Restored reservations keep their original (eid, rid), in a set separate from the new episode's own reservations, so a new id can never overwrite one (RV3 A1). They fund nothing: their funding witness matches no record.
-    - The set of entities with an unresolved payment is PEP-wide, because two intents may name the same invoice. `ReconcilePending` checks it for every payment, in every intent.
+    - The set of entities with an unresolved payment is PEP-wide, because two intents may name the same invoice. `PaymentPending` checks it for every payment, in every intent.
     - The intent's highest ratchet level is restored too.
   - **Every episode of an intent starts from that ledger.** RV2 had unresolved entries count against the intent. Committed spend counts too: without it, a restart would still refund it. So neither a restart nor a new episode refunds spend.
     - This makes a configured intent behave like the Week 5 RAR, which binds one `episode_id`.
+    - The ledger is keyed by the intent's config name (RV4 #5). A re-sign changes the intent's `lockfile_digest` but not its name, so spend, calls and the ratchet carry over.
     - Gate 1 tests use one intent per test group.
   - **Week 3:** SQLite replaces the journal.
 - **Both options keep:**
@@ -479,6 +498,7 @@ RV2 had T1, L1 and Q1 closing after step 2. RV2's own reordering (§2) moves the
 - **Decided:** the journal as specified above. That covers the lock, torn-tail truncation, one fsync per call with group commit, the capacity check, and replay into a per-intent ledger, with restored reservations keyed by (eid, rid), a PEP-wide unresolved-entity set and the ratchet restored. Also decided: per-boot keys, key delivery through `/run/pep-pub`, the broker's boot-second cutoff and the tool server's dedupe store.
 - **Why:** without the journal, a restart refunds every budget, forgets `NeedsReconcile` and agent-write taint, and resets the ratchet. Under B1's `panic = "abort"`, any panic the agent can reach would do the same.
 - **Fallback:** R1 (b) stays the last item of the cut list (Risks).
+- **Amended 2026-11-04 (RV4 #4, #5):** a ratchet rise is durable before the reply that depends on it; quarantine is journaled by (server_id, lockfile_digest); every server's first poll completes before the agent socket binds; and the ledger is keyed by the intent's config name.
 - **SPEC:** §1, §3.3, §3.4 and §4 (§6).
 
 ### E1. Episode lifecycle
@@ -495,13 +515,14 @@ RV2 had T1, L1 and Q1 closing after step 2. RV2's own reordering (§2) moves the
   - **Week 2 claim values.** Week 2 fills `sub`, `client_id` and `rar_digest` from the configured intent, and `txn` is the episode's eid; Week 5's RAR and Txn-Token values replace them.
   - **Why the token has no `iss`, `aud`, `jti` or `nbf`.** The PEP mints and verifies the token itself, and the distinct `typ` and key make Episode Token and Call Proof validation mutually exclusive (rfc8725bis-10 §3.12 [74]). Record this in SPEC §3.3.
   - **Getting the token to the agent.** The Gate 1 harness writes the token to the agent process's stdin. Never argv, env or a volume, for the same reason C-PROC checks the PEP's argv.
-  - **One agent process per episode (RV3 A3).**
-    - The harness starts a fresh agent process for each episode, and gives a token only to a process that has never held another. After a PEP restart it restarts the agent too.
-    - So a process that read Secret data never carries it into a later episode's context.
-    - The journaled ratchet (R1) is the backstop if a harness breaks this rule. SPEC §3.3 states the rule (§6).
+  - **One agent container per episode (RV3 A3, amended after RV4 #3).**
+    - The harness runs each episode in a fresh agent container (`docker compose run --rm agent`), removed when the episode ends, and gives a token only to a container that has never held another. After a PEP restart it starts new containers too.
+    - A fresh process in a reused container is not a boundary for a compromised agent. `/tmp`, `/dev/shm` and a background helper survive into the next process, and without Yama a same-uid process can read another's memory: `/proc/<pid>/mem` gave up another process's token on the reviewer's VM. This machine has Yama with `ptrace_scope` 1, but N1 defers Yama, so nothing relies on it. A fresh container had neither file (RV4 #3). Live episodes of two intents in one container would share all of this too.
+    - The journaled ratchet (R1) is per intent, so it is no backstop across intents: a second intent's engine starts Public. If containers are ever reused, the ratchet must be per container.
+    - SPEC §3.3 states the rule (§6).
 
 **Decision: CLOSED 2026-11-03, as recommended.**
-- **Decided:** `start_episode` mints a fresh ULID eid, which is also `txn` and `PepIntent.episode_id`, and builds the episode's engine from the intent's ledger. An intent has at most one live episode, and at most `limits.episodes` are live in all. Also decided: `end_episode(eid)`, a 30-minute idle timeout, a key separate from the Call Proof's, and the token on stdin, to a fresh agent process for each episode.
+- **Decided:** `start_episode` mints a fresh ULID eid, which is also `txn` and `PepIntent.episode_id`, and builds the episode's engine from the intent's ledger. An intent has at most one live episode, and at most `limits.episodes` are live in all. Also decided: `end_episode(eid)`, a 30-minute idle timeout, a key separate from the Call Proof's, and the token on stdin, to a fresh agent container for each episode (amended after RV4 #3: a fresh process in a reused container is not a boundary).
 - **Why:** concurrent episodes of one intent would multiply its limits, and an agent process reused across episodes would carry their data with it.
 - **SPEC:** §3.3 (§6).
 
@@ -623,6 +644,9 @@ The unsigned lockfile v1 payload is also the config's `pins` section from step 7
   | — | Also pinned: `output_label`, `trusted_fields`, `max_result_bytes`, `max_result_nodes`, `store_uri`, and the store table (a `KeyPolicy` per normalized URI) |
 
   Each intent's `SeqPolicy` goes in the config's `intents` entry, because `PepEngine::new` takes it apart from the intent and the pins. Every tool it names must be pinned.
+- **Store readers (RV4 #8).** A read tool that returns stored data without naming its location in its arguments, such as a search over notes, declares the stores it reads (`reads_stores`). At load, if any pinned tool writes such a store, the reader's `output_label` must be at least the store's high-water label: the highest confidentiality any agent write to it can carry, which is Secret unless the store's policy caps it. Otherwise the lockfile is a load error.
+  - Without this rule, a secret saved in chunks under 16 bytes, which are never content-indexed (F-08), came back through such a reader unlabelled and reached a Public sink. Long values stored verbatim are caught, even hex-encoded.
+  - WEEK1_PLAN's Risks covered short values only for amounts. AgentDojo-style search tools are exactly this shape, so the stub servers gain one such reader (§2a).
 - **Payment tools** must declare a `currency` argument. This closes the Week 1 code review's open item. A payment tool without one is a load error.
 - **Two schemas per tool:**
   - the upstream definition, stored in full, with its digest for drift;
@@ -648,9 +672,13 @@ The unsigned lockfile v1 payload is also the config's `pins` section from step 7
   - The PEP polls each server's `server/discover` and every `tools/list` page through the broker, every `drift_poll_ms` (5,000, ±20% jitter). There is no upstream `subscriptions/listen` stream (RV2).
   - Each poll has a deadline, `drift_poll_deadline_ms` (3,000), covering every page.
   - **The quarantine unit is the whole server (RV3 B2).** Any mismatch quarantines every tool of that server: a changed, added or removed tool, or a changed discover result. Its tools disappear from the agent's `tools/list`, which comes from the lockfile (M1), and their calls are denied with `ToolQuarantined`.
-  - **A failed poll quarantines too (RV3 A5).** A poll that errors, misses its deadline, exceeds its caps, loops its cursor or returns an inconsistent page structure quarantines the whole server. A server that hides its drift behind a failure is treated as drifted.
-  - **Quarantine lasts until a restart with a re-signed lockfile.** A definition that reverts does not lift it (#27).
-  - **Detection window T = 10 s:** the longest interval (6 s, with jitter), plus the poll deadline (3 s), plus 1 s margin. G2 requires every mutation to quarantine its server within T, with no call forwarded to it after detection. The re-check just before each upstream write enforces that (P1).
+  - **A failed poll suspends the server (RV3 A5, amended after RV4 #9).** A poll that errors, misses its deadline, exceeds its caps, loops its cursor or returns an inconsistent page structure suspends the whole server.
+    - A suspended server's tools are hidden and denied exactly as a quarantined server's are, with the same `ToolQuarantined`. So a server that hides its drift behind a failure gains nothing, and mutation #26 is met.
+    - The next poll that matches the pins lifts the suspension. Only a mismatch quarantines.
+    - Without the two states, a broker restart, which G3 requires, or one missed deadline under G4's load would quarantine every server until a re-sign, and an agent able to saturate the broker could trigger it.
+  - **Quarantine lasts until the PEP loads a lockfile with a different digest.** It is journaled by (server_id, lockfile_digest) (R1), so a restart with the same lockfile keeps it, and re-signing an identical payload does not lift it (RV4 #5). A definition that reverts does not lift it either (#27).
+  - **One poller per server, with reserved capacity (RV4 #9).** Each server has its own poller thread: one thread for two servers would take 6 + 3 + 3 = 12 s, past T. The broker reserves connections for proof-less polls (`poll_connections` in its config), so in-flight calls (up to 64 per episode, 10 s each) cannot starve them.
+  - **Detection window T = 10 s per server:** the longest interval (6 s, with jitter), plus the poll deadline (3 s), plus 1 s margin. G2 requires every mutation to quarantine its server within T, with no call forwarded to it after detection. The re-check just before each upstream write enforces that (P1).
 - **Tooling:**
   - `pep-sidecar lock-scan` is a subcommand of the PEP binary, run under uid 20002 in the PEP's container, because the broker admits only that uid. It writes the unsigned payload from `server/discover` plus every `tools/list` page, holds no `HostAuthority` and binds no socket.
   - `pepctl lock sign` runs on the host with the signer keys.
@@ -659,6 +687,7 @@ The unsigned lockfile v1 payload is also the config's `pins` section from step 7
 
 **Decision: CLOSED 2026-11-03, as recommended, with the signer rule chosen in step 2.**
 - **Decided:** everything above. That covers the payload with full definitions, the epochs, per-server identity, tool names, the mapping onto `ToolPolicy`, the two schemas, the `x-mcp-header` rejection, per-tool step-up, DSSE with DER signatures only, drift found by polling with whole-server quarantine, T = 10 s, and the tooling.
+- **Amended 2026-11-04:** a failed poll suspends rather than quarantines, one poller per server with reserved broker capacity (RV4 #9); quarantine is journaled by (server_id, lockfile_digest) (RV4 #5); and store readers must carry the store's high-water label (RV4 #8).
 - **Signers:**
   - the config sets a threshold of distinct keys per role, and each key belongs to exactly one role; a key listed under two roles is a load error;
   - Gate 1 uses `release` ≥ 1 and `security` ≥ 1, so a lockfile with any payment tool, external sink or amount-authorizing read-only entry needs two distinct keys;
@@ -669,6 +698,7 @@ The unsigned lockfile v1 payload is also the config's `pins` section from step 7
 ### O1. Latency definition
 - **Scope.** Gate 1's "added latency" is the whole system's (RV2), so G4 measures the PEP plus the broker.
 - **Formula.** Each process records its residence time per call with `Instant`s. Its "agent side" is the connection the request arrived on, and its "tool side" the one it was sent on. Residence = (first byte written to the tool side − first byte read from the agent side) + (last byte written to the agent side − last byte read from the tool side). G4 is the p99 of the per-call sum of the PEP's and the broker's residence, joined on `jti`. (RV3 B7: the 3 Nov draft used "downstream" for the agent side, the opposite of §2a and F-16.)
+- **Gate on the agent side (RV4 #15).** Residence starts at the first byte read, so time spent in the listen backlog or waiting for a pool thread is not counted, and that queueing is what open-loop load exists to expose. So G4 gates on the agent-side figure minus the tool server's own time (from its log), and the residence figures are reported beside it.
 - **Also reported:** the PEP alone, the broker alone, and an agent-side end-to-end figure. The Unix-socket transit between the PEP and the broker is excluded from G4; the end-to-end figure bounds it.
 - **Load:** open-loop, at fixed arrival rates, because a closed-loop harness hides queueing. A stated mix of reads, payments, store writes and lists, at a stated concurrency cap. Writes are in the mix because each journals its taint entries (RV3 A9). The journal's fsyncs are on the measured path under R1 (a), and the report says so.
 - **Provisioning (RV3 D3).** The engine's own limits shape the run:
@@ -677,7 +707,7 @@ The unsigned lockfile v1 payload is also the config's `pins` section from step 7
   - each payment needs its own fresh lookup;
   - one intent's budget is shared by its episodes (R1, E1).
 
-  So the 10,500 calls run over at least 41 episodes, one live per intent, with budgets sized for the run, many entities, `per_entity_max_uses` raised for the test intents, and arrival rates under 5 per second per episode. The report states all of these.
+  So the 10,500 calls run over at least 42 episodes (10,500 / 256 = 41.02; RV4 #15), one live per intent, with budgets sized for the run, many entities, `per_entity_max_uses` raised for the test intents, and arrival rates under 5 per second per episode. The report states all of these.
 - **Head-of-line case (A1):** one episode recording 1 MiB results while others make small calls, reported separately.
 - **Crypto cost:** on this machine (AMD Ryzen 3 5300U, release, Rust 1.97.1, 2026-11-03), ES256 takes about 0.57 ms to sign and 0.56 ms to verify (mean). So each payment spends about 1.1 ms on crypto across the PEP and the broker.
 - **Exclusions:** step-up calls are excluded, since they wait for a human. 1 MiB requests are measured separately, because hashing cost grows with bytes × depth.
@@ -701,6 +731,8 @@ The unsigned lockfile v1 payload is also the config's `pins` section from step 7
 
   | Step | Check | Reply |
   |---|---|---|
+  | 0a | The peer check: `require_peer` fails (uid, gid, or a pidfd that shows no live peer) | The connection is closed before any byte is read, with no reply |
+  | 0b | The agent's connection pool is full | The connection is closed at once, with no reply |
   | 1 | HTTP framing (`http.rs`): the request line, headers, `Content-Length`, size caps and deadlines | 400; a missed deadline closes the connection |
   | 2 | The method is not POST | 405 |
   | 3 | An `Origin` header is present | 403 |
@@ -764,9 +796,9 @@ The unsigned lockfile v1 payload is also the config's `pins` section from step 7
     - the Call Proof signing key.
 
     No connection thread holds any of them.
-  - **No `&HostAuthority` on the agent path (RV3 F9).** The agent-message handler's signature never takes `&HostAuthority`; only the host-message handler does. So F-13's compile-time boundary survives inside the actor.
+  - **No `&HostAuthority` on the agent path (RV3 F9).** The agent-message handler's signature never takes `&HostAuthority`; only the host-message handler does. So F-13's compile-time boundary survives inside the actor. The agent-message path releases an unforwarded reservation through `release_unforwarded`, which needs no `HostAuthority` and refuses a forwarded one; `settle` and the operator's decline stay behind it (RV4 #17).
   - **Upstream workers (P1).** At the point of forwarding the actor hands the call to a worker thread, which makes the upstream call and sends the result back. So a slow upstream leg or a step-up wait never blocks the actor's other calls or its host channel.
-  - **Registry.** The eid → agent-channel registry is the only map that connection threads read, and `limits.episodes` bounds the number of actors.
+  - **Registry.** Connection threads read only the eid → agent-channel registry, `EpisodeStates` (end and idle state, step 6) and each episode's rate bucket (T1); `limits.episodes` bounds the number of actors. (Corrected after RV4 #20: the 3 Nov draft called the registry "the only map".)
 
 **Decision: CLOSED 2026-11-03, option (ii).**
 - **Decided:** one actor thread per episode, owning its `PepEngine`, with the two channels, the shared state and the upstream workers above, and no `&HostAuthority` on the agent path.
@@ -779,9 +811,9 @@ Step 2 (2026-11-03) confirmed every answer whose decision it closed, and settled
 | # | Question | Recommended answer | Where |
 |---|---|---|---|
 | 1 | Is each eid fresh, and is it written into `PepIntent.episode_id` and `txn`? May an intent have more than one live episode? How are restored reservations keyed? Is the unresolved-entity set per intent or PEP-wide? | Fresh ULID, written into both; at most one live episode per intent; restored reservations keyed by (eid, rid), apart from new ones; the unresolved-entity set is PEP-wide | E1, R1 |
-| 2 | Does `context_conf` carry across an intent's episodes? Must the agent process restart per episode? | Yes: it is journaled per intent. One agent process per episode, restarted after a PEP restart too | R1, E1 |
+| 2 | Does `context_conf` carry across an intent's episodes? Must the agent process restart per episode? | Yes: it is journaled per intent. One agent container per episode, new after a PEP restart too (RV4 #3) | R1, E1 |
 | 3 | Which thread makes the upstream call? What is the point of forwarding? What is re-checked just before it? What does the agent get for a call still upstream after `end_episode`? | A worker the actor hands the call to. The fsync of the `forwarded` record. Quarantine, epoch and episode liveness. `end_episode` stops new calls only: a call already forwarded completes, its outcome applies, and the agent gets its reply if still connected | P1, A1, §2a |
-| 4 | Does the v1 payload carry full definitions and `instructions`? What is quarantined, and for how long? What happens when a poll fails? What should #9, #12 and #16 show? | Yes. The whole server, until a restart with a re-signed lockfile. A failed or late poll quarantines the server. Each shows its server quarantined (§3) | L1, §3 |
+| 4 | Does the v1 payload carry full definitions and `instructions`? What is quarantined, and for how long? What happens when a poll fails? What should #9, #12 and #16 show? | Yes. The whole server, until a lockfile with a different digest is loaded (journaled, RV4 #5). A failed or late poll suspends the server until a poll matches (RV4 #9). Each shows its server quarantined (§3) | L1, §3 |
 | 5 | Does the PEP reject high-S Episode Tokens? Is revocation keyed by eid? What binds a Call Proof to its server? What does `kid` mean? Must `rid` be present exactly for payments? | Yes; yes; a `server_id` claim, with `aud` naming the broker (step 2); the boot key's thumbprint; yes | T1 |
 | 6 | The full reply order and codes, and the two application codes for `PEP_DENIED` and `PEP_UNAVAILABLE` | The order is in U1. The codes are -31403 and -31503 (step 2) | U1 |
 | 7 | How does the harness attach the token? Does `subscriptions/listen` need one? | `_meta` on `tools/list` and `tools/call`, plus an optional matching header (tested); no | D2, M1 |
@@ -800,17 +832,17 @@ The order follows RV2: p256, peer identity and the lock file come before the bin
 
 | Step | Decisions | Deliverables | Acceptance | Commit |
 |---|---|---|---|---|
-| 1 | — | Docker Engine inside WSL Ubuntu (yours: it needs sudo). Not Docker Desktop: its VM kernel differs, and Q1 depends on the kernel. Set `systemd=true` in `/etc/wsl.conf`. Record `uname -r` here: 6.18.54.1-microsoft-standard-WSL2 on 2026-10-31.<br>• Compose runs from a clone on WSL's own filesystem, not from `/mnt/c` (§4).<br>• The broker credential lives outside the repo and outside OneDrive. | `docker run --rm hello-world` works inside WSL | — |
+| 1 | — | Docker Engine inside WSL Ubuntu (yours: it needs sudo). Not Docker Desktop: its VM kernel differs, and Q1 depends on the kernel. Set `systemd=true` in `/etc/wsl.conf`. Record `uname -r` here: 6.18.54.1-microsoft-standard-WSL2 on 2026-10-31.<br>• Compose runs from a clone on WSL's own filesystem, not from `/mnt/c` (§4).<br>• The tool servers' credentials live outside the repo and outside OneDrive. | `docker run --rm hello-world` works inside WSL | — |
 | 2 | The 14 that block steps 3–7 (D2 CLOSED 2026-11-03) | Close them. Apply the §6 SPEC wording as each decision closes; SPEC keeps CRLF. Hand the CLAUDE.md wording to you. If D1 = A, make the toolchain commit here. | No OPEN decision blocks step 3 | `docs: close Week 2 decisions; SPEC §1/§3/§4` |
 | 3 | D1 | `p256 = { version = "=0.14.0", default-features = false, features = ["ecdsa"] }`. In the same commit:<br>• BSD-3-Clause in `deny.toml`, for `subtle`, the only new licence. Not earlier: an unused allowance makes `cargo deny` warn.<br>• Unsafe-record rows for the 23 new crates, and the changed feature sets of `hybrid-array` and `digest`.<br>• A fail-closed CI check that getrandom is absent. List the whole tree with `cargo tree --target all --prefix none`, fail the job if that command fails, then fail it if any line starts with `getrandom v`. (`cargo tree -i getrandom` exits 101 when nothing matches, so inverting its status would also pass when cargo itself fails.)<br>• Optional bans (getrandom, serde and serde_json until Week 5, openssl, ring), only if `cargo deny check` stays warning-free.<br>• `reports/Week2 crypto crate check.md`, recording the 2026-11-03 probe and prehash test (Appendix A), plus `cargo deny` on the real tree, which the probe could not cover.<br>• Advisory facts (AP item 3):<br>  – RUSTSEC-2026-0387: crypto-bigint timing variability, patched in ≥ 0.7.6 [43]. 0.7.0–0.7.8 are yanked, including the patched 0.7.6–0.7.8, which were yanked for an unrelated semver break. Only 0.7.9 and 0.7.10 are usable, and 0.7.10 resolves [104].<br>  – p256 0.14.0 declares rust-version 1.85, below crypto-bigint's 1.87. A 1.85 toolchain's MSRV-aware resolver would pick the yanked, affected 0.7.5 [46]; 1.97.1 is not affected.<br>  – RUSTSEC-2026-0385: ctutils, patched in ≥ 0.4.4 [105]. crypto-bigint ≥ 0.7.6 requires `^0.4.5` [18], and 0.4.8 resolves.<br>  – The jsonwebtoken crate is rejected. Its latest release, 11.1.0, still takes p256 `^0.13.2` behind its optional `rust_crypto` feature, which pulls crypto-bigint 0.5.5 [52]. | The ES256 surface, already shown to work with exactly `["ecdsa"]` on 1.97.1 (Appendix A):<br>• `Signature::from_slice` for JWS r‖s;<br>• `Signature::from_der` for DSSE;<br>• `VerifyingKey::from_sec1_bytes`;<br>• `Verifier::verify`;<br>• `SigningKey` signing, with `normalize_s`.<br>JWK parsing is hand-rolled, because elliptic-curve 0.14 dropped its `jwk` feature: decode `x` and `y`, check that each is 32 bytes, then build SEC1 `04‖x‖y`; `from_sec1_bytes` rejects off-curve points.<br>`cargo deny` rejects only `subtle` until BSD-3-Clause is allowed, and accepts `ff` and `group`'s `MIT/Apache-2.0` (the old slash syntax) without a warning (checked on the probe, Appendix A).<br>G5 holds | `deps: p256 0.14 (ecdsa only); deny BSD-3-Clause; unsafe record` |
 | 4 | Q1 | `SO_PEERPIDFD`, fail-closed per Q1, and `require_peer(uid, gid)`, for the agent, operator and broker peers alike (RV3 F7).<br>• A CI job that branches on the runner's kernel version and records `uname -r` (moved here from step 9, RV3 D4) | C-PID's checks and the C-UID unit tests pass on this kernel and in that CI job | `peercred: SO_PEERPIDFD fail-closed; gid check` |
 | 5 | — | The lock file:<br>• std `File::try_lock`, not nix `fs`; this supersedes the `Flock` plan in AP, MG and WEEK1_PLAN §1.<br>• `<sock>.lock` is created in the checked parent with mode 0600 and owner euid.<br>• It is opened with `O_NOFOLLOW`, through std's `OpenOptionsExt::custom_flags(nix::libc::O_NOFOLLOW)`. nix re-exports libc unconditionally, so this needs neither nix's `fs` feature nor a new direct dependency (RV2; Appendix A).<br>• An fstat after open requires a regular file, mode 0600, owner euid and `nlink` 1.<br>• Added in step 5: the file is created with `create_new` and then set to exactly 0600, so a restrictive umask cannot leave it 0400; an existing one must already be 0600. `O_NONBLOCK` joins `O_NOFOLLOW`, so a FIFO planted at the path fails the open instead of blocking it. The lock file is never removed. A child forked while the lock is held shares it until it execs, so tests that re-bind after a release retry `LockHeld` for a bounded time.<br>• The lock is taken before any existing socket is unlinked.<br>• `bind_safe_listener` returns `BoundListener { listener, lock }`.<br>• `socket_is_live` and `PROBE_TIMEOUT` are removed: with the lock held, any existing socket is stale, which also closes the macOS backlog gap. Their test `full_backlog_counts_as_live` (peercred.rs:575) goes too, along with ci.yml's comment and `ulimit` line for it (RV3 D4).<br>• flock semantics (AP item 2):<br>  – the lock belongs to the open file description, and does not interact with fcntl or OFD locks;<br>  – it works on overlayfs and on local named volumes;<br>  – NFS is forbidden for the socket volume, because flock there is emulated or unreliable. | C-LOCK's unit and root tests pass. Its two Compose attacks, among them "the agent cannot open the lock file" (the agent's group can read `/run/pep`, and flock works on a read-only descriptor), run in step 9 (RV3 D4) | `peercred: lock file held with the listener` |
 | 6 | T1, R1, E1 | `src/tokens.rs`, shared by the PEP and the stub broker:<br>• ES256 JWS per T1;<br>• the Episode Token;<br>• the Call Proof, on every forwarded call, with `rid` for `Held` payments only;<br>• `prov` as the witness origin hashes (the former step 11);<br>• the replay cache with an injected clock.<br>• Done 2026-11-04: also `EpisodeStates` (end and idle state keyed by eid, behind the same high-water clock) and the two golden vectors in `spikes/token-vectors/`, recomputed with pyca/cryptography. The verified-token cache keyed by a hash of the token's bytes (T1) moves to step 7's registry, since it only saves the 0.56 ms verify; state stays keyed by eid. G3's concurrency class runs in-process here (RV4 #14). | Unit vectors:<br>• alg confusion and `typ` swap;<br>• header members outside the allowlist;<br>• the charset, padding and non-zero trailing bits;<br>• expiry and the idle timeout;<br>• a full cache that fails closed;<br>• low-S emitted, and high-S rejected by the broker and, for Episode Tokens, by the PEP (RV3 A7);<br>• `kid` checked against the current boot's thumbprint;<br>• end and idle state keyed by eid, so a re-encoded copy of an ended token stays ended;<br>• the clock high-water mark under an injected backward step;<br>• the broker's boot-second cutoff | `tokens: Episode Token, Call Proof, ReplayCache, prov` |
-| 7 | D1, D2, M1, M2, P1, R1, E1, H1, U1, J1, L1, A1 | The binary, the stub broker, two stub tool servers, the scripted operator and the engine changes in §2a, plus:<br>• the R1 journal, with its lock, torn-tail truncation and one fsync per call;<br>• the decision logs, as separate `allow` and `outcome` records (§2a);<br>• J1's result number mode;<br>• the per-episode rate limit;<br>• the point of forwarding and the re-check just before it (P1);<br>• fresh eids and one live episode per intent (E1);<br>• the PEP-assigned request ids (M1);<br>• the control socket's own capacity (H1).<br>Conditions:<br>• The engine test that asserts the Episode Token is forwarded (engine.rs:4754) is inverted: the token must never leave the PEP (RV3 C1).<br>• The request bodies the D2 spike logged are replayed through `jcs::parse` with the request profile, so the transport is known to accept what the SDKs send (RV3 E4).<br>• Pins come from the config's `pins`, which is the unsigned lockfile v1 payload (L1). Step 10 adds the DSSE envelope and drift checks.<br>• Tokens are real from the start (step 6), with no placeholder checks.<br>• The broker credential is a 0400 file owned by uid 20003, outside the repo and OneDrive (§4). The stub tool servers check it against a SHA-256 verifier, a 0400 file owned by uid 20005 (§2a). Step 7's own tests generate a throwaway pair in their temp directory. Vault is deferred.<br>• Every binary passes the macOS cross-lint, with Linux-only paths behind `cfg`.<br>• Binaries follow the logging rule in §6. | End to end over temp-directory sockets:<br>• a read, a payment, a step-up approval and a refusal;<br>• every P1 row and every router row in M1;<br>• `end_episode`;<br>• a restart that replays the journal;<br>• `tools/list` and `server/discover` served from the pins (L1);<br>• the D2 spike's client scenarios run against the real PEP | `bin: std-threads sidecar, transport, stubs` (several commits) |
+| 7 | D1, D2, M1, M2, P1, R1, E1, H1, U1, J1, L1, A1 | The binary, the stub broker, two stub tool servers, the scripted operator and the engine changes in §2a, plus:<br>• the R1 journal, with its lock, torn-tail truncation and one fsync per call;<br>• the decision logs, as separate `allow` and `outcome` records (§2a);<br>• J1's result number mode;<br>• the per-episode rate limit;<br>• the point of forwarding and the re-check just before it (P1);<br>• fresh eids and one live episode per intent (E1);<br>• the PEP-assigned request ids (M1);<br>• the control socket's own capacity (H1).<br>Conditions:<br>• The engine test that asserts the Episode Token is forwarded (engine.rs:4754) is inverted: the token must never leave the PEP (RV3 C1).<br>• The request bodies the D2 spike logged are replayed through `jcs::parse` with the request profile, so the transport is known to accept what the SDKs send (RV3 E4).<br>• Pins come from the config's `pins`, which is the unsigned lockfile v1 payload (L1). Step 10 adds the DSSE envelope and drift checks.<br>• Tokens are real from the start (step 6), with no placeholder checks.<br>• Each tool server has its own credential, a 0400 file owned by uid 20003, outside the repo and OneDrive (§4), and checks it against its own SHA-256 verifier, a 0400 file owned by that server's uid (§2a, RV4 #7). Step 7's own tests generate throwaway pairs in their temp directory. Vault is deferred.<br>• Every binary passes the macOS cross-lint, with Linux-only paths behind `cfg`.<br>• The engine's `Forwarded` state, `release_unforwarded` and `settle`, the shared PEP-wide unresolved set, and the per-connection disconnect watcher (RV4 #1, #17).<br>• Ratchet rises fsynced before their reply, quarantine records, and every server's first poll before the agent socket binds (RV4 #4, #5).<br>• The broker's own config, with static routes and the lockfile mounted read-only (RV4 #12).<br>• A token-enforcing run of the D2 spike: both SDKs, Python's `call_tool` on a tool the session has not listed, a client recreated mid-episode, and a -32020 re-list, each with the token as a client-wide `Pep-Episode` header (RV4 #11).<br>• Binaries follow the logging rule in §6. | End to end over temp-directory sockets:<br>• a read, a payment, a step-up approval and a refusal;<br>• every P1 row and every router row in M1;<br>• `end_episode`;<br>• a restart that replays the journal;<br>• `tools/list` and `server/discover` served from the pins (L1);<br>• the D2 spike's client scenarios run against the real PEP | `bin: std-threads sidecar, transport, stubs` (several commits) |
 | 8 | N1, B1 | `compose.yaml`, Dockerfiles, `seccomp-unix-only.json` and `.gitattributes`, per §4.<br>• `.gitattributes` sets LF for `*.sh`, `Dockerfile*`, `compose.yaml`, `*.nft` and `seccomp*.json`; SPEC and CLAUDE.md keep CRLF.<br>• B1's `Cargo.toml` and toolchain changes land here too. | The topology starts from the WSL-side clone. Volume owners and modes match §4. Posture checks pass. The step 7 flows pass in Compose | `compose: SPEC §1 topology` |
 | 8b | N1 | nftables rules, only if N1 = (b) | Rule-set tests pass | `net: nftables rules` |
-| 9 | S1, O1 | The bypass kit (§3) with expected verdicts, the oracle and the decision-log join (§2a), and the `probe` service. Also:<br>• the open-loop latency harness (PEP plus broker);<br>• a CI job that runs the checks (the kernel branching comes from step 4);<br>• **the G3 replay harness (RV3 D2):** the stub broker, in a test-only mode, writes each Call Proof it receives to its log, and an `injector` service, running as uid 20002 with the broker socket mounted, replays captured proofs and tokens. Neither exists in a release image;<br>• C-UID's probes each hold a live Episode Token minted for uid 20001, a stolen token, so a broken `require_peer` would execute a call the oracle can see (RV3 A10);<br>• if they can run without fixture tools, the official MCP conformance suite's 2026-07-28 server scenarios [100], against the PEP in CI through a test-only TCP bridge that also attaches an Episode Token (RV3 D5). Its schema check validates every message on the wire. | The kit runs in CI, and the attack run passes in Compose on this machine. The first latency report exists | `test: Gate 1 kit and harness` |
-| 10 | L1 | `src/lockfile.rs` (DSSE around the step 7 payload), `pep-sidecar lock-scan` and `pepctl lock sign`.<br>• Drift hashing uses the result number profile (J1) with larger caps; the request profile rejects ordinary schema values such as `"minimum": 0.5` and caps 8,192 nodes.<br>• Definitions with integers beyond ±(2^53−1) are quarantined only if J1 = (a).<br>• Every upstream page is fetched.<br>• The drift poller (L1), with the poll deadline, whole-server quarantine and the failed-poll rule (RV3 A5, B2).<br>• The strict argument schema, per-tool step-up, and a review of the F-13 read-only exception. | The 27 mutations, each quarantining its server within T; the step-up timing case; and the negatives (§3) | `lockfile: DSSE verify, drift quarantine, lock-scan and sign` |
+| 9 | S1, O1 | The bypass kit (§3) with expected verdicts, the oracle and the decision-log join (§2a), and the `probe` service. Also:<br>• the open-loop latency harness (PEP plus broker);<br>• a CI job that runs the checks (the kernel branching comes from step 4);<br>• **the G3 replay harness (RV3 D2):** the stub broker, in a test-only mode, writes each Call Proof it receives to its log, and an `injector` service, running as uid 20002 with the broker socket mounted, replays captured proofs and tokens. Neither exists in the PEP's release image: Gate 1 runs release-profile builds, and the capture mode and the injector live in test images of the same build (RV4 #20). The concurrency class runs in-process instead (step 6, RV4 #14);<br>• C-UID's probes each hold a live Episode Token minted for uid 20001, a stolen token, so a broken `require_peer` would execute a call the oracle can see (RV3 A10);<br>• if they can run without fixture tools, the official MCP conformance suite's 2026-07-28 server scenarios [100], against the PEP in CI through a test-only TCP bridge that also attaches an Episode Token (RV3 D5). Its schema check validates every message on the wire. | The kit runs in CI, and the attack run passes in Compose on this machine. The first latency report exists | `test: Gate 1 kit and harness` |
+| 10 | L1 | `src/lockfile.rs` (DSSE around the step 7 payload), `pep-sidecar lock-scan` and `pepctl lock sign`.<br>• Drift hashing uses the result number profile (J1) with larger caps; the request profile rejects ordinary schema values such as `"minimum": 0.5` and caps 8,192 nodes.<br>• Every upstream page is fetched.<br>• The drift poller (L1): one poller per server with reserved broker capacity, the poll deadline, whole-server quarantine, and suspension on a failed poll (RV3 A5, B2; RV4 #9).<br>• The strict argument schema, per-tool step-up, and a review of the F-13 read-only exception. | The 28 mutations, each quarantining its server (or, for #26, suspending it) within T; the step-up timing case; and the negatives (§3) | `lockfile: DSSE verify, drift quarantine, lock-scan and sign` |
 | 11 | All G-criteria | The Gate 1 suite, run on the release profile in Compose | G1–G6 | `gate1: results` |
 
 ## 2a. Interfaces (proposals)
@@ -823,19 +855,28 @@ The order follows RV2: p256, peer identity and the lock file come before the bin
   - `record_result_raw(..) -> Result<Vec<u8>, PepError>` requires `resultType == "complete"`. Otherwise, absent included, it returns a new `PepError::IncompleteResult`, which maps to `PEP_UNAVAILABLE`.
   - It drops the result's top-level `_meta` before labelling.
   - It returns exactly the canonical bytes it recorded, under J1's number mode. Those are the only result bytes the agent receives.
-- **Quarantine.** G_pin denies a tool in a shared `Arc<QuarantineSet>` (new `PolicyError::ToolQuarantined`). Because it is a guard, F-09's ratchet still runs.
-- **Re-check before forwarding (P1, RV3 A4).** A new `PepEngine::recheck_before_forward(call_id)` re-runs G_pin's quarantine and epoch checks for a call already allowed or approved. The actor calls it just before the point of forwarding, and checks the episode's liveness itself. On a failure it calls `abort(DefinitelyNotExecuted)`.
-- **Reconcile check (P1).** `g_budget` denies a payment, with a new `PolicyError::ReconcilePending`, when its entity (after NFC) matches either:
-  - a `NeedsReconcile` reservation's `entity`;
-  - an entity in the restored, PEP-wide unresolved set (R1, RV3 A1).
+- **Server states (L1, RV4 #9).** A shared `Arc<ServerStates>` holds each server's state: `Serving`, `Suspended` (a failed poll; the next matching poll lifts it) or `Quarantined` (a definition mismatch; permanent for the loaded lockfile digest, and journaled, R1). G_pin denies a tool whose server is not `Serving`, with a new `PolicyError::ToolQuarantined` for both states, so the agent cannot tell them apart. Because it is a guard, F-09's ratchet still runs.
+- **Witness servers (RV4 #2).** G_prov also denies a payment whose witness record came from a tool on a server that is not `Serving` (new `PolicyError::WitnessQuarantined`). `validate_binding` lets `lookup_tool` live on another server, which is the realistic layout (a system of record and a PSP), so a drifted lookup server's Trusted amount, recorded before detection, could otherwise fund a payment to the healthy server after it. A trusted input has no server.
+- **Re-check before forwarding (P1, RV3 A4).** A new `PepEngine::recheck_before_forward(call_id)` re-runs G_pin's server-state and epoch checks, and for a payment G_prov's witness-server check (RV4 #2), for a call already allowed or approved. The actor calls it just before the point of forwarding, and checks the episode's liveness itself. On a failure it calls `release_unforwarded` (RV4 #17).
+- **Pending-payment check (P1, RV4 #1).** `g_budget` denies a payment with `PolicyError::PaymentPending` when its entity (after NFC) matches:
+  - a `NeedsReconcile` reservation's `entity`, for any payment;
+  - a `Held`, `AwaitingStepUp` or `Forwarded` reservation's `entity`, for an amount-bound payment. Two live reservations on one invoice carry different F-07 keys, so the provider cannot dedupe them, and the agent needs no failure to get them: it only has to race inside the upstream window;
+  - an entity in the PEP-wide unresolved set (R1, RV3 A1). That set is a shared `Arc`, like `ServerStates`, not a snapshot passed to `PepEngine::new`, which would never see another intent's new `abort(Unknown)`.
 
-  `Reservation` already stores the entity. This is pure validation, so F-06 holds.
+  The first two are in the engine since RV4 (`fc3b620`); the shared set comes with step 7. `Reservation` already stores the entity. This is pure validation, so F-06 holds. Invoice intents run with `per_entity_max_uses: 1`, checked when the config loads, because a system of record that lags after a commit would otherwise fund a second payment.
+- **Forwarded state (P1, RV4 #17).** Today `abort` takes `&HostAuthority`, which A1 keeps off the agent path, yet P1 needs a release on agent-path events. And with no forwarded state, `abort(DefinitelyNotExecuted)` would also release a payment already sent. The engine gains:
+  - `ResState::Forwarded`, set from `Held` by a crate-private `mark_forwarded(rid)` at the point of forwarding (P1), and counted in `reserved`;
+  - a crate-private `release_unforwarded(rid, reason)`, with no `HostAuthority`, for the agent-path events: a disconnect before forwarding, a failed re-check, a failed journal write, a step-up timeout and `end_episode`. It releases `Held` and `AwaitingStepUp` only, and refuses `Forwarded`;
+  - `settle(&HostAuthority, rid, outcome)` for a `Forwarded` reservation, from the upstream worker's report of the broker's explicit outcome: `executed` gives `Committed`, `refused` gives `Released`, and `unknown` or a timeout gives `NeedsReconcile`. It replaces `commit`;
+  - `abort` keeps only the operator's decline of an `AwaitingStepUp` reservation, and refuses `Forwarded`.
+
+  So once forwarded, a payment ends only through `settle`, and P1's promise no longer rests on actor code alone.
 - **Ledger restore (R1).** `PepEngine::new` takes, behind `&HostAuthority`, the intent's journaled ledger:
   - committed spend;
   - calls;
   - entity uses;
   - the restored unresolved reservations, counted in `reserved`. They are kept in a separate set keyed by (eid, rid), never in `reservations`, whose new ids start at 1, and they have no funding witness (RV3 A1);
-  - the PEP-wide set of entities with an unresolved payment;
+  - a handle to the PEP-wide set of entities with an unresolved payment, shared by every engine (RV4 #1);
   - the intent's ratchet level, as the starting `context_conf` (RV3 A3);
   - the episode's fresh eid, in `PepIntent.episode_id` (E1, RV3 A2).
 - **Batched taint (RV3 A9).** `LabelStore` gains `record_all(entries)`, and `apply` passes one call's taint entries in a single call (today it calls `record` once per index, engine.rs:1617-1619). So the journal-backed store writes them as one record, with one fsync.
@@ -846,7 +887,7 @@ The order follows RV2: p256, peer identity and the lock file come before the bin
   - `require_peer(socket, uid, gid)`;
   - `BoundListener { listener, lock }`;
   - new `PeerError` variants for pidfd and lock failures.
-- **jcs (J1 (b)):** a result number mode that keeps the digits of plain integer tokens beyond ±(2^53−1); the request profile is unchanged.
+- **jcs (J1 (b)):** a result number mode that keeps the digits of plain integer tokens beyond ±(2^53−1); the request profile is unchanged. It also gains a definition profile: that number mode with larger caps, for `pins`, the lockfile and their digests (RV4 #13).
 
 **Module layout.** The core is sans-IO: pure functions over byte buffers, so that Week 3's Tokio runtime reuses it.
 
@@ -865,7 +906,7 @@ The order follows RV2: p256, peer identity and the lock file come before the bin
 | `src/bin/pepctl.rs` | `lock sign` and key generation (keys from `/dev/urandom`); Week 6 adds `explain` and `replay` |
 | `src/bin/` stubs | The stub broker, the stub tool server and the scripted operator, under the same lints |
 
-**Config** (JSON parsed by `jcs`, safe integers only; keys as SEC1 or JWK):
+**Config** (JSON parsed by `jcs`; keys as SEC1 or JWK). Every section uses the request number profile, safe integers only, except `pins`. `pins` uses the definition profile: J1's exact-digit result numbers, with caps of 8 MiB and 262,144 values, because full upstream definitions hold values such as `"minimum": 0.5` and can exceed 8,192 values. The lockfile, `lockfile_digest` and every `tool_schema_digest` use the definition profile too (RV4 #13):
 
 | Section | Fields |
 |---|---|
@@ -876,7 +917,7 @@ The order follows RV2: p256, peer identity and the lock file come before the bin
 | `lockfile` | `path`, `signers` (`role`, `key`; each key in exactly one role), `thresholds` (role → number of distinct keys, each ≥ 1; L1), `min_accepted_epoch` (the rollback floor) |
 | `journal` | `path`, `lock` (R1) |
 | `log` | `path` (on `pep-log`), `max_bytes` (RV3 B4) |
-| `intents` | name → `PepIntent` plus its `SeqPolicy`; the Week 2 stand-in for RAR |
+| `intents` | name → `PepIntent` plus its `SeqPolicy`; the Week 2 stand-in for RAR. The name is the ledger key (R1, RV4 #5), and an invoice intent must set `per_entity_max_uses: 1` (RV4 #1) |
 | `limits` | `connections`, `control_connections` (H1), `header_bytes`, `body_bytes`, `read_timeout_ms`, `upstream_timeout_ms` (10,000), `step_up_timeout_ms` (45,000; the two together ≤ 55,000, checked at load, P1), `episode_idle_ms`, `episodes`, `call_burst`, `call_rate_per_s`, `clock_skew_ms`, `replay_cache_entries`, `drift_poll_ms`, `drift_poll_deadline_ms` (L1) |
 | `pins` | The unsigned lockfile v1 payload (L1). Step 10 replaces it with the signed lockfile at `lockfile.path` |
 
@@ -897,23 +938,25 @@ The order follows RV2: p256, peer identity and the lock file come before the bin
   - proof-less `tools/list` and `server/discover`, for drift polls and `lock-scan`.
 
   The broker forwards a proof-less request only for those two methods.
-- **Routing:** `/mcp/{server_id}`, from the lockfile.
+- **Routing:** `/mcp/{server_id}`, through a static `server_id → endpoint` table in the broker's own config, not the lockfile, so `lock-scan`'s first scan does not depend on a lockfile (RV4 #12).
+- **The broker's config and lockfile (RV4 #12).** The broker has its own config (`/etc/broker`: the routes, the credential paths, `replay_cache_entries`, `clock_skew_ms` and `poll_connections`), and mounts the same lockfile as the PEP, read-only. From the lockfile it takes `release_epoch`, each tool's `tool_schema_digest` and which tools are payments (SPEC §3.4).
+  - On a re-sign the broker restarts first, with the new lockfile, and then the PEP. In between, the old PEP's proofs carry the old epoch and are refused, which fails closed.
 - **Broker duties:**
   - verify the Call Proof (T1), including `iat` after its boot second;
   - recompute `action_digest` and, for payments, the F-07 key;
-  - inject the credential and `Idempotency-Key`;
-  - forward to the tool server over `tools_net`, keeping the PEP-assigned JSON-RPC id;
+  - inject the target server's own credential and the `Idempotency-Key` (RV4 #7);
+  - forward to the tool server over that server's own network, keeping the PEP-assigned JSON-RPC id;
   - answer the PEP with JSON only;
   - write its log (schema below).
 - **Outcomes.** For payments, the broker adds `_meta["dev.pep-sidecar/outcome"]` (`executed`, `refused` or `unknown`, mapped as P1 says), after stripping any `dev.pep-sidecar/*` key the tool server sent. A Call Proof the broker rejects gets `refused` with no tool result.
 
 **Stub tool servers** (two servers, for mutations #12 and #25):
-- **Tools:** the Week 1 test set: a bound lookup (`get_invoice`), a payment (`pay_invoice`), a sink, and a store writer.
+- **Tools:** the Week 1 test set: a bound lookup (`get_invoice`), a payment (`pay_invoice`), a sink, and a store writer, plus a store reader that names no location (`search_notes`), for L1's store-reader rule (RV4 #8).
 - **Replies:** JSON only.
 - **Credential check (C-CRED).**
-  - Each server reads a verifier from `/run/credential.sha256`: the lowercase hex SHA-256 of the broker credential.
+  - Each server has its own credential (RV4 #7). It reads a verifier from `/run/credential.sha256`: the lowercase hex SHA-256 of its own credential.
   - It rejects any call unless the SHA-256 of the credential the broker presents matches, compared in constant time. A rejected call executes nothing.
-  - A server never holds the credential itself, just as a real provider keeps only a verifier.
+  - A server never stores a credential, just as a real provider keeps only a verifier. It does see its own credential on every call. With one credential per server, and one network per server, a rug-pulled server that captures it can present it only to itself (the 3 Nov design shared one credential, verifier and network, so tool-b could call tool-a's `pay_invoice` directly).
 - **Payment status.** Payment results carry an explicit `status` (`executed`, `declined` or `pending`), which the broker maps as P1 says: `pending`, a missing status, or anything ambiguous, becomes `unknown` (RV3 B6).
 - **Bookkeeping:**
   - `Idempotency-Key` dedupe, in a store on the server's own volume that survives PEP and broker restarts;
@@ -956,7 +999,7 @@ No log ever holds raw tokens, proofs, keys, credentials, or argument values othe
   - for attacks that execute nothing (C-NET, C-PROC, C-LOCK, C-CRED, C-CTL), the attempt succeeding.
 
 ## 3. Gate 1 suite
-### Containment (54 attack tests count toward G1; 74 checks run in CI)
+### Containment (60 attack tests count toward G1; 79 checks run in CI)
 Only the attack column counts toward G1's ≥ 50, and only when run in Compose on this machine (RV2).
 - **Attacks** are bypass attempts whose success the oracle, or the attempt itself, would show: a call that executes but should not, money moving outside the intent, data reaching a sink it should not, or a containment boundary crossed.
   - The C-UID probes run from the `probe` service with group 20001, so each one passes the socket's 0660 mode and reaches `accept()`.
@@ -969,28 +1012,28 @@ Only the attack column counts toward G1's ≥ 50, and only when run in Compose o
 | C-UID | 4, from the `probe` service, each holding a stolen live token:<br>• wrong uid (`20009:20001`);<br>• root (`0:20001`);<br>• overflow uid 65534 (`65534:20001`);<br>• uid right but gid wrong (`20001:20009`, with group 20001 supplementary), rejected under Q1 | 1:<br>• socketpair self-connect (unit) |
 | C-PID | — | 6:<br>• a getsockopt error rejects (injected errno);<br>• fdinfo `Pid: -1` rejects (fdinfo parser);<br>• the peer exits between accept and check (test hook);<br>• `Pid: 0` is handled per Q1;<br>• `ENOPROTOOPT` rejects (injected errno: this needs a kernel older than 6.5);<br>• no pidfd leaks (cloexec) |
 | C-LOCK | 2:<br>• the agent cannot open the lock file;<br>• the agent cannot create or replace an entry in `/run/pep`, such as a planted symlink | 5:<br>• a second instance is blocked;<br>• a stale socket is replaced only under the lock;<br>• the lock is released on a crash;<br>• a read-only lock directory fails;<br>• a symlink planted at the socket path is refused (`ExistingNotSocket`; corrected in step 5, which found no `UnsafePath` variant) |
-| C-NET | 7, from the agent:<br>• no route;<br>• no DNS;<br>• no way into `tools_net` (the broker and the tool servers);<br>• no IPv6;<br>• raw and packet sockets fail;<br>• UDP/53 fails;<br>• DoH (TCP/443 to a resolver) fails | 1:<br>• only `lo` is present |
+| C-NET | 8, from the agent:<br>• no route;<br>• no DNS;<br>• no way into the tool networks (`tools_a`, `tools_b`: the broker and the tool servers);<br>• no IPv6;<br>• raw and packet sockets fail;<br>• UDP/53 fails;<br>• DoH (TCP/443 to a resolver) fails;<br>• no socket of any family but `AF_UNIX`, natively, through `int 0x80` or through the x32 ABI: a sweep of every `AF_*` value, `AF_VSOCK` included, which reaches the host from outside the network namespace (RV4 #6) | 1:<br>• only `lo` is present |
 | C-PROC | 3:<br>• ptrace of the PEP fails, or, under Q1 (i), the PEP pid is not visible;<br>• `/proc/<pep>/mem` is unreadable;<br>• the PEP's argv and env hold no key or credential | 1:<br>• the agent's argv and env hold no Episode Token (E1: it arrives on stdin) |
-| C-POSTURE | — | 6:<br>• every container has CapEff 0;<br>• NoNewPrivs 1;<br>• Seccomp 2, with the AF_UNIX-only profile on the agent, the PEP, the operator and the probe;<br>• `io_uring_setup` fails under that profile: `IORING_OP_SOCKET` would create a socket without calling `socket()` (RV3 F10);<br>• no container mounts `docker.sock`;<br>• the agent's `pids_limit`, memory limit and private `/tmp` are in effect |
+| C-POSTURE | — | 8:<br>• every container has CapEff 0;<br>• NoNewPrivs 1;<br>• Seccomp 2, with the AF_UNIX-only profile on the agent, the PEP, the operator and the probe;<br>• `io_uring_setup` fails under that profile: `IORING_OP_SOCKET` would create a socket without calling `socket()` (RV3 F10);<br>• the profile has no `socketcall` rule and x86_64 has no `subArchitectures`, so `int 0x80` and x32 syscalls die with SIGSYS (RV4 #6);<br>• `pep-log` keeps its records across `docker restart pep` and `docker kill pep`, because the `oracle` service holds it (RV4 #10);<br>• no container mounts `docker.sock`;<br>• the agent's `pids_limit`, memory limit and private `/tmp` are in effect |
 | C-HTTP | — | 18:<br>• CL+TE;<br>• TE only;<br>• duplicate CL;<br>• CL mismatch;<br>• obs-fold;<br>• bare LF;<br>• header over the cap;<br>• body over the cap;<br>• slowloris headers, including one byte per interval (RV3 F1);<br>• slow body;<br>• a pipelined second request;<br>• `Content-Encoding`;<br>• HTTP/1.0;<br>• an HTTP/2 preface;<br>• GET → 405;<br>• DELETE → 405;<br>• a notification POST → 400, except `notifications/cancelled` → 202, ignored;<br>• a duplicated `MCP-Protocol-Version`, `Mcp-Method`, `Mcp-Name`, `Pep-Episode`, `Content-Type` or `Host`, whitespace before a colon, or a request target other than the plain path → 400 (RV3 F5) |
-| C-MCP | — | 17:<br>• the version header differs from `_meta` → -32020;<br>• `Mcp-Method` differs from the body → -32020;<br>• `Mcp-Name` differs from the body → -32020;<br>• a base64-sentinel `Mcp-Name` mismatch → -32020;<br>• a batch array body → 400;<br>• any `Mcp-Param-*` header → -32020;<br>• missing `MCP-Protocol-Version` → -32020;<br>• a JSON-RPC response as the body → 400;<br>• any `Origin` → 403;<br>• an unsupported version → -32022;<br>• `Accept` without `text/event-stream` → 400;<br>• missing `_meta` `protocolVersion` → -32602;<br>• missing `_meta` `clientCapabilities` → -32602;<br>• `server/discover` answered without upstream `instructions`;<br>• `subscriptions/listen` acknowledged first (subscription id, empty filter), then completed and closed, with no `notifications/cancelled`;<br>• `Mcp-Name` base64 with NFC compared correctly;<br>• every PEP result carries `resultType`, and discover and list results carry `ttlMs` and `cacheScope` as M1 sets them |
+| C-MCP | — | 18:<br>• the version header differs from `_meta` → -32020;<br>• `Mcp-Method` differs from the body → -32020;<br>• `Mcp-Name` differs from the body → -32020;<br>• a base64-sentinel `Mcp-Name` mismatch → -32020;<br>• a batch array body → 400;<br>• any `Mcp-Param-*` header → -32020;<br>• missing `MCP-Protocol-Version` → -32020;<br>• a JSON-RPC response as the body → 400;<br>• any `Origin` → 403;<br>• an unsupported version → -32022;<br>• `Accept` without `text/event-stream` → 400;<br>• missing `_meta` `protocolVersion` → -32602;<br>• missing `_meta` `clientCapabilities` → -32602;<br>• `server/discover` answered without upstream `instructions`;<br>• `subscriptions/listen` acknowledged first (subscription id, empty filter), then completed and closed, with no `notifications/cancelled`;<br>• `Mcp-Name` base64 with NFC compared correctly;<br>• every PEP result carries `resultType`, and discover and list results carry `ttlMs` and `cacheScope` as M1 sets them;<br>• `tools/list` with the token as a `Pep-Episode` header alone is served, and a header that differs from `_meta` gets -32020 (RV4 #11) |
 | C-FWD | 3:<br>• no agent header (`Authorization`, `Idempotency-Key`, `Mcp-Param-*`, `Pep-Episode`) reaches upstream;<br>• upstream `_meta` holds only PEP-built keys: the agent's Episode Token (today it is forwarded: Context), `traceparent`, `logLevel`, `progressToken` and unknown keys are absent (RV3 C1);<br>• the upstream id is PEP-assigned | 1:<br>• the upstream body equals the `forward::tools_call_request` output byte for byte |
 | C-RES | 3:<br>• an `outcome` key forged by the tool server is stripped and never trusted;<br>• a response id mismatch;<br>• two responses in one body | 3:<br>• an unknown or absent `resultType`;<br>• `input_required` is not recorded, and a payment's reservation follows the broker's outcome (P1);<br>• an SSE reply from the broker is invalid |
-| C-JSON | — | 6:<br>• duplicate keys (`name` twice), checked against the forwarded body;<br>• NaN or Infinity;<br>• lone surrogates;<br>• a depth bomb;<br>• a huge number;<br>• a BOM |
+| C-JSON | — | 7:<br>• duplicate keys (`name` twice), checked against the forwarded body;<br>• NaN or Infinity;<br>• lone surrogates;<br>• a depth bomb;<br>• a huge number;<br>• a BOM;<br>• `pins` with `"minimum": 0.5` and more than 8,192 values loads under the definition profile, while the request profile still rejects both (RV4 #13) |
 | C-EPI | 7, Episode Token:<br>• missing;<br>• malformed (charset, padding, non-zero trailing bits);<br>• a header member outside `alg`, `typ` and `kid`;<br>• forged signature;<br>• expired or idle;<br>• a Call Proof presented as an Episode Token;<br>• the token of an ended episode | 1:<br>• `peer_uid` mismatch (a unit test: in Compose any other uid fails `require_peer` first, RV3 A10) |
-| C-CRED | 1:<br>• the agent and the PEP cannot read the broker credential | 1:<br>• the tool server rejects calls without it (from a probe on `tools_net`) |
+| C-CRED | 2:<br>• the agent and the PEP cannot read any tool server's credential;<br>• a rug-pulled tool-b that captured its own credential cannot reach tool-a's network, and tool-a rejects that credential (RV4 #7) | 1:<br>• each tool server rejects calls without its own credential (from a probe on its network) |
 | C-CTL | 1:<br>• the agent cannot reach `/run/pep-ctl` | 6:<br>• an approval with any of (eid, rid, `action_digest`, amount) mismatched is refused;<br>• a declined step-up leaves the reservation `Released`, and the agent gets `PEP_DENIED`;<br>• an approval that arrives after the agent disconnected is refused;<br>• after `end_episode`, later calls are denied and in-flight legs finish;<br>• `start_episode` is refused while the intent has a live episode (E1, RV3 A2);<br>• `end_episode` lands promptly while the agent saturates its socket (H1, RV3 A11) |
-| C-OUT | 8:<br>• an agent disconnect after the point of forwarding never releases the reservation;<br>• a `notifications/cancelled` naming a forwarded payment's id never releases the reservation;<br>• a retry after `Unknown` with a changed `/memo` (a new `action_digest`) → `ReconcilePending`;<br>• a PEP restart mid-payment: the next episode of that intent starts with the reservation `NeedsReconcile` (R1 (a));<br>• with entity X unresolved, after a restart or after `end_episode` and `start_episode`, a payment to Y and then a retry of X → `ReconcilePending` (R1 (a), RV3 A1);<br>• an agent write before a PEP restart is still tainted after it (R1 (a));<br>• read Secret data, end the episode, start the intent's next one, send to a Public sink → denied (R1 (a), RV3 A3);<br>• a burst over the per-episode bucket is refused and issues no Call Proof | 1:<br>• denials from every guard have identical wire bytes apart from the id |
-| C-ENG | 15, end to end through the engine (RV3 A10), each expected `deny`:<br>• a payment to an entity id that looks like an allowed one (a homoglyph or an NFD variant);<br>• a payment to an entity outside the intent;<br>• an amount taken from an unbound result field instead of the bound lookup (F-14);<br>• a funding lookup laundered through a store write (F-08);<br>• a value the agent wrote in one episode, used as a witness in the next (F-08);<br>• Secret data sent to a Public sink (F-09);<br>• a payment split into smaller ones to dodge step-up;<br>• two concurrent payments funded by the same lookup;<br>• a payment over `per_call_max_minor`, or past the cumulative cap;<br>• an undeclared nested argument (F-13);<br>• a tool name under the reserved `pep/` prefix;<br>• a call to an unpinned tool;<br>• a call to a tool of a quarantined server;<br>• a control method (`approve`, `start_episode`) sent on the agent socket;<br>• a forged `dev.pep-sidecar/call-proof` or `dev.pep-sidecar/outcome` member in the agent's `_meta` | — |
+| C-OUT | 9:<br>• an agent disconnect after the point of forwarding never releases the reservation;<br>• a `notifications/cancelled` naming a forwarded payment's id never releases the reservation;<br>• a retry after `Unknown` with a changed `/memo` (a new `action_digest`) → `PaymentPending`;<br>• a PEP restart mid-payment: the next episode of that intent starts with the reservation `NeedsReconcile` (R1 (a));<br>• with entity X unresolved, after a restart or after `end_episode` and `start_episode`, a payment to Y and then a retry of X → `PaymentPending` (R1 (a), RV3 A1);<br>• an agent write before a PEP restart is still tainted after it (R1 (a));<br>• read Secret data, end the episode, start the intent's next one, send to a Public sink → denied (R1 (a), RV3 A3);<br>• a burst over the per-episode bucket is refused and issues no Call Proof;<br>• read Secret data in one intent's episode, then try to send it to a Public sink from another intent's episode: the second runs in a fresh container, which holds neither the data nor a helper (RV4 #3) | 2:<br>• denials from every guard have identical wire bytes apart from the id;<br>• a disconnect before the point of forwarding, and a half-close, each release the reservation through `release_unforwarded`, which refuses a `Forwarded` one (RV4 #17) |
+| C-ENG | 18, end to end through the engine (RV3 A10), each expected `deny`:<br>• a payment to an entity id that looks like an allowed one (a homoglyph or an NFD variant);<br>• a payment to an entity outside the intent;<br>• an amount taken from an unbound result field instead of the bound lookup (F-14);<br>• a funding lookup laundered through a store write (F-08);<br>• a value the agent wrote in one episode, used as a witness in the next (F-08);<br>• Secret data sent to a Public sink (F-09);<br>• a secret saved in chunks under 16 bytes, read back through a store reader that names no location, then sent to a Public sink (F-08; L1's store-reader rule, RV4 #8);<br>• a payment split into smaller ones to dodge step-up;<br>• two concurrent payments funded by the same lookup;<br>• lookup, pay, lookup, pay on one invoice while the first payment is still upstream → `PaymentPending` (RV4 #1);<br>• the same invoice paid from a second intent while the first intent's payment is `NeedsReconcile` → `PaymentPending`, through the shared unresolved set (RV4 #1);<br>• a payment over `per_call_max_minor`, or past the cumulative cap;<br>• an undeclared nested argument (F-13);<br>• a tool name under the reserved `pep/` prefix;<br>• a call to an unpinned tool;<br>• a call to a tool of a quarantined server;<br>• a control method (`approve`, `start_episode`) sent on the agent socket;<br>• a forged `dev.pep-sidecar/call-proof` or `dev.pep-sidecar/outcome` member in the agent's `_meta` | — |
 
-Under R1 (b), the four journal attacks in C-OUT (the restart, the unresolved retry, the taint and the ratchet) are dropped and the accepted risk recorded instead. That leaves exactly 50, so (b) has no margin.
+Under R1 (b), the four journal attacks in C-OUT (the restart, the unresolved retry, the taint and the ratchet) are dropped and the accepted risk recorded instead. That leaves 56 of the 60, so (b) still keeps a margin of six.
 
 ### Rug-pull mutations (G2: every one quarantined within T)
-Each mutation must quarantine the mutated server within T (L1). The quarantine unit is the whole server (RV3 B2), so the observable is the same for every mutation:
+Each mutation must quarantine the mutated server within T (L1). #26, a failed poll, suspends it instead, with the same observable (RV4 #9). The quarantine unit is the whole server (RV3 B2), so the observable is the same for every mutation:
 - every pinned tool of that server is hidden from `tools/list`;
 - its calls are denied with `ToolQuarantined`;
 - no call reaches it after detection, re-checked just before each upstream write (P1);
-- it stays quarantined until a restart with a re-signed lockfile.
+- it stays quarantined until the PEP loads a lockfile with a different digest (journaled, RV4 #5).
 
 A tool the mutation adds is never served, because it is unpinned, and a call to it gets `ToolNotPinned`.
 
@@ -1022,13 +1065,14 @@ Its mitigation for rug pulls is pinning tool descriptions "using a hash or check
 20. a definition changed between two polls, with or without a `notifications/tools/list_changed`. The PEP polls, so the notification is not needed;
 21. title or icon change on a security-role tool;
 22. default value injected into the schema;
-23. an integer beyond ±(2^53−1) changed. Under J1 (b) the digest keeps exact digits and changes; under J1 (a), definitions with such integers are quarantined at load;
+23. an integer beyond ±(2^53−1) changed. The definition profile keeps exact digits (J1 (b)), so the digest changes;
 24. a definition changed on page 2 only;
 25. cross-server shadowing, in Invariant's sense. After pinning, a tool on server B gains description text that tells the agent how to use server A's `pay_invoice`, for example to pay another recipient. That is a description change on B, so B's tool is quarantined.
     - A description that shadows from the start is not drift. Lockfile review must catch it.
     - G_entity, F-14 and the sink clearances limit what a redirected call can do, which is Invariant's third mitigation, "Cross-Server Protection".
-26. the tool list times out, or returns errors, after the server mutates. A failed poll quarantines the server (RV3 A5);
-27. mutate, then revert before the next poll, or after detection. A revert after detection does not lift the quarantine; one before detection is not drift (RV3 A5).
+26. the tool list times out, or returns errors, after the server mutates. A failed poll suspends the server, which hides and denies it exactly as quarantine does, and the next matching poll lifts it (RV3 A5, RV4 #9);
+27. mutate, then revert before the next poll, or after detection. A revert after detection does not lift the quarantine; one before detection is not drift (RV3 A5);
+28. a lookup server drifts after recording a Trusted amount. A payment to the healthy server funded by that witness is denied with `WitnessQuarantined`, whether it arrives after detection or was waiting for step-up when detection came (RV4 #2).
 
 **The step-up timing case (RV3 A4).** Mutate a server while a payment to it waits for step-up, then approve: the re-check just before forwarding denies it, nothing is forwarded, and the agent gets `PEP_DENIED`.
 
@@ -1046,10 +1090,10 @@ Split by token type (RV3 A7). An Episode Token is a reusable bearer token with n
 - verbatim;
 - after `exp`;
 - against a different `rid`;
-- after the reservation leaves `Held`;
+- after the reservation leaves `Held`. The broker keeps no reservation state, so in Compose this tests only `jti`; the PEP side, that only a `Held` reservation gets payment claims, is tested in-process (`PaymentClaims::for_held`, step 6; RV4 #14);
 - with a malleated high-S signature (same `jti`);
 - re-encoded with padding, the standard alphabet, or non-zero trailing bits, all rejected by the strict decoder;
-- concurrently from N threads, where exactly one first use is accepted;
+- concurrently from N threads, where exactly one first use is accepted. The injector holds only logged proofs, which are already spent, so this class runs in-process (`concurrent_replays_admit_exactly_once`, step 6) and is reported beside G3 (RV4 #14);
 - after a PEP restart, with a key from the previous boot;
 - after a broker restart, with a proof issued before the broker booted, including one issued in the broker's boot second;
 - an Episode Token presented as a Call Proof.
@@ -1064,7 +1108,7 @@ Split by token type (RV3 A7). An Episode Token is a reusable bearer token with n
 - with a malleated high-S signature, which the PEP rejects (T1);
 - a Call Proof presented as an Episode Token.
 
-**In-process, beside G3:** after the clock is stepped back, against the replay cache's injected clock (step 6).
+**In-process, beside G3:** after the clock is stepped back, against the replay cache's injected clock; concurrent first uses; and payment claims for a reservation that is not `Held` (all step 6).
 
 ### p99 (G4)
 Measured as O1 defines it: the PEP plus the broker, with the PEP alone beside it. Reported with p50, p99.9, max, the CPU model and the load profile.
@@ -1074,23 +1118,26 @@ Measured as O1 defines it: the PEP plus the broker, with the PEP alone beside it
 - on `/mnt/c`, a chown to uid 20003 doesn't stick without the drvfs `metadata` mount option;
 - the repo sits in OneDrive.
 
-The broker credential lives in `$PEP_SECRETS_DIR`, outside the repo and outside OneDrive (for example `~/.config/pep-gate1/secrets`), so OneDrive never syncs it to the cloud. `.gitignore` lists `secrets/` as a backstop.
+The tool servers' credentials, one per server, live in `$PEP_SECRETS_DIR`, outside the repo and outside OneDrive (for example `~/.config/pep-gate1/secrets`), so OneDrive never syncs it to the cloud. `.gitignore` lists `secrets/` as a backstop.
 
-**Creating the credential (step 8; yours, since it needs sudo).** Run this in a WSL bash shell, never in PowerShell:
+**Creating the credentials (step 8; yours, since it needs sudo).** One credential per tool server (RV4 #7). Run this in a WSL bash shell, never in PowerShell:
 
 ```bash
 install -d -m 0700 ~/.config/pep-gate1/secrets
 cd ~/.config/pep-gate1/secrets
-( umask 077
-  head -c 32 /dev/urandom | base64 -w0 > broker-credential
-  sha256sum broker-credential | cut -d' ' -f1 | tr -d '\n' > broker-credential.sha256 )
-sudo chown 20003:20003 broker-credential
-sudo chown 20005:20005 broker-credential.sha256
-sudo chmod 0400 broker-credential broker-credential.sha256
+for pair in a:20005 b:20008; do
+  server=${pair%%:*} uid=${pair##*:}
+  ( umask 077
+    head -c 32 /dev/urandom | base64 -w0 > "broker-credential-$server"
+    sha256sum "broker-credential-$server" | cut -d' ' -f1 | tr -d '\n' > "broker-credential-$server.sha256" )
+  sudo chown 20003:20003 "broker-credential-$server"
+  sudo chown "$uid:$uid" "broker-credential-$server.sha256"
+  sudo chmod 0400 "broker-credential-$server" "broker-credential-$server.sha256"
+done
 ```
 
 - `base64 -w0` writes no trailing newline (plain `base64` ends with `\n`, checked 2026-11-03). So the file holds exactly the bytes the broker sends, and the verifier hashes exactly those.
-- The files are private while you still own them: the directory is 0700 and the umask 077. After the `chown`, your own account can no longer read either file. Only the broker (20003) and the tool servers (20005) can, through the bind mounts, which the Docker daemon makes as root.
+- The files are private while you still own them: the directory is 0700 and the umask 077. After the `chown`, your own account can no longer read either file. Only the broker (20003) and each tool server (20005 or 20008) can, through the bind mounts, which the Docker daemon makes as root.
 - Compose refuses to start unless `PEP_SECRETS_DIR` is set (`${PEP_SECRETS_DIR:?…}`). Ubuntu's `~/.bashrc` returns early in non-interactive shells, so an `export` appended at its end is missed by scripts. Set it in `~/.profile`, or on the command line for scripted runs.
 
 A Compose sketch (step 8 verifies every key against the Compose reference [80]):
@@ -1098,7 +1145,7 @@ A Compose sketch (step 8 verifies every key against the Compose reference [80]):
 ```yaml
 name: pep-gate1
 services:
-  agent:                       # Gate 1 test client (TS or Python SDK)
+  agent:                       # Gate 1 test client (TS or Python SDK); one container per episode: `docker compose run --rm agent` (E1, RV4 #3)
     user: "20001:20001"
     read_only: true
     cap_drop: [ALL]
@@ -1134,17 +1181,21 @@ services:
       - { type: volume, source: pep-state,   target: /var/lib/pep }   # R1 journal; only the PEP mounts it
       - { type: volume, source: pep-log,     target: /var/log/pep }   # decision log (RV3 B4)
       - { type: bind, source: ./config/pep, target: /etc/pep, read_only: true }
+      - { type: bind, source: ./config/lockfile, target: /etc/lockfile, read_only: true }   # shared with the broker (RV4 #12)
   broker:
     user: "20003:20003"
     read_only: true
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
-    networks: [tools_net]
+    networks: [tools_a, tools_b]   # one network per tool server (RV4 #7)
     volumes:
       - { type: volume, source: broker-sock,  target: /run/broker,     volume: { nocopy: true } }
       - { type: volume, source: pep-pub,      target: /run/pep-pub,    read_only: true, volume: { nocopy: true } }
       - { type: volume, source: broker-state, target: /var/lib/broker }   # broker log
-      - { type: bind, source: "${PEP_SECRETS_DIR:?set PEP_SECRETS_DIR}/broker-credential", target: /run/credential, read_only: true }
+      - { type: bind, source: ./config/broker,   target: /etc/broker,   read_only: true }   # static routes (RV4 #12)
+      - { type: bind, source: ./config/lockfile, target: /etc/lockfile, read_only: true }   # the same lockfile as the PEP
+      - { type: bind, source: "${PEP_SECRETS_DIR:?set PEP_SECRETS_DIR}/broker-credential-a", target: /run/credential-a, read_only: true }
+      - { type: bind, source: "${PEP_SECRETS_DIR:?set PEP_SECRETS_DIR}/broker-credential-b", target: /run/credential-b, read_only: true }
   injector:                    # G3 only: replays captured proofs and tokens (RV3 D2); never in a release image
     profiles: [gate1]
     user: "20002:20002"        # the broker admits only the PEP's uid
@@ -1163,50 +1214,70 @@ services:
     network_mode: "none"
     volumes:
       - { type: volume, source: pep-ctl, target: /run/pep-ctl, volume: { nocopy: true } }
-  tool-a: &tool                # stub tool servers; any unprivileged uid
+  oracle:                      # reads every log, and keeps pep-log's tmpfs mounted across PEP restarts (RV4 #10)
+    user: "20006:20007"        # 20007 is the log group that every log directory grants read to
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true", "seccomp=./seccomp-unix-only.json"]
+    network_mode: "none"
+    volumes:
+      - { type: volume, source: pep-log,      target: /logs/pep,    read_only: true }
+      - { type: volume, source: broker-state, target: /logs/broker, read_only: true }
+      - { type: volume, source: tool-a-state, target: /logs/tool-a, read_only: true }
+      - { type: volume, source: tool-b-state, target: /logs/tool-b, read_only: true }
+  tool-a: &tool                # stub tool servers; each has its own uid, network and credential (RV4 #7)
     user: "20005:20005"
     read_only: true
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
-    networks: [tools_net]
+    networks: [tools_a]
     environment: { TOOL_SERVER_ID: "a" }
     volumes:
       - { type: volume, source: tool-a-state, target: /var/lib/tool }   # dedupe store, execution log
-      - { type: bind, source: "${PEP_SECRETS_DIR:?set PEP_SECRETS_DIR}/broker-credential.sha256", target: /run/credential.sha256, read_only: true }
+      - { type: bind, source: "${PEP_SECRETS_DIR:?set PEP_SECRETS_DIR}/broker-credential-a.sha256", target: /run/credential.sha256, read_only: true }
   tool-b:                      # second server, for mutations #12 and #25
     <<: *tool                  # `<<` replaces whole keys, so per-server keys are restated in full
+    user: "20008:20008"
+    networks: [tools_b]
     environment: { TOOL_SERVER_ID: "b" }
     volumes:
       - { type: volume, source: tool-b-state, target: /var/lib/tool }
-      - { type: bind, source: "${PEP_SECRETS_DIR:?set PEP_SECRETS_DIR}/broker-credential.sha256", target: /run/credential.sha256, read_only: true }
+      - { type: bind, source: "${PEP_SECRETS_DIR:?set PEP_SECRETS_DIR}/broker-credential-b.sha256", target: /run/credential.sha256, read_only: true }
 volumes:
   pep-sock:     { driver: local, driver_opts: { type: tmpfs, device: tmpfs, o: "uid=20002,gid=20001,mode=2750" } }
   broker-sock:  { driver: local, driver_opts: { type: tmpfs, device: tmpfs, o: "uid=20003,gid=20002,mode=2750" } }
   pep-ctl:      { driver: local, driver_opts: { type: tmpfs, device: tmpfs, o: "uid=20002,gid=20004,mode=2750" } }
   pep-pub:      { driver: local, driver_opts: { type: tmpfs, device: tmpfs, o: "uid=20002,gid=20003,mode=2750" } }
   pep-state:    {}             # on disk; owner 20002 and mode 0700 come from the image's /var/lib/pep
-  pep-log:      { driver: local, driver_opts: { type: tmpfs, device: tmpfs, o: "uid=20002,gid=20002,mode=0750,size=256m" } }
+  pep-log:      { driver: local, driver_opts: { type: tmpfs, device: tmpfs, o: "uid=20002,gid=20007,mode=2750,size=256m" } }
   broker-state: {}
   tool-a-state: {}
   tool-b-state: {}
 networks:
-  tools_net: { internal: true }
+  tools_a: { internal: true }
+  tools_b: { internal: true }
 ```
 
 - **Socket directories.** They must exist before the PEP starts, with the owners and modes above. Otherwise `bind_safe_listener` refuses: the parent must be owned by the euid with `mode & 0o027 == 0`, and setgid gives the socket the parent's group.
   - **Why named volumes.** A tmpfs-backed *named* volume is shared between containers. A per-service `tmpfs:` entry would give each container a private copy, which is what the agent's `/tmp` wants.
   - **`nocopy: true`.** It stops Docker copying image contents into a fresh volume. Some engines also copy the image directory's owner and mode even when it is empty, so step 8 checks owner and mode at start.
 - **State volumes.** `pep-state` and the other `*-state` volumes are on disk, not tmpfs, so the journal and the tool servers' dedupe stores survive restarts. They take their owner and mode from the image's directory on first use, which step 8 checks.
-- **The log volume (RV3 B4).** `pep-log` is a size-capped tmpfs that the oracle reads through a read-only mount. It survives a PEP container restart, which the restart tests need, but not a host reboot. `pep-state` stays private to the PEP.
+- **The log volume (RV3 B4, corrected after RV4 #10).** `pep-log` is a size-capped tmpfs that the `oracle` service reads through a read-only mount.
+  - Docker's local driver unmounts a tmpfs volume when the last container using it stops. So the 3 Nov claim that it "survives a PEP container restart" was wrong: `docker kill` and `docker restart` of the PEP alone emptied it, and C-OUT's restart test then had no `allow` record for the oracle to join.
+  - It survives because the long-lived `oracle` service, which starts first and stays up for the whole run, also mounts it. It does not survive a host reboot.
+  - `pep-state` stays private to the PEP.
 - **The injector (RV3 D2).** The stub broker's test-only mode writes each Call Proof it receives to `broker-state`. The `injector` service, in the `gate1` profile, replays them through the broker socket as uid 20002. It and that mode exist only for G3.
 - **Images:**
   - a real `/run` owned by root and not a symlink, because `bind_safe_listener` checks every ancestor;
   - B1 decides between static musl and a glibc-matched base.
 - **The AF_UNIX-only seccomp profile** (`seccomp-unix-only.json`). Docker's default profile, minus every socket family except `AF_UNIX`. It applies to the agent, the PEP, the operator and the probe; the broker and the tool servers need inet and keep Docker's default. The denial returns `EAFNOSUPPORT` rather than killing the process, so SDKs fail cleanly.
+  - **Compat syscalls (RV4 #6).** Docker's default profile allows `socketcall` unconditionally, and allows the x86 sub-architecture on x86_64. With only the families removed, a static 64-bit binary using `int 0x80` created AF_INET, AF_NETLINK and AF_VSOCK sockets under `network_mode: none`, as uid 20001 with no capabilities. AF_VSOCK is outside the network namespace: a connect to host CID 2 got `ECONNRESET` from the far side.
+  - So the profile removes `socketcall`, and empties x86_64's `subArchitectures` (x86 and x32). The reviewer verified that `int 0x80` then dies with SIGSYS, and native families still get `EAFNOSUPPORT`.
+  - This machine's kernel has `CONFIG_IA32_EMULATION=y`, `CONFIG_X86_X32_ABI=y`, `CONFIG_VSOCKETS=y` and `CONFIG_HYPERV_VSOCKETS=y`, and `/dev/vsock` is mode 0666 (Appendix A). So the x32 ABI is a third route, which the empty `subArchitectures` also closes. C-NET sweeps all three.
 - **Agent limits.** `pids_limit`, `mem_limit` and a private, size-capped `/tmp` (RV2). The root filesystem stays read-only.
 - **Secrets:**
-  - Compose ignores `uid`, `gid` and `mode` on file secrets [80], so the broker credential is a host file that is already 0400 and owned by 20003, bind-mounted read-only into the broker only. The broker refuses to start unless the file holds only base64 characters, with no trailing newline;
-  - the tool servers get only its verifier, `broker-credential.sha256` (0400, owned by 20005), bind-mounted read-only, so no tool server can present the credential itself;
+  - Compose ignores `uid`, `gid` and `mode` on file secrets [80], so each tool server's credential (`broker-credential-a`, `broker-credential-b`) is a host file that is already 0400 and owned by 20003, bind-mounted read-only into the broker only (RV4 #7). The broker refuses to start unless the file holds only base64 characters, with no trailing newline;
+  - each tool server gets only its own verifier (`broker-credential-a.sha256`, owned by 20005, or `broker-credential-b.sha256`, owned by 20008; 0400), bind-mounted read-only, and sits on its own network. A server sees only its own credential, on its own calls, so even after capturing it, it can present it only to itself;
   - the PEP's own keys are per-boot (R1), so they need no secret.
 - **Host user 20004.** The operator uid is new. SPEC §1 gains it in step 2.
 
@@ -1283,13 +1354,14 @@ networks:
   - **Week 3:** "SQLite replaces the Week 2 journal; reconciliation replaces the Week 2 `NeedsReconcile` entity check". *Applied.*
 
 **CLAUDE.md:**
-- **§2 (once `compose.yaml` exists):** add `docker compose config --quiet` to the loop. *Waits for step 8.*
+- **§2 (once `compose.yaml` exists):** add `PEP_SECRETS_DIR=/nonexistent docker compose config --quiet` to the loop, and the same step to CI. `config` only interpolates, and fails when the variable is unset, as it is in CI, so a dummy value is enough (RV4 #16). *Waits for step 8.*
 - **§3, new rule "Binaries":** "Binaries log with `writeln!` to a locked `stderr` handle and return `std::process::ExitCode` from `main`. `print_stdout`, `print_stderr` and `exit` stay denied. Never log raw tokens, proofs or keys." *Applied*, headed `Binaries (print_stdout, print_stderr and exit = "deny")`, and with "keys or credentials": §2a's log rule also excludes credentials, and step 7 adds the broker's.
-- **Two-Phase Budget, append (R1 (a)):** "Journal each payment reservation when it is made, and fsync its `forwarded` record and the call's F-08 taint and F-09 ratchet records before the call is forwarded. At boot, truncate a torn tail under the journal lock; reservations forwarded without a final outcome return as `NeedsReconcile`, keyed by their original (eid, rid), and count against their intent." *Applied*, with "reservations forwarded with no outcome, or with outcome unknown" in place of "without a final outcome", which could be read as excluding `unknown` (R1 restores both as `NeedsReconcile`).
+- **Two-Phase Budget, append (R1 (a)); amended 2026-11-04 after RV4 #4, and the section is now headed F-10 (RV4 #21):** "Journal each payment reservation when it is made, and fsync its `forwarded` record and the call's F-08 taint and F-09 ratchet records before the call is forwarded. At boot, truncate a torn tail under the journal lock; reservations forwarded without a final outcome return as `NeedsReconcile`, keyed by their original (eid, rid), and count against their intent." *Applied*, with "reservations forwarded with no outcome, or with outcome unknown" in place of "without a final outcome", which could be read as excluding `unknown` (R1 restores both as `NeedsReconcile`).
 - **F-11/F-12, append:** "Before unlinking or binding, take an exclusive `File::try_lock` on `<socket>.lock`, opened with `O_NOFOLLOW | O_NONBLOCK` (from `nix::libc`, through `custom_flags`), created with `create_new` and set to exactly 0600, and checked by fstat (regular file, mode 0600, owner euid, `nlink` 1). Hold it for the listener's lifetime, and never remove the lock file." (Updated in step 5 with `O_NONBLOCK`, the exact mode and the never-remove rule.) *Applied* ("created if absent with create_new and then set to exactly 0600").
-- **F-13, replace the second sentence:** "Agent connection threads never hold `HostAuthority`; they send an episode's actor messages that cannot express approve, trusted input, end or abort. `approve_step_up`, `record_trusted_input` and `end_episode` run only for control-socket messages from the operator uid. No agent message changes a reservation: an agent disconnect releases one only before its point of forwarding, and after that point a reservation ends only through the broker's explicit outcome or an upstream timeout." (Corrected after RV3 B1: the 3 Nov wording, "abort outcomes come only from the upstream leg", contradicted P1's own rows.) At step 10, also replace "(until the Week 2 lockfile pins full argument schemas)" with the rule the strict schemas set. *Applied*, plus RV3 F9's rule after the first sentence: "Inside the actor, only the host-message handler takes &HostAuthority; the agent-message handler's signature never does." Without it, dropping "code reachable from the agent socket never receives HostAuthority" would lose F-13's compile-time boundary. The step 10 parenthetical is unchanged until step 10.
+- **F-13, replace the second sentence; amended 2026-11-04 after RV4 #17 to name `release_unforwarded` and `settle`:** "Agent connection threads never hold `HostAuthority`; they send an episode's actor messages that cannot express approve, trusted input, end or abort. `approve_step_up`, `record_trusted_input` and `end_episode` run only for control-socket messages from the operator uid. No agent message changes a reservation: an agent disconnect releases one only before its point of forwarding, and after that point a reservation ends only through the broker's explicit outcome or an upstream timeout." (Corrected after RV3 B1: the 3 Nov wording, "abort outcomes come only from the upstream leg", contradicted P1's own rows.) At step 10, also replace "(until the Week 2 lockfile pins full argument schemas)" with the rule the strict schemas set. *Applied*, plus RV3 F9's rule after the first sentence: "Inside the actor, only the host-message handler takes &HostAuthority; the agent-message handler's signature never does." Without it, dropping "code reachable from the agent socket never receives HostAuthority" would lose F-13's compile-time boundary. The step 10 parenthetical is unchanged until step 10.
 - **F-16, replace:** "Only bytes built by `forward::tools_call_request` from the engine's canonical tool name and arguments, with a PEP-built `_meta`, are sent downstream; never the agent's wire bytes, id or `_meta`." *Applied.* Until step 7 it disagrees with `engine.rs`'s `canonical_request` doc and the engine test that step 7 inverts.
 - **§1:** no change, because D1 closed as B.
+- **F-04 (RV4 #21), applied 2026-11-04:** the `lenient-numbers` parenthetical now says the feature only widens the request profile, does not affect tool results, and is a test configuration.
 
 ## Out of scope (later weeks)
 - **Week 3:**
@@ -1323,17 +1395,17 @@ networks:
 - **Schedule.** RV2 sized the 31 Oct draft at two to three weeks of work. This draft adopts RV2's four cuts and adds the journal and RV3's fixes, so it is still more than one week, and step 7 is most of it. The order puts the security foundations first (steps 3–6), so a slip delays Gate 1 rather than weakening it.
   - **Cut list (RV3 D6),** in the order to apply it if the schedule slips, least Gate 1 impact first:
     1. the MCP conformance suite in CI (step 9) becomes optional;
-    2. J1 moves to Week 4: Week 2's results keep RFC 8785 rounding, and J1 (b) lands before Gate 2;
-    3. if the journal's fixes (RV3 A1, A9, B5) cannot close in time, Gate 1 runs under R1 (b). Its four journal attacks are dropped and the risk is recorded. That leaves exactly 50 attacks, so this cut uses up G1's whole margin.
+    2. J1 moves to Week 4: the agent-facing result bytes keep RFC 8785 rounding, and J1 (b) lands before Gate 2. Drift hashing keeps exact digits even then, through the definition profile, so #23 stays detected (RV4 #19, #13);
+    3. if the journal's fixes (RV3 A1, A9, B5) cannot close in time, Gate 1 runs under R1 (b). Its four journal attacks are dropped and the risk is recorded. That leaves 56 attacks, so this cut uses four of G1's ten-attack margin.
   - Week 3's SQLite store replaces the journal, so the journal is deliberately minimal.
 - **User namespaces.** Under userns-remap or rootless Docker, uids are translated, so `require_peer` must compare uids as the PEP's user namespace sees them. The cross-namespace test showed this: a peer with uid 1000 appeared as uid 0 to a listener in a user namespace that maps 1000 to 0 (Appendix A). Test on the actual runtime (AP's Q2).
 - **HTTP smuggling.** Only the strict parser stands between the agent and request smuggling. With one hop and F-16 forwarding only the PEP's own parse, a parser bug is a robustness failure rather than a bypass (RV3 A10), but it still blocks Gate 1, because the C-HTTP checks must pass.
 - **A young MCP revision.** 2026-07-28 is three months old, and SDKs and servers may diverge from it, for example on the `subscriptions/listen` reply or on `resultType`. The spec itself is ambiguous on whether a server-closed subscription also needs `notifications/cancelled`; both SDKs misread a server that sends it (M1). The TypeScript SDK v2 still defaults to the 2025 handshake (D2). Re-check the Appendix A pages before Gate 1.
 - **Restarts.**
-  - Under R1 (a), a restart keeps budgets, taint and the ratchet, but voids every token, so the operator must start episodes again, each in a fresh agent process (E1).
+  - Under R1 (a), a restart keeps budgets, taint and the ratchet, but voids every token, so the operator must start episodes again, each in a fresh agent container (E1).
   - Under R1 (b), a restart refunds every budget, forgets every `NeedsReconcile` and in-flight payment, forgets agent-write taint, and resets the confidentiality ratchet. That is an accepted Gate 1 risk, in those words.
 - **Step-up timeouts.** Approvals that take longer than 45 s fail in Week 2, because the step-up wait plus the upstream call must stay under the TypeScript SDK's 60 s (P1).
-- **Journal throughput.** One fsync per call, with group commit, puts disk latency on the payment and write path. G4 measures it (O1); if it breaks 25 ms, the fallback is a larger group-commit window, not skipping the fsync.
+- **Journal throughput.** One fsync per call, with group commit, puts disk latency on the payment and write path. G4 measures it (O1); if it breaks 25 ms, the fallback is `sync_data` (fdatasync) on a preallocated journal file, or a faster disk, never skipping the fsync. A larger group-commit window would raise each commit's latency instead (RV4 #15).
 - **Result fidelity.** JavaScript agents round big integers themselves, whatever J1 decides, and NFD strings cannot round-trip through the PEP (F-05).
 - **The seccomp profile.** Blocking non-`AF_UNIX` sockets may break an SDK, or a library in the PEP's image, that opens an inet socket at start-up. The profile returns `EAFNOSUPPORT`, so such failures are visible.
 - **Kernel drift.** CI's runner kernel (7.0, azure) is newer than this machine's (6.18.54) (Q1). Tests branch on version and record `uname -r`. `ubuntu-latest` moves to Ubuntu 26.04 in November 2026 [99]. CI pins `ubuntu-24.04`, so a kernel change there is a deliberate edit.
@@ -1544,7 +1616,7 @@ The stand-in, the clients and their pinned SDKs are in `spikes/d2-transport/`, a
 - `full_backlog_counts_as_live` is `#[ignore]`d (peercred.rs:575), and ci.yml's `ignored-tests` job raises `ulimit` for it;
 - `lenient-numbers` switches the request profile to `EcmaSafe` (jcs.rs:29-32).
 
-**Week 1 verified plan:** "pep-sidecar Week 1_ Verified Plan and Partial Rust Code for JCS, Policy Engine and Peer Credentials" is at `C:\Users\mitam\AI & Cybersecurity\`, not in the parent folder. Its "Appendix: Gate 1 containment testbed (outline)" (lines 231–245) lists:
+**Week 1 verified plan:** "pep-sidecar Week 1_ Verified Plan and Partial Rust Code for JCS, Policy Engine and Peer Credentials" is on the author's machine, outside this repo and its parent folder. Its "Appendix: Gate 1 containment testbed (outline)" (lines 231–245) lists:
 - TCP egress from uid 20001;
 - UDP/53 and DoH;
 - IPv6;
@@ -1585,11 +1657,17 @@ The stand-in, the clients and their pinned SDKs are in `spikes/d2-transport/`, a
 | The Compose reference [80] | File-secret `uid`, `gid` and `mode` are silently ignored; `network_mode` excludes `networks`; `volume.nocopy` |
 | The Python SDK v2 transports page [26] | httpx2; no Unix-socket mention; custom transports allowed |
 
+**RV4 checks (2026-11-04).**
+- *Engine claims*, re-checked against `src/` before the fixes: `one_lookup_funds_one_payment` asserted two `Held` payments on one invoice as correct; `abort` takes `&HostAuthority` and accepts any `Held` reservation, with no forwarded state; `MAX_RECORDS` was checked only in `record_result_raw`, after the guards; and `lenient-numbers` changes only `REQUEST_NUMBERS` (`src/jcs.rs:29-32`). #1 and #18 are fixed in `fc3b620`.
+- *This machine's kernel* (6.18.54.1-microsoft-standard-WSL2): `CONFIG_IA32_EMULATION=y`, `CONFIG_X86_X32_ABI=y`, `CONFIG_VSOCKETS=y` and `CONFIG_HYPERV_VSOCKETS=y`; `/dev/vsock` is mode 0666 and `hv_sock` is loaded; Yama is built in with `ptrace_scope` 1. So RV4 #6's 32-bit and vsock routes exist here, and the x32 ABI is a third one.
+- *RV4's container checks of steps 4 and 5* (on §4's tmpfs volume, with that day's `bind_safe_listener` and a prototype lock): the volume is accepted; the peer shows pid 0, with `Pid: 0` while it lives and `Pid: -1` after it exits; gid 20009 is visible; a second instance gets `WouldBlock`; and the agent gets `EACCES` both on the lock file and when planting a file.
+- *CI* (`ubuntu-24.04`, kernel 7.0.0-1017-azure): every Week 2 branch's run passed on 2026-11-04, the root-only tests and the cross-namespace test included, once `9459802` let that test run as root.
+
 ## Appendix B. To re-confirm
 
 | Item | Why it is open | Settled at |
 |---|---|---|
-| Engines copying an image directory's owner and mode into an empty volume (RV, from moby [84][85]); `*-state` volumes taking the image's owner | Docker is not installed yet: step 1 needs your sudo | Step 8 |
+| Engines copying an image directory's owner and mode into an empty volume (RV, from moby [84][85]); `*-state` volumes taking the image's owner | Docker is installed (step 1), but the check needs step 8's images | Step 8 |
 | Whether the MCP conformance suite can run against the PEP | It takes an HTTP URL, its scenarios may need fixture tools, and the bridge must attach an Episode Token to `tools/list` and `tools/call` (RV3 D5) | Step 9 |
 | Source [65] | No reachable mirror; the plan does not rely on it | — |
 
@@ -1703,7 +1781,7 @@ Settled on 2026-11-03 and removed from this table (Appendix A):
 |---|---|
 | A1 restored reservation ids collide | R1 (restored set keyed by (eid, rid)); §2a ledger restore and reconcile check; C-OUT |
 | A2 episode identity and concurrency | E1 (fresh eid, one live episode per intent); §2a control protocol; C-CTL; §6 SPEC §3.3 |
-| A3 the F-09 ratchet resets | R1 (journaled per intent); E1 (one agent process per episode); §2a ledger restore; C-OUT; §6 SPEC §3.3 |
+| A3 the F-09 ratchet resets | R1 (journaled per intent); E1 (one agent process per episode, now one container: RV4 #3); §2a ledger restore; C-OUT; §6 SPEC §3.3 |
 | A4 quarantine checked only at evaluation | P1 (re-check before forwarding); §2a `recheck_before_forward`; §3 step-up timing case |
 | A5 drift fails open on a failed poll | L1 (poll deadline, failed-poll quarantine, permanent quarantine, T arithmetic); mutations 26–27 |
 | A6 the oracle: restart joins, rewritten arguments, ambiguous ids | §2a decision logs (two records, ULID ids, `pep-log`) and bypass oracle (digest-mismatch rule) |
@@ -1880,6 +1958,32 @@ Settled on 2026-11-03 and removed from this table (Appendix A):
 | The items MG skipped: crate choice, kernel checks, the old step ordering | Unchanged: p256 only, JWS and DSSE hand-rolled; Q1; §2 |
 | MG's checks of the Week 1 report: N1 and `/run/pep` before start were kept; eBPF was skipped | N1; §4; the eBPF skip is corrected |
 | The merged build order | §2 (reordered per RV2) |
+
+**RV4 (2026-11-04).** Each finding, and where it went:
+
+| # | Finding | Disposition |
+|---|---|---|
+| 1 | A second payment while the first is in flight; the cross-intent set is a snapshot | Engine: `PaymentPending` (`fc3b620`). §2a pending-payment check, with the shared set in step 7; `per_entity_max_uses: 1` for invoice intents (config); C-ENG +2 |
+| 2 | A quarantined server's lookups still fund payments | §2a witness servers (`WitnessQuarantined`); P1 re-check; mutation #28 |
+| 3 | A fresh process is not a boundary, and the ratchet is per intent | E1: one container per episode; SPEC §3.3; §4 `run --rm`; C-OUT +1 |
+| 4 | The ratchet rises after forwarding | R1: a rise is durable before the reply that depends on it; CLAUDE.md Two-Phase Budget |
+| 5 | A restart lifts quarantine; no poll before serving; the ledger key | R1 quarantine records and boot order; L1; the ledger is keyed by intent name; SPEC §1 |
+| 6 | The seccomp profile is bypassable through `socketcall` and compat syscalls | §4 profile; N1; C-NET +1; C-POSTURE +1; Appendix A kernel facts |
+| 7 | One credential lets a tool server pay through another | One credential, verifier, uid and network per server (§2a, §4, step 7); SPEC §1; C-CRED +1 |
+| 8 | Confidentiality launders through short values | L1 store-reader rule; the stub `search_notes`; C-ENG +1 |
+| 9 | One failed poll quarantines every server | L1: `Suspended` and `Quarantined`; one poller per server; reserved broker capacity |
+| 10 | `pep-log` is destroyed when the PEP stops | §4 `oracle` service; the log note corrected; C-POSTURE +1 |
+| 11 | SDK-internal `tools/list` cannot carry `_meta` | D2 and M1: `Pep-Episode` alone on `tools/list`; SPEC §3.3; a token-enforcing spike run in step 7; C-MCP +1 |
+| 12 | The broker has no lockfile | §2a broker config, static routes and restart order; §4 mounts; SPEC §1 |
+| 13 | `pins` cannot be parsed as specified | §2a config and jcs: the definition profile; SPEC §2; C-JSON +1 |
+| 14 | G3's concurrency class cannot run in Compose | In-process in step 6 (`concurrent_replays_admit_exactly_once`); §3 Replays |
+| 15 | O1: 42 episodes; queueing excluded; the group-commit fallback | O1, still OPEN: agent-side minus tool time; 42 episodes; Risks: `sync_data` on a preallocated file |
+| 16 | `docker compose config` fails without `PEP_SECRETS_DIR` | §6: a dummy value |
+| 17 | A1 and the F-13 wording contradict P1 | §2a `Forwarded`, `release_unforwarded` and `settle`; P1 watcher; A1; CLAUDE.md F-13; a C-OUT check |
+| 18 | Calls still execute at `MAX_RECORDS` | Engine: `RecordsExhausted` (`fc3b620`) |
+| 19 | Cut-list item 2 breaks G2 | Risks: drift hashing keeps exact digits |
+| 20 | Stale or wrong details | Appendix B; step 10 and #23; A1's registry; U1 rows 0a and 0b; C-LOCK (fixed in step 5); step 9's images; the user path scrubbed here and in `reports/` and `research_notes/`. The duplicate `WEEK2_PLAN.md` upload is outside this repo |
+| 21 | CLAUDE.md: F-04, the F-id gap, the unapplied wording | CLAUDE.md F-04 and Two-Phase Budget (F-10); §6 was applied in `9147e1f` |
 
 ## Sources
 Sources [1]–[65] are carried from AP. All were re-checked on 2026-11-03 (Appendix A). [65] could not be reached, and the notes after [5], [20], [21], [22], [31], [44] and [51] record what the re-check found.
