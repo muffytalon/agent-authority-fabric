@@ -1086,8 +1086,12 @@ pub struct Allowed {
     pub call_id: String,
     /// `action_digest` of the call.
     pub action_digest: String,
-    /// The only bytes that may be forwarded downstream.
-    pub canonical_request: Vec<u8>,
+    /// The canonical tool name. With `arguments`, the only input to the forwarded request
+    /// ([`crate::forward::tools_call_request`], F-16): the agent's id and `_meta` never leave
+    /// the PEP.
+    pub tool: String,
+    /// The canonical arguments, the same value `action_digest` hashes.
+    pub arguments: JcsValue,
     /// The payment ticket, for payment tools.
     pub reservation: Option<Ticket>,
     /// Origin hashes of the payment's witness leaves.
@@ -1101,8 +1105,10 @@ pub struct PendingApproval {
     pub call_id: String,
     /// `action_digest` of the call.
     pub action_digest: String,
-    /// The bytes to forward once approved.
-    pub canonical_request: Vec<u8>,
+    /// The canonical tool name, to forward once approved (F-16).
+    pub tool: String,
+    /// The canonical arguments, to forward once approved.
+    pub arguments: JcsValue,
     /// Reservation id to pass to [`PepEngine::approve_step_up`].
     pub reservation_id: u64,
     /// Amount in minor units.
@@ -1250,7 +1256,6 @@ struct Plan {
     call_id: String,
     tool: String,
     action_digest: String,
-    canonical_request: Vec<u8>,
     arguments: JcsValue,
     store_key: Option<StoreKey>,
     payment: Option<PaymentPlan>,
@@ -1607,7 +1612,6 @@ impl PepEngine {
             call_id: canon.call_id,
             tool: name.to_owned(),
             action_digest: canon.action_digest,
-            canonical_request: call.request.to_canonical_bytes(),
             arguments: canon.arguments.clone(),
             store_key: canon.store_key,
             payment,
@@ -1625,7 +1629,6 @@ impl PepEngine {
             call_id,
             tool,
             action_digest,
-            canonical_request,
             arguments,
             store_key,
             payment,
@@ -1675,7 +1678,8 @@ impl PepEngine {
                     Decision::StepUpRequired(PendingApproval {
                         call_id: call_id.clone(),
                         action_digest: action_digest.clone(),
-                        canonical_request,
+                        tool: tool.clone(),
+                        arguments: arguments.clone(),
                         reservation_id: payment.reservation_id,
                         amount_minor: payment.amount,
                         prov,
@@ -1684,7 +1688,8 @@ impl PepEngine {
                     Decision::Allow(Allowed {
                         call_id: call_id.clone(),
                         action_digest: action_digest.clone(),
-                        canonical_request,
+                        tool: tool.clone(),
+                        arguments: arguments.clone(),
                         reservation: Some(Ticket {
                             reservation_id: payment.reservation_id,
                             idempotency_key: idempotency_key(
@@ -1700,7 +1705,8 @@ impl PepEngine {
             None => Decision::Allow(Allowed {
                 call_id: call_id.clone(),
                 action_digest: action_digest.clone(),
-                canonical_request,
+                tool: tool.clone(),
+                arguments: arguments.clone(),
                 reservation: None,
                 prov,
             }),
@@ -2810,6 +2816,8 @@ mod tests {
     use super::*;
 
     const EID: u128 = 0x0192_d4e0_7c3a_7b2e_9f10_3c4d_5e6f_7a8b;
+    /// A PEP-assigned upstream id (M1), as the transport would give a forwarded call.
+    const UPSTREAM_ID: &str = "01JBAE0Z1TFCQ9Y41W9NF6YYMB";
     const BILLING: &str = "billing://invoices";
     const NOTES: &str = "notes://agent";
     const PARTNER: &str = "https://partner.example/api";
@@ -3326,13 +3334,26 @@ mod tests {
             " {{ \"params\" : {{\"arguments\":{{\"memo\":\"{memo}\",\"currency\":\"USD\",\"amount\":30000,\"invoice_id\":\"INV-1001\"}},\"name\":\"pay_invoice\"}}, \"method\":\"tools/call\",\"id\":2,\"jsonrpc\":\"2.0\" }}"
         );
         let decision = allowed(engine.evaluate_raw(raw.as_bytes()));
+        assert_eq!(decision.tool, "pay_invoice");
+        let request = crate::forward::tools_call_request(
+            UPSTREAM_ID,
+            &decision.tool,
+            &decision.arguments,
+            "p",
+        )
+        .unwrap();
+        let text = String::from_utf8(request.body).unwrap();
+        // Canonical (sorted, NFC), with the PEP's own id rather than the agent's.
+        assert!(text.starts_with(&format!(
+            r#"{{"id":"{UPSTREAM_ID}","jsonrpc":"2.0","method":"tools/call""#
+        )));
+        assert!(text.contains(
+            "\"arguments\":{\"amount\":30000,\"currency\":\"USD\",\"invoice_id\":\"INV-1001\",\"memo\":\"caf\u{e9}\"}"
+        ));
         assert_eq!(
-            decision.canonical_request,
-            jcs::canonicalize(raw.as_bytes()).unwrap()
+            jcs::action_digest(&decision.tool, &decision.arguments),
+            decision.action_digest
         );
-        let text = String::from_utf8(decision.canonical_request).unwrap();
-        assert!(text.starts_with(r#"{"id":2,"jsonrpc":"2.0","method":"tools/call""#));
-        assert!(text.contains("caf\u{e9}"));
     }
 
     #[test]
@@ -5088,12 +5109,42 @@ mod tests {
                 "{member}"
             );
         }
-        let meta = format!(r#"{{"{EPISODE_META_KEY}":"eyJ.token","progressToken":7}}"#);
-        let decision = allow(&mut engine, &request_with_meta(2, &meta));
+    }
+
+    /// RV3 C1, inverted from the Week 1 test that asserted the opposite: the Episode Token,
+    /// and everything else the agent put in `_meta` or the id, never leaves the PEP.
+    #[test]
+    fn episode_token_never_leaves_the_pep() {
+        let mut engine = engine();
+        let meta = format!(
+            r#"{{"{EPISODE_META_KEY}":"eyJ.secret-token","progressToken":7,"io.modelcontextprotocol/logLevel":"debug"}}"#
+        );
+        let decision = allow(&mut engine, &request_with_meta(424_242, &meta));
+        let request = crate::forward::tools_call_request(
+            UPSTREAM_ID,
+            &decision.tool,
+            &decision.arguments,
+            "p",
+        )
+        .unwrap();
+        let body = String::from_utf8(request.body).unwrap();
+        for leaked in [
+            EPISODE_META_KEY,
+            "eyJ.secret-token",
+            "progressToken",
+            "logLevel",
+            "424242",
+        ] {
+            assert!(
+                !body.contains(leaked),
+                "{leaked} reached the upstream body: {body}"
+            );
+        }
         assert!(
-            String::from_utf8(decision.canonical_request)
-                .unwrap()
-                .contains(EPISODE_META_KEY)
+            request
+                .headers
+                .iter()
+                .all(|(_, value)| !value.contains("secret-token"))
         );
     }
 
