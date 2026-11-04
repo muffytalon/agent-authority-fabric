@@ -4,6 +4,8 @@
 //! - [`jcs`] parses wire bytes with the JCS-strict-NFC profile and computes digests.
 //! - [`engine`] runs the nine-guard pipeline, the two-phase budget and the taint labels.
 //! - `peercred` (Linux and macOS) checks peer credentials and binds the socket safely.
+//! - [`tokens`] signs and verifies the Episode Token and the Call Proof, and keeps the replay
+//!   cache.
 //!
 //! The architecture is specified in `SPEC.md`; the Week 1 design is in `WEEK1_PLAN.md`.
 #![forbid(unsafe_code)]
@@ -12,3 +14,4 @@ pub mod engine;
 pub mod jcs;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod peercred;
+pub mod tokens;
