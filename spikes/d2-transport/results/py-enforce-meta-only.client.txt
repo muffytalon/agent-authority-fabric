@@ -1,0 +1,4 @@
+unlisted call raised: MCPError: PEP_DENIED
+call from a recreated client raised: MCPError: PEP_DENIED
+stale call (-32020, then re-list and resend) raised: MCPError: Header mismatch
+client closed cleanly

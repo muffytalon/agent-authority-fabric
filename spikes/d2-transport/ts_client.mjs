@@ -54,6 +54,22 @@ async function main() {
     console.log('client closed cleanly');
     return;
   }
+  if (scenario === 'enforce-header' || scenario === 'enforce-meta-only') {   // RV4 #11, against the stand-in's `enforce`
+    const headers = scenario === 'enforce-header' ? { requestInit: { headers: { 'Pep-Episode': TOKEN } } } : {};
+    const meta = { 'dev.pep-sidecar/episode': TOKEN };
+    const call = async (label, name, invoice) => {      // a fresh client each time: nothing listed yet
+      const { client, transport } = makeClient(pin, viaUndici, headers);
+      await client.connect(transport);
+      try { const r = await client.callTool({ name, arguments: { invoice_id: invoice }, _meta: meta }); console.log(`${label}: ${r.content[0].text} isError: ${r.isError}`); }
+      catch (e) { console.log(`${label} failed:`, e?.code ?? e?.name, String(e?.message).slice(0, 120)); }
+      await client.close();
+    };
+    await call('unlisted call', 'get_invoice', 'INV-1');
+    await call('call from a recreated client', 'get_invoice', 'INV-2');
+    await call('stale call (-32020, then re-list and resend)', 'stale', 'INV-3');
+    console.log('client closed cleanly');
+    return;
+  }
   if (scenario === 'listchanged') {                   // listChanged configured: does connect auto-open a subscription?
     const { client, transport } = makeClient({ ...pin, listChanged: { tools: { onChanged: () => console.log('  onChanged fired') } } }, viaUndici);
     await client.connect(transport);

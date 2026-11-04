@@ -1,8 +1,12 @@
 """MCP Python SDK v2 client over a Unix socket (httpx2 AsyncHTTPTransport(uds=...)).
 
-Usage: py_client.py SOCKET [token]
+Usage: py_client.py SOCKET [token|enforce-header|enforce-meta-only]
   token: attach a test Episode Token as the Pep-Episode header on every request (client-wide
          headers) and as _meta["dev.pep-sidecar/episode"] on tools/list and tools/call.
+  enforce-header, enforce-meta-only (RV4 #11, against the stand-in's `enforce` variant): call
+         tools without listing them first, from a client recreated mid-episode, and through the
+         -32020 re-list path. enforce-header sends the token client-wide as Pep-Episode and in
+         _meta on tools/call; enforce-meta-only sends it in _meta only.
 """
 import sys
 import anyio, httpx2
@@ -30,4 +34,26 @@ async def main(sock: str, mode: str) -> None:
             await anyio.sleep(2)   # give any automatic re-listen a chance to show up in the server log
     print("client closed cleanly")
 
-anyio.run(main, sys.argv[1], sys.argv[2] if len(sys.argv) > 2 else "plain")
+async def enforce(sock: str, mode: str) -> None:
+    transport = httpx2.AsyncHTTPTransport(uds=sock)
+    headers = {"Pep-Episode": TOKEN} if mode == "enforce-header" else None
+    meta = {"dev.pep-sidecar/episode": TOKEN}
+    async with httpx2.AsyncClient(transport=transport, trust_env=False, headers=headers,
+                                  timeout=httpx2.Timeout(30.0, read=300.0)) as http:
+        async def call(label: str, name: str, invoice: str) -> None:
+            # A fresh Client each time: the first call of a session has never listed the tool.
+            async with Client(streamable_http_client("http://pep.local/mcp", http_client=http)) as client:
+                try:
+                    r = await client.call_tool(name, {"invoice_id": invoice}, meta=meta)
+                    print(f"{label}: {r.content[0].text} isError: {r.is_error}")
+                except Exception as e:  # report what the agent would see
+                    print(f"{label} raised: {type(e).__name__}: {str(e)[:120]}")
+        await call("unlisted call", "get_invoice", "INV-1")
+        await call("call from a recreated client", "get_invoice", "INV-2")
+        await call("stale call (-32020, then re-list and resend)", "stale", "INV-3")
+    print("client closed cleanly")
+
+if len(sys.argv) > 2 and sys.argv[2].startswith("enforce"):
+    anyio.run(enforce, sys.argv[1], sys.argv[2])
+else:
+    anyio.run(main, sys.argv[1], sys.argv[2] if len(sys.argv) > 2 else "plain")

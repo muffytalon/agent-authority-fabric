@@ -1,12 +1,19 @@
 """Test-only stand-in for the PEP's agent-facing MCP endpoint (WEEK2_PLAN M1 router) on a Unix socket.
 
-Usage: pep_standin.py SOCKET LOGFILE [plain|cancelled|hold] [202|400]
+Usage: pep_standin.py SOCKET LOGFILE [plain|cancelled|hold|enforce] [202|400]
   plain:     subscriptions/listen -> acknowledged (empty filter), then the completion result.
   hold:      acknowledged, then the completion result only after 5 s.
   cancelled: the same, with notifications/cancelled sent between the two (the spec's ambiguity).
+  enforce:   plain, but the Episode Token rule of M1 (as amended after RV4 #11) is enforced:
+             tools/call needs the token in _meta; tools/list takes it in _meta or as a
+             Pep-Episode header alone; a Pep-Episode header that differs from _meta gets
+             400/-32020; a missing or wrong token gets PEP_DENIED (-31403, HTTP 200).
   202|400:   the status for notification POSTs (the plan's U1 says 400).
-The tool `slow` answers after 3 s, to provoke a client-side timeout.
-It logs every request and the M1 header/_meta checks, but answers regardless, to observe client behaviour.
+The tool `slow` answers after 3 s, to provoke a client-side timeout. The tool `stale` answers
+400/-32020 the first time it is called, to provoke the SDKs' re-list-and-retry path.
+Without `enforce`, it logs every request and the M1 header/_meta checks, but answers regardless,
+to observe client behaviour. Every executed tools/call is logged, so a denial that follows an
+execution shows in order.
 """
 import json, socketserver, sys, time
 from http.server import BaseHTTPRequestHandler
@@ -15,6 +22,8 @@ SOCK, LOGFILE = sys.argv[1], sys.argv[2]
 VARIANT = sys.argv[3] if len(sys.argv) > 3 else "plain"
 NOTIFY_STATUS = int(sys.argv[4]) if len(sys.argv) > 4 else 202
 LOG = open(LOGFILE, "a", buffering=1)
+TOKEN = "eyJ.spike.token"   # the test token the clients send; `enforce` accepts exactly this
+STALE_SEEN = set()          # ids of `stale` calls already answered with -32020
 TOOL = {"name": "get_invoice", "description": "Look up an invoice.",
         "inputSchema": {"type": "object", "properties": {"invoice_id": {"type": "string"}},
                         "required": ["invoice_id"], "additionalProperties": False}}
@@ -82,6 +91,23 @@ class Handler(BaseHTTPRequestHandler):
         if problems:
             log(kind="m1-check", method=method, problems=problems)
 
+        if VARIANT == "enforce" and method in ("tools/list", "tools/call"):
+            header, in_meta = hdr.get("pep-episode"), meta.get("dev.pep-sidecar/episode")
+            if header is not None and in_meta is not None and header != in_meta:
+                log(kind="enforce", method=method, id=rid, verdict="-32020: Pep-Episode differs from _meta")
+                self._send(400, json.dumps({"jsonrpc": "2.0", "id": rid,
+                                            "error": {"code": -32020, "message": "Header mismatch"}}).encode())
+                return
+            token = in_meta if method == "tools/call" else (in_meta if in_meta is not None else header)
+            if token != TOKEN:
+                where = "no token in _meta" if method == "tools/call" else "no token in _meta or Pep-Episode"
+                log(kind="enforce", method=method, id=rid, verdict=f"PEP_DENIED: {where}")
+                self._send(200, json.dumps({"jsonrpc": "2.0", "id": rid,
+                                            "error": {"code": -31403, "message": "PEP_DENIED"}}).encode())
+                return
+            log(kind="enforce", method=method, id=rid,
+                verdict="allow (" + ("_meta" if in_meta is not None else "Pep-Episode header alone") + ")")
+
         if method == "subscriptions/listen":
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
@@ -111,11 +137,19 @@ class Handler(BaseHTTPRequestHandler):
             result = {"resultType": "complete", "supportedVersions": ["2026-07-28"],
                       "capabilities": {"tools": {}}, "ttlMs": 0, "cacheScope": "public"}
         elif method == "tools/list":
-            result = {"resultType": "complete", "tools": [TOOL], "ttlMs": 0, "cacheScope": "private"}
+            tools = [TOOL, {**TOOL, "name": "stale", "description": "Answers -32020 once."}] if VARIANT == "enforce" else [TOOL]
+            result = {"resultType": "complete", "tools": tools, "ttlMs": 0, "cacheScope": "private"}
+        elif method == "tools/call" and params.get("name") == "stale" and "stale" not in STALE_SEEN:
+            STALE_SEEN.add("stale")
+            log(kind="stale-32020", method=method, id=rid)
+            self._send(400, json.dumps({"jsonrpc": "2.0", "id": rid,
+                                        "error": {"code": -32020, "message": "Header mismatch"}}).encode())
+            return
         elif method == "tools/call" and params.get("name") == "slow":
             time.sleep(3)
             result = {"resultType": "complete", "isError": False, "content": [{"type": "text", "text": "slow done"}]}
         elif method == "tools/call":
+            log(kind="executed", method=method, id=rid, tool=params.get("name"))
             result = {"resultType": "complete", "isError": False,
                       "content": [{"type": "text", "text": f"invoice {params.get('arguments', {}).get('invoice_id')}"}]}
         else:
