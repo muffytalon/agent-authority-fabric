@@ -193,10 +193,11 @@ pub enum PolicyError {
     /// from executing with no result the engine can record (RV4 #18).
     #[error("episode records exhausted")]
     RecordsExhausted,
-    /// A payment to the same entity is still unresolved: a `NeedsReconcile` reservation blocks
-    /// every payment to its entity (P1), and a `Held` or `AwaitingStepUp` one also blocks
-    /// another amount-bound payment, which would pay the same invoice twice under a different
-    /// idempotency key (RV4 #1).
+    /// A payment to the same entity is still unresolved. An entity in the PEP-wide unresolved
+    /// set (a `NeedsReconcile` reservation of any episode, or one restored at boot, R1) blocks
+    /// every payment to it (P1), and a `Held`, `AwaitingStepUp` or `Forwarded` reservation
+    /// also blocks another amount-bound payment, which would pay the same invoice twice under a
+    /// different idempotency key (RV4 #1).
     #[error("a payment to this entity is pending")]
     PaymentPending,
     /// The inputs are more confidential than the destination allows.
@@ -239,6 +240,10 @@ pub enum ConfigError {
     /// trailing `/`), so one record could be tainted under one name and read under the other.
     #[error("pinned stores overlap")]
     OverlappingStores,
+    /// The restored ledger is inconsistent: its unresolved amounts overflow, an entity is not
+    /// NFC, or a restored reservation belongs to the new episode's own id (R1, E1).
+    #[error("invalid ledger")]
+    InvalidLedger,
 }
 
 /// Errors from the label store.
@@ -587,12 +592,14 @@ pub struct LabelEntry {
 
 /// Cross-episode taint labels, shared by every [`PepEngine`] through `Arc`.
 pub trait LabelStore: Send + Sync + fmt::Debug {
-    /// Joins `entry.label` into the label stored under `index`.
+    /// Joins `entry.label` into the label stored under each of `indexes`: one call's F-08
+    /// entries, recorded together (RV3 A9). Atomic: on an error no index changes, so a
+    /// journal-backed store writes them as one record with one fsync.
     ///
     /// # Errors
     ///
     /// Returns a [`StoreError`] if the store is full, poisoned or unreachable.
-    fn record(&self, index: &TaintIndex, entry: LabelEntry) -> Result<(), StoreError>;
+    fn record_all(&self, indexes: &[TaintIndex], entry: LabelEntry) -> Result<(), StoreError>;
 
     /// The joined label stored under `index`, if any.
     ///
@@ -640,23 +647,28 @@ impl InMemoryLabelStore {
 }
 
 impl LabelStore for InMemoryLabelStore {
-    fn record(&self, index: &TaintIndex, entry: LabelEntry) -> Result<(), StoreError> {
+    fn record_all(&self, indexes: &[TaintIndex], entry: LabelEntry) -> Result<(), StoreError> {
         let mut entries = self.entries.lock().map_err(|_| StoreError::Poisoned)?;
-        if let Some(stored) = entries.get_mut(index) {
-            stored.label = stored.label.join(entry.label);
-            stored.writers.insert(entry.writer_episode);
-            return Ok(());
-        }
-        if entries.len() >= self.capacity {
+        // Capacity first, so a batch that does not fit changes nothing.
+        let new: BTreeSet<&TaintIndex> = indexes
+            .iter()
+            .filter(|index| !entries.contains_key(*index))
+            .collect();
+        if entries
+            .len()
+            .checked_add(new.len())
+            .is_none_or(|total| total > self.capacity)
+        {
             return Err(StoreError::CapacityExceeded);
         }
-        entries.insert(
-            index.clone(),
-            StoredLabel {
+        for index in indexes {
+            let stored = entries.entry(index.clone()).or_insert_with(|| StoredLabel {
                 label: entry.label,
-                writers: BTreeSet::from([entry.writer_episode]),
-            },
-        );
+                writers: BTreeSet::new(),
+            });
+            stored.label = stored.label.join(entry.label);
+            stored.writers.insert(entry.writer_episode);
+        }
         Ok(())
     }
 
@@ -934,7 +946,8 @@ pub struct Reservation {
 /// Two-phase payment budget.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Budget {
-    /// Total of `Held`, `AwaitingStepUp`, `Forwarded` and `NeedsReconcile` reservations.
+    /// Total of `Held`, `AwaitingStepUp`, `Forwarded` and `NeedsReconcile` reservations,
+    /// restored ones included.
     pub reserved: u64,
     /// Total of committed payments.
     pub committed: u64,
@@ -944,6 +957,9 @@ pub struct Budget {
     pub entity_uses: BTreeMap<String, u32>,
     /// Reservations by id.
     pub reservations: BTreeMap<u64, Reservation>,
+    /// Unresolved reservations of earlier episodes of the intent, by their original
+    /// (eid, rid). Apart from `reservations`, so a new id never overwrites one (RV3 A1).
+    pub restored: BTreeMap<(u128, u64), RestoredReservation>,
 }
 
 impl Budget {
@@ -956,6 +972,48 @@ impl Budget {
             calls: 0,
             entity_uses: BTreeMap::new(),
             reservations: BTreeMap::new(),
+            restored: BTreeMap::new(),
+        }
+    }
+}
+
+/// A payment of an earlier episode that the journal could not resolve (R1): forwarded with no
+/// outcome, or with outcome unknown. It counts in `reserved` and blocks its entity
+/// (`PaymentPending`), and it funds nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RestoredReservation {
+    /// The paid entity, NFC.
+    pub entity: String,
+    /// Reserved amount in minor units.
+    pub amount_minor: u64,
+}
+
+/// An intent's ledger, rebuilt from the journal at boot (R1). Every episode of the intent
+/// starts from it, so neither a restart nor a new episode refunds spend.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Ledger {
+    /// Committed spend in minor units.
+    pub committed_minor: u64,
+    /// Payment reservations made, released ones included (SPEC §3.1).
+    pub calls: u32,
+    /// Payments per entity (NFC), unresolved ones included.
+    pub entity_uses: BTreeMap<String, u32>,
+    /// Unresolved reservations, by their original (eid, rid).
+    pub unresolved: BTreeMap<(u128, u64), RestoredReservation>,
+    /// The intent's highest F-09 ratchet level (RV3 A3).
+    pub context_conf: Confidentiality,
+}
+
+impl Ledger {
+    /// The ledger of an intent with no journaled history.
+    #[must_use]
+    pub const fn empty() -> Self {
+        Self {
+            committed_minor: 0,
+            calls: 0,
+            entity_uses: BTreeMap::new(),
+            unresolved: BTreeMap::new(),
+            context_conf: Confidentiality::Public,
         }
     }
 }
@@ -1055,11 +1113,11 @@ pub struct EpisodeState {
 }
 
 impl EpisodeState {
-    fn new(intent: PepIntent) -> Self {
+    fn new(intent: PepIntent, budget: Budget, context_conf: Confidentiality) -> Self {
         Self {
             intent,
-            budget: Budget::empty(),
-            context_conf: Confidentiality::Public,
+            budget,
+            context_conf,
             records: BTreeMap::new(),
             next_seq: 1,
             leaf_index: BTreeMap::new(),
@@ -1217,7 +1275,7 @@ pub enum ServerState {
 
 /// Every pinned server's state, shared by all episodes. A server nobody has reported on is
 /// `Suspended`, so no tool is callable before its server's first matching poll.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ServerStates {
     states: RwLock<BTreeMap<String, ServerState>>,
 }
@@ -1225,8 +1283,10 @@ pub struct ServerStates {
 impl ServerStates {
     /// No server reported yet: every server is `Suspended`.
     #[must_use]
-    pub fn new() -> Self {
-        Self::default()
+    pub const fn empty() -> Self {
+        Self {
+            states: RwLock::new(BTreeMap::new()),
+        }
     }
 
     /// A poll matched the pins: the server serves again, unless it is quarantined.
@@ -1282,6 +1342,46 @@ impl ServerStates {
     }
 }
 
+/// The entities with an unresolved payment, PEP-wide (R1, RV4 #1). Two intents may name the
+/// same invoice, so every engine checks this set for every payment. Keyed by the NFC entity
+/// alone: an invoice id equal to a recipient id is blocked too, which fails closed. Week 2
+/// has no reconciliation, so entries stay until Week 3's replaces this set.
+#[derive(Debug)]
+pub struct UnresolvedEntities {
+    entities: RwLock<BTreeSet<String>>,
+}
+
+impl UnresolvedEntities {
+    /// No unresolved payment.
+    #[must_use]
+    pub const fn empty() -> Self {
+        Self {
+            entities: RwLock::new(BTreeSet::new()),
+        }
+    }
+
+    /// Marks `entity` as having an unresolved payment.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Poisoned`] if the lock was poisoned.
+    pub fn insert(&self, entity: &str) -> Result<(), StoreError> {
+        self.entities
+            .write()
+            .map_err(|_| StoreError::Poisoned)?
+            .insert(entity.to_owned());
+        Ok(())
+    }
+
+    /// Whether `entity` has an unresolved payment. A poisoned lock blocks every entity.
+    #[must_use]
+    pub fn contains(&self, entity: &str) -> bool {
+        self.entities
+            .read()
+            .map_or(true, |entities| entities.contains(entity))
+    }
+}
+
 /// The PEP-wide state that every episode's engine shares.
 #[derive(Debug, Clone)]
 pub struct Shared {
@@ -1289,6 +1389,8 @@ pub struct Shared {
     pub labels: Arc<dyn LabelStore>,
     /// Every pinned server's state (L1).
     pub servers: Arc<ServerStates>,
+    /// The entities with an unresolved payment (R1, RV4 #1).
+    pub unresolved: Arc<UnresolvedEntities>,
 }
 
 /// The policy enforcement engine for one episode.
@@ -1299,6 +1401,7 @@ pub struct PepEngine {
     state: EpisodeState,
     labels: Arc<dyn LabelStore>,
     servers: Arc<ServerStates>,
+    unresolved: Arc<UnresolvedEntities>,
 }
 
 struct RoleArgs<'a> {
@@ -1379,28 +1482,37 @@ struct LabelCtx<'a> {
 }
 
 impl PepEngine {
-    /// Builds the engine for one episode after validating the configuration.
+    /// Builds the engine for one episode of an intent, from the intent's journaled `ledger`
+    /// (R1), after validating the configuration. Only the host starts episodes, so it takes
+    /// [`HostAuthority`]: a fresh ledger would refund the intent's spend. `intent.episode_id`
+    /// is the episode's fresh eid (E1). The ledger's unresolved entities join the PEP-wide
+    /// set in `shared`.
     ///
     /// # Errors
     ///
-    /// Returns [`PepError::InvalidConfig`] for inconsistent limits, an invalid currency, an
-    /// unknown store, a trusted pointer outside `structuredContent`, a malformed binding, a tool
-    /// pinned under the wrong or a reserved name, a mutating-internal tool without a store
-    /// location, or overlapping pinned stores.
+    /// Returns [`PepError::InvalidConfig`] if the intent, the pins or the ledger is invalid,
+    /// or [`PepError::Store`] if the unresolved set is poisoned.
     pub fn new(
+        _host: &HostAuthority,
         mut intent: PepIntent,
         pins: ToolPins,
         seq: SeqPolicy,
         shared: Shared,
+        ledger: Ledger,
     ) -> Result<Self, PepError> {
         validate_config(&intent, &pins)?;
+        let (budget, context_conf) = restore_budget(intent.episode_id, ledger)?;
+        for restored in budget.restored.values() {
+            shared.unresolved.insert(&restored.entity)?;
+        }
         intent.entities.ids = intent.entities.ids.normalized();
         Ok(Self {
             pins,
             seq,
-            state: EpisodeState::new(intent),
+            state: EpisodeState::new(intent, budget, context_conf),
             labels: shared.labels,
             servers: shared.servers,
+            unresolved: shared.unresolved,
         })
     }
 
@@ -1785,7 +1897,8 @@ impl PepEngine {
         // 7. G_budget (computes the plan, applies nothing)
         let taint_writes = planned_writes(tool, canon.store_key.as_ref(), &canon.roles);
         let payment = payment_inputs(tool, amount, entity, witness.as_ref())?;
-        let (payment, label_quota_after) = g_budget(state, tool, payment, taint_writes.len())?;
+        let (payment, label_quota_after) =
+            g_budget(state, &self.unresolved, tool, payment, taint_writes.len())?;
 
         // 8. G_label
         let input = g_label(&*self.labels, state, tool, &canon, witness.as_ref())?;
@@ -1828,9 +1941,7 @@ impl PepEngine {
             label: write_label,
             writer_episode: episode_id,
         };
-        for index in &taint_writes {
-            self.labels.record(index, entry)?;
-        }
+        self.labels.record_all(&taint_writes, entry)?;
 
         let state = &mut self.state;
         state.label_quota_remaining = label_quota_after;
@@ -2029,12 +2140,14 @@ impl PepEngine {
     ///   in flight, so its result can still be recorded.
     /// - `Aborted(DefinitelyNotExecuted)` releases the reservation, its amount and its entity
     ///   use.
-    /// - `Aborted(Unknown)` makes it `NeedsReconcile`, still counted in `reserved` (fail closed).
+    /// - `Aborted(Unknown)` makes it `NeedsReconcile`, still counted in `reserved` (fail closed),
+    ///   and adds its entity to the PEP-wide unresolved set.
     ///
     /// # Errors
     ///
-    /// Returns [`PepError::UnknownReservation`] for an unknown id, or
-    /// [`PepError::InvalidTransition`] unless the reservation is `Forwarded`.
+    /// Returns [`PepError::UnknownReservation`] for an unknown id,
+    /// [`PepError::InvalidTransition`] unless the reservation is `Forwarded`, or
+    /// [`PepError::Store`] if the unresolved set is poisoned.
     pub fn settle(
         &mut self,
         _host: &HostAuthority,
@@ -2050,6 +2163,16 @@ impl PepEngine {
                 self.release(reservation_id)
             }
             Settlement::Aborted(AbortOutcome::Unknown) => {
+                // PEP-wide first: if that fails, nothing changes and the reservation stays
+                // `Forwarded`, still counted (fail closed); replay restores it as unresolved.
+                let entity = self
+                    .state
+                    .budget
+                    .reservations
+                    .get(&reservation_id)
+                    .map(|reservation| reservation.entity.clone())
+                    .ok_or(PepError::UnknownReservation)?;
+                self.unresolved.insert(&entity)?;
                 let call_id = self.set_state(reservation_id, ResState::NeedsReconcile)?;
                 self.state.in_flight.remove(&call_id);
                 Ok(())
@@ -2126,6 +2249,36 @@ impl PepEngine {
         self.state.in_flight.remove(&call_id);
         Ok(())
     }
+}
+
+/// The new episode's budget and starting ratchet level, from its intent's ledger (R1).
+fn restore_budget(
+    episode_id: u128,
+    ledger: Ledger,
+) -> Result<(Budget, Confidentiality), ConfigError> {
+    let is_nfc = |entity: &str| jcs::JcsString::new(entity).as_str() == entity;
+    let mut reserved: u64 = 0;
+    for (&(eid, _), restored) in &ledger.unresolved {
+        // A restored reservation under the new eid could share its F-07 key with a new one.
+        if eid == episode_id || !is_nfc(&restored.entity) {
+            return Err(ConfigError::InvalidLedger);
+        }
+        reserved = reserved
+            .checked_add(restored.amount_minor)
+            .ok_or(ConfigError::InvalidLedger)?;
+    }
+    if !ledger.entity_uses.keys().all(|entity| is_nfc(entity)) {
+        return Err(ConfigError::InvalidLedger);
+    }
+    let budget = Budget {
+        reserved,
+        committed: ledger.committed_minor,
+        calls: ledger.calls,
+        entity_uses: ledger.entity_uses,
+        reservations: BTreeMap::new(),
+        restored: ledger.unresolved,
+    };
+    Ok((budget, ledger.context_conf))
 }
 
 fn validate_config(intent: &PepIntent, pins: &ToolPins) -> Result<(), ConfigError> {
@@ -2750,6 +2903,7 @@ fn blocks_payment(reservation: &Reservation, tool: &ToolPolicy, entity: &str) ->
 
 fn g_budget(
     state: &EpisodeState,
+    unresolved: &UnresolvedEntities,
     tool: &ToolPolicy,
     payment: Option<PaymentInputs>,
     writes: usize,
@@ -2779,10 +2933,11 @@ fn g_budget(
     };
     let limits = &state.intent.limits;
     let budget = &state.budget;
-    if budget
-        .reservations
-        .values()
-        .any(|reservation| blocks_payment(reservation, tool, &entity))
+    if unresolved.contains(&entity)
+        || budget
+            .reservations
+            .values()
+            .any(|reservation| blocks_payment(reservation, tool, &entity))
     {
         return Err(fail(PolicyError::PaymentPending));
     }
@@ -3106,11 +3261,15 @@ mod tests {
     /// The shared state for a test engine: `labels`, with the fixture servers `a` (the
     /// default for every pinned tool), `b` and `sor` (a separate system of record) serving.
     fn serving(labels: Arc<dyn LabelStore>) -> Shared {
-        let servers = Arc::new(ServerStates::new());
+        let servers = Arc::new(ServerStates::empty());
         for server in ["a", "b", "sor"] {
             servers.set_serving(server).unwrap();
         }
-        Shared { labels, servers }
+        Shared {
+            labels,
+            servers,
+            unresolved: Arc::new(UnresolvedEntities::empty()),
+        }
     }
 
     fn tool(name: &str, effect: EffectClass, args: Vec<ArgSpec>) -> ToolPolicy {
@@ -3320,10 +3479,12 @@ mod tests {
 
     fn engine_on(shared: &Arc<InMemoryLabelStore>, ids: EntitySet, limits: Limits) -> PepEngine {
         PepEngine::new(
+            &HostAuthority::for_tests(),
             intent(ids, limits),
             pins(),
             SeqPolicy::Unconstrained,
             serving(shared.clone()),
+            Ledger::empty(),
         )
         .unwrap()
     }
@@ -3426,7 +3587,14 @@ mod tests {
     }
 
     fn config_error(intent: PepIntent, pins: ToolPins) -> ConfigError {
-        match PepEngine::new(intent, pins, SeqPolicy::Unconstrained, serving(store())) {
+        match PepEngine::new(
+            &HostAuthority::for_tests(),
+            intent,
+            pins,
+            SeqPolicy::Unconstrained,
+            serving(store()),
+            Ledger::empty(),
+        ) {
             Err(PepError::InvalidConfig(error)) => error,
             other => panic!("expected InvalidConfig, got {other:?}"),
         }
@@ -3493,10 +3661,12 @@ mod tests {
         let mut stale = pins();
         stale.release_epoch = 8;
         let mut engine = PepEngine::new(
+            &HostAuthority::for_tests(),
             intent(invoices(), limits("USD")),
             stale,
             SeqPolicy::Unconstrained,
             serving(store()),
+            Ledger::empty(),
         )
         .unwrap();
         assert_eq!(
@@ -3520,10 +3690,12 @@ mod tests {
         let shared = serving(store());
         let servers = shared.servers.clone();
         let engine = PepEngine::new(
+            &HostAuthority::for_tests(),
             intent(invoices(), limits("USD")),
             pins,
             SeqPolicy::Unconstrained,
             shared,
+            Ledger::empty(),
         )
         .unwrap();
         (engine, servers)
@@ -3565,16 +3737,19 @@ mod tests {
 
     #[test]
     fn a_server_never_polled_is_suspended() {
-        let servers = Arc::new(ServerStates::new());
+        let servers = Arc::new(ServerStates::empty());
         assert_eq!(servers.state("a"), ServerState::Suspended);
         let mut engine = PepEngine::new(
+            &HostAuthority::for_tests(),
             intent(invoices(), limits("USD")),
             pins(),
             SeqPolicy::Unconstrained,
             Shared {
+                unresolved: Arc::new(UnresolvedEntities::empty()),
                 labels: store(),
                 servers,
             },
+            Ledger::empty(),
         )
         .unwrap();
         assert_eq!(denied(engine.evaluate_raw(&ticket(1))), NOT_SERVING);
@@ -3582,7 +3757,7 @@ mod tests {
 
     #[test]
     fn a_poisoned_server_table_reads_as_quarantined() {
-        let servers = Arc::new(ServerStates::new());
+        let servers = Arc::new(ServerStates::empty());
         servers.set_serving("a").unwrap();
         let poisoner = servers.clone();
         let handle = std::thread::spawn(move || {
@@ -3622,10 +3797,12 @@ mod tests {
         let shared = serving(store());
         let servers = shared.servers.clone();
         let mut engine = PepEngine::new(
+            &HostAuthority::for_tests(),
             intent(recipients(), limits("USD")),
             sor_pins(),
             SeqPolicy::Unconstrained,
             shared,
+            Ledger::empty(),
         )
         .unwrap();
         servers.quarantine("sor").unwrap();
@@ -3708,16 +3885,19 @@ mod tests {
             &mut writer,
             &request(1, "save_note", r#"{"key":"k1","text":"x"}"#),
         );
-        let servers = Arc::new(ServerStates::new());
+        let servers = Arc::new(ServerStates::empty());
         servers.set_serving("a").unwrap();
         let mut reader = PepEngine::new(
+            &HostAuthority::for_tests(),
             intent(invoices(), limits("USD")),
             pins(),
             SeqPolicy::Unconstrained,
             Shared {
+                unresolved: Arc::new(UnresolvedEntities::empty()),
                 labels: shared,
                 servers: servers.clone(),
             },
+            Ledger::empty(),
         )
         .unwrap();
         allow(&mut reader, &request(1, "get_note", r#"{"key":"k1"}"#));
@@ -3734,10 +3914,12 @@ mod tests {
             let mut custom = pins();
             custom.tools.get_mut("get_ticket").unwrap().server_id = server.to_owned();
             PepEngine::new(
+                &HostAuthority::for_tests(),
                 intent(invoices(), limits("USD")),
                 custom,
                 SeqPolicy::Unconstrained,
                 serving(store()),
+                Ledger::empty(),
             )
         };
         for server in [
@@ -3768,10 +3950,12 @@ mod tests {
             (Some("get_invoice".to_owned()), "pay_invoice".to_owned()),
         ]);
         let mut engine = PepEngine::new(
+            &HostAuthority::for_tests(),
             intent(invoices(), limits("USD")),
             pins(),
             SeqPolicy::Transitions(transitions),
             serving(store()),
+            Ledger::empty(),
         )
         .unwrap();
         assert_eq!(
@@ -4157,10 +4341,12 @@ mod tests {
             .trusted_fields
             .insert("/structuredContent/details".to_owned());
         let mut engine = PepEngine::new(
+            &HostAuthority::for_tests(),
             intent(invoices(), limits("USD")),
             custom,
             SeqPolicy::Unconstrained,
             serving(store()),
+            Ledger::empty(),
         )
         .unwrap();
         allow(
@@ -4339,10 +4525,12 @@ mod tests {
             .trusted_fields
             .insert("/structuredContent/amount".to_owned());
         let mut engine = PepEngine::new(
+            &HostAuthority::for_tests(),
             intent(invoices(), limits("USD")),
             custom,
             SeqPolicy::Unconstrained,
             serving(store()),
+            Ledger::empty(),
         )
         .unwrap();
         allow(
@@ -4548,10 +4736,12 @@ mod tests {
         let shared = store();
         let engine_with = |pins: ToolPins| {
             PepEngine::new(
+                &HostAuthority::for_tests(),
                 intent(invoices(), limits("USD")),
                 pins,
                 SeqPolicy::Unconstrained,
                 serving(shared.clone()),
+                Ledger::empty(),
             )
             .unwrap()
         };
@@ -4826,10 +5016,12 @@ mod tests {
         let mut custom = pins();
         custom.tools.get_mut("get_ticket").unwrap().max_result_bytes = 16;
         let mut engine = PepEngine::new(
+            &HostAuthority::for_tests(),
             intent(invoices(), limits("USD")),
             custom,
             SeqPolicy::Unconstrained,
             serving(store()),
+            Ledger::empty(),
         )
         .unwrap();
         allow(
@@ -5423,6 +5615,343 @@ mod tests {
         assert_ne!(idempotency_key(0, 0x31, ""), idempotency_key(0, 0, "1"));
     }
 
+    // ---- Ledger restore and the PEP-wide unresolved set (R1, RV3 A1, A3, RV4 #1) ----
+
+    const OLD_EID: u128 = 0x0191_0000_0000_0000_0000_0000_0000_0001;
+
+    fn restored(entity: &str, amount_minor: u64) -> RestoredReservation {
+        RestoredReservation {
+            entity: entity.to_owned(),
+            amount_minor,
+        }
+    }
+
+    /// An episode of the invoice (or recipient) intent with eid `eid`, on `ledger`.
+    fn episode(
+        shared: &Shared,
+        ids: EntitySet,
+        eid: u128,
+        ledger: Ledger,
+    ) -> Result<PepEngine, PepError> {
+        let mut intent = intent(ids, limits("USD"));
+        intent.episode_id = eid;
+        PepEngine::new(
+            &HostAuthority::for_tests(),
+            intent,
+            pins(),
+            SeqPolicy::Unconstrained,
+            shared.clone(),
+            ledger,
+        )
+    }
+
+    #[test]
+    fn a_new_episode_starts_from_its_intent_ledger() {
+        let shared = serving(store());
+        let ledger = Ledger {
+            committed_minor: 420_000,
+            calls: 4,
+            entity_uses: BTreeMap::from([("rcpt_A".to_owned(), 2)]),
+            unresolved: BTreeMap::new(),
+            context_conf: Confidentiality::Internal,
+        };
+        let mut engine = episode(&shared, recipients(), EID, ledger.clone()).unwrap();
+        assert_eq!(engine.state().budget.committed, 420_000);
+        assert_eq!(engine.state().budget.reserved, 0);
+        assert_eq!(engine.state().context_conf, Confidentiality::Internal);
+        // rcpt_A has had both its payments.
+        fund(&mut engine, "u1", "rcpt_A", 100);
+        assert_eq!(
+            denied(pay_to(&mut engine, 1, "rcpt_A", 100)),
+            (GuardId::Entity, PolicyError::EntityUsesExceeded)
+        );
+        // 420,000 committed + 90,000 > 500,000.
+        fund(&mut engine, "u2", "rcpt_B", 90_000);
+        assert_eq!(
+            denied(pay_to(&mut engine, 2, "rcpt_B", 90_000)),
+            (GuardId::Budget, PolicyError::CumulativeMaxExceeded)
+        );
+        // Four calls made, so one more of five.
+        fund(&mut engine, "u3", "rcpt_B", 100);
+        allowed(pay_to(&mut engine, 3, "rcpt_B", 100));
+        fund(&mut engine, "u4", "rcpt_B", 100);
+        assert_eq!(
+            denied(pay_to(&mut engine, 4, "rcpt_B", 100)),
+            (GuardId::Budget, PolicyError::MaxCallsExceeded)
+        );
+        // The ratchet carries over too (RV3 A3): above the payment sink's Internal clearance.
+        let ratcheted = Ledger {
+            context_conf: Confidentiality::Confidential,
+            ..ledger
+        };
+        let mut engine = episode(&shared, recipients(), EID, ratcheted).unwrap();
+        fund(&mut engine, "u1", "rcpt_B", 100);
+        assert_eq!(
+            denied(pay_to(&mut engine, 1, "rcpt_B", 100)),
+            (GuardId::Label, PolicyError::ConfidentialityViolation)
+        );
+    }
+
+    #[test]
+    fn restored_reservations_count_block_and_keep_their_ids() {
+        let shared = serving(store());
+        let ledger = Ledger {
+            calls: 1,
+            entity_uses: BTreeMap::from([("rcpt_A".to_owned(), 1)]),
+            unresolved: BTreeMap::from([((OLD_EID, 1), restored("rcpt_A", 30_000))]),
+            ..Ledger::empty()
+        };
+        let mut engine = episode(&shared, recipients(), EID, ledger).unwrap();
+        assert_eq!(engine.state().budget.reserved, 30_000);
+        assert!(shared.unresolved.contains("rcpt_A"));
+        fund(&mut engine, "u1", "rcpt_A", 100);
+        assert_eq!(
+            denied(pay_to(&mut engine, 1, "rcpt_A", 100)),
+            (GuardId::Budget, PolicyError::PaymentPending)
+        );
+        // The episode's own reservation 1 does not overwrite the restored (OLD_EID, 1).
+        fund(&mut engine, "u2", "rcpt_B", 100);
+        let ticket = allowed(pay_to(&mut engine, 2, "rcpt_B", 100))
+            .reservation
+            .unwrap();
+        assert_eq!(ticket.reservation_id, 1);
+        assert_eq!(
+            engine.state().budget.restored,
+            BTreeMap::from([((OLD_EID, 1), restored("rcpt_A", 30_000))])
+        );
+        assert_eq!(engine.state().budget.reserved, 30_100);
+        // Another episode, with no unresolved payment of its own, is blocked too.
+        let mut other = episode(&shared, recipients(), OLD_EID + 1, Ledger::empty()).unwrap();
+        fund(&mut other, "u1", "rcpt_A", 100);
+        assert_eq!(
+            denied(pay_to(&mut other, 1, "rcpt_A", 100)),
+            (GuardId::Budget, PolicyError::PaymentPending)
+        );
+    }
+
+    #[test]
+    fn an_unknown_outcome_blocks_the_entity_in_every_intent() {
+        let shared = serving(store());
+        let mut first = episode(&shared, invoices(), EID, Ledger::empty()).unwrap();
+        let mut second = episode(&shared, invoices(), OLD_EID, Ledger::empty()).unwrap();
+        for engine in [&mut first, &mut second] {
+            lookup(engine, 1, "INV-1001", "30000", "USD");
+            lookup(engine, 2, "INV-1002", "30000", "USD");
+        }
+        let held = |result| allowed(result).reservation.unwrap().reservation_id;
+        let unknown = held(pay(&mut first, 3, "INV-1001", 30_000));
+        let refused = held(pay(&mut first, 4, "INV-1002", 30_000));
+        forward_and_settle(&mut first, unknown, UNKNOWN);
+        forward_and_settle(&mut first, refused, REFUSED);
+        assert_eq!(
+            denied(pay(&mut second, 3, "INV-1001", 30_000)),
+            (GuardId::Budget, PolicyError::PaymentPending)
+        );
+        allowed(pay(&mut second, 4, "INV-1002", 30_000));
+    }
+
+    #[test]
+    fn a_poisoned_unresolved_set_fails_closed() {
+        let host = HostAuthority::for_tests();
+        let shared = serving(store());
+        let mut engine = episode(&shared, invoices(), EID, Ledger::empty()).unwrap();
+        lookup(&mut engine, 1, "INV-1001", "30000", "USD");
+        lookup(&mut engine, 2, "INV-1002", "30000", "USD");
+        let id = allowed(pay(&mut engine, 3, "INV-1001", 30_000))
+            .reservation
+            .unwrap()
+            .reservation_id;
+        engine.mark_forwarded(id).unwrap();
+        let poisoner = shared.unresolved.clone();
+        let handle = std::thread::spawn(move || {
+            let _guard = poisoner.entities.write().unwrap();
+            panic!("poisoning the unresolved set on purpose");
+        });
+        assert!(handle.join().is_err());
+        // Every payment is blocked, and an unknown outcome changes nothing: the reservation
+        // stays Forwarded and counted, and replay restores it as unresolved.
+        assert_eq!(
+            denied(pay(&mut engine, 4, "INV-1002", 30_000)),
+            (GuardId::Budget, PolicyError::PaymentPending)
+        );
+        assert_eq!(
+            engine.settle(&host, id, UNKNOWN),
+            Err(PepError::Store(StoreError::Poisoned))
+        );
+        assert_eq!(
+            engine.state().budget.reservations[&id].state,
+            ResState::Forwarded
+        );
+        assert_eq!(engine.state().budget.reserved, 30_000);
+        let ledger = Ledger {
+            unresolved: BTreeMap::from([((OLD_EID, 1), restored("INV-1001", 1))]),
+            ..Ledger::empty()
+        };
+        assert_eq!(
+            episode(&shared, invoices(), OLD_EID + 1, ledger).err(),
+            Some(PepError::Store(StoreError::Poisoned))
+        );
+    }
+
+    #[test]
+    fn invalid_ledgers_rejected() {
+        let shared = serving(store());
+        let unresolved = |entries: Vec<((u128, u64), RestoredReservation)>| Ledger {
+            unresolved: entries.into_iter().collect(),
+            ..Ledger::empty()
+        };
+        let ledgers = [
+            // Under the new episode's own eid, it could share a new reservation's F-07 key.
+            unresolved(vec![((EID, 1), restored("rcpt_A", 1))]),
+            unresolved(vec![
+                ((OLD_EID, 1), restored("rcpt_A", u64::MAX)),
+                ((OLD_EID, 2), restored("rcpt_B", 1)),
+            ]),
+            unresolved(vec![((OLD_EID, 1), restored("cafe\u{301}", 1))]),
+            Ledger {
+                entity_uses: BTreeMap::from([("cafe\u{301}".to_owned(), 1)]),
+                ..Ledger::empty()
+            },
+        ];
+        for ledger in ledgers {
+            assert_eq!(
+                episode(&shared, recipients(), EID, ledger.clone()).err(),
+                Some(PepError::InvalidConfig(ConfigError::InvalidLedger)),
+                "{ledger:?}"
+            );
+        }
+        // A rejected ledger marks nothing unresolved.
+        assert!(!shared.unresolved.contains("rcpt_A"));
+    }
+
+    #[test]
+    fn blocks_payment_by_state() {
+        let reservation = |state| Reservation {
+            id: 1,
+            call_id: "1".to_owned(),
+            amount_minor: 1,
+            entity: "INV-1001".to_owned(),
+            action_digest: String::new(),
+            witness_seq: 1,
+            state,
+        };
+        let (bound, unbound) = (pay_invoice(), pay_recipient());
+        for (state, blocks_bound, blocks_unbound) in [
+            (ResState::NeedsReconcile, true, true),
+            (ResState::Held, true, false),
+            (ResState::AwaitingStepUp, true, false),
+            (ResState::Forwarded, true, false),
+            (ResState::Committed, false, false),
+            (ResState::Released, false, false),
+        ] {
+            let reservation = reservation(state);
+            assert_eq!(
+                blocks_payment(&reservation, &bound, "INV-1001"),
+                blocks_bound,
+                "{state:?}"
+            );
+            assert_eq!(
+                blocks_payment(&reservation, &unbound, "INV-1001"),
+                blocks_unbound,
+                "{state:?}"
+            );
+            assert!(!blocks_payment(&reservation, &bound, "INV-1002"));
+        }
+    }
+
+    // ---- Batched taint (RV3 A9) ----
+
+    fn note_keys(keys: &[&str]) -> Vec<TaintIndex> {
+        keys.iter()
+            .map(|key| TaintIndex::Location(StoreKey::new(NOTES, key, &pins().stores).unwrap()))
+            .collect()
+    }
+
+    #[test]
+    fn record_all_is_atomic() {
+        let labels = InMemoryLabelStore::with_capacity(2);
+        let keys = note_keys(&["k1", "k2", "k3"]);
+        let first = LabelEntry {
+            label: Label::new(Confidentiality::Internal, Integrity::UntrustedAgentWrite),
+            writer_episode: EID,
+        };
+        assert_eq!(
+            labels.record_all(&keys, first),
+            Err(StoreError::CapacityExceeded)
+        );
+        assert!(keys.iter().all(|key| labels.lookup(key).unwrap().is_none()));
+        // One index twice needs one slot.
+        let one = InMemoryLabelStore::with_capacity(1);
+        one.record_all(&[keys[0].clone(), keys[0].clone()], first)
+            .unwrap();
+        labels.record_all(&keys[..2], first).unwrap();
+        // Present indexes need no capacity; they join.
+        let second = LabelEntry {
+            label: Label::new(Confidentiality::Secret, Integrity::UntrustedAgentWrite),
+            writer_episode: OLD_EID,
+        };
+        labels.record_all(&keys[..2], second).unwrap();
+        assert_eq!(
+            labels.lookup(&keys[0]).unwrap(),
+            Some(first.label.join(second.label))
+        );
+        assert_eq!(labels.writers(&keys[1]).unwrap(), vec![OLD_EID, EID]);
+        assert_eq!(
+            labels.record_all(&keys[1..], second),
+            Err(StoreError::CapacityExceeded)
+        );
+        assert_eq!(
+            labels.lookup(&keys[1]).unwrap(),
+            Some(first.label.join(second.label))
+        );
+        assert_eq!(labels.writers(&keys[1]).unwrap(), vec![OLD_EID, EID]);
+        assert!(labels.lookup(&keys[2]).unwrap().is_none());
+    }
+
+    /// Counts the batches the engine hands the store.
+    #[derive(Debug)]
+    struct CountingStore {
+        inner: InMemoryLabelStore,
+        batches: Mutex<Vec<usize>>,
+    }
+
+    impl LabelStore for CountingStore {
+        fn record_all(&self, indexes: &[TaintIndex], entry: LabelEntry) -> Result<(), StoreError> {
+            self.batches
+                .lock()
+                .map_err(|_| StoreError::Poisoned)?
+                .push(indexes.len());
+            self.inner.record_all(indexes, entry)
+        }
+
+        fn lookup(&self, index: &TaintIndex) -> Result<Option<Label>, StoreError> {
+            self.inner.lookup(index)
+        }
+    }
+
+    #[test]
+    fn one_call_records_its_taint_in_one_batch() {
+        let counting = Arc::new(CountingStore {
+            inner: InMemoryLabelStore::with_capacity(100),
+            batches: Mutex::new(Vec::new()),
+        });
+        let mut engine = PepEngine::new(
+            &HostAuthority::for_tests(),
+            intent(invoices(), limits("USD")),
+            pins(),
+            SeqPolicy::Unconstrained,
+            serving(counting.clone()),
+            Ledger::empty(),
+        )
+        .unwrap();
+        // `Location(a/b/c)`, `Below(a)` and `Below(a/b)`.
+        allow(
+            &mut engine,
+            &request(1, "save_note", r#"{"key":"a/b/c","text":"x"}"#),
+        );
+        assert_eq!(*counting.batches.lock().unwrap(), vec![3]);
+    }
+
     // ---- One witness funds one payment ----
 
     #[test]
@@ -6009,10 +6538,12 @@ mod tests {
     #[test]
     fn nested_undeclared_argument_rejected() {
         let mut engine = PepEngine::new(
+            &HostAuthority::for_tests(),
             intent(recipients(), limits("USD")),
             nested_pins(),
             SeqPolicy::Unconstrained,
             serving(store()),
+            Ledger::empty(),
         )
         .unwrap();
         let host = HostAuthority::for_tests();
@@ -6041,10 +6572,12 @@ mod tests {
     #[test]
     fn nested_sink_and_array_arguments_checked() {
         let mut engine = PepEngine::new(
+            &HostAuthority::for_tests(),
             intent(invoices(), limits("USD")),
             nested_pins(),
             SeqPolicy::Unconstrained,
             serving(store()),
+            Ledger::empty(),
         )
         .unwrap();
         let redirect =
@@ -6105,10 +6638,12 @@ mod tests {
             custom.tools.insert(policy.name.clone(), policy);
         }
         let mut engine = PepEngine::new(
+            &HostAuthority::for_tests(),
             intent(recipients(), limits("USD")),
             custom,
             SeqPolicy::Unconstrained,
             serving(store()),
+            Ledger::empty(),
         )
         .unwrap();
         for (name, arguments) in [
@@ -6367,10 +6902,12 @@ mod tests {
                     .insert(uri.to_owned(), KeyPolicy { case_insensitive });
             }
             PepEngine::new(
+                &HostAuthority::for_tests(),
                 intent(invoices(), limits("USD")),
                 custom,
                 SeqPolicy::Unconstrained,
                 serving(store()),
+                Ledger::empty(),
             )
             .err()
         };

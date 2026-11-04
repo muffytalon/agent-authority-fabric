@@ -888,7 +888,7 @@ The order follows RV2: p256, peer identity and the lock file come before the bin
   - a `Held`, `AwaitingStepUp` or `Forwarded` reservation's `entity`, for an amount-bound payment. Two live reservations on one invoice carry different F-07 keys, so the provider cannot dedupe them, and the agent needs no failure to get them: it only has to race inside the upstream window;
   - an entity in the PEP-wide unresolved set (R1, RV3 A1). That set is a shared `Arc`, like `ServerStates`, not a snapshot passed to `PepEngine::new`, which would never see another intent's new `abort(Unknown)`.
 
-  The first two are in the engine since RV4 (`fc3b620`); the shared set comes with step 7. `Reservation` already stores the entity. This is pure validation, so F-06 holds. Invoice intents run with `per_entity_max_uses: 1`, checked when the config loads, because a system of record that lags after a commit would otherwise fund a second payment.
+  The first two are in the engine since RV4 (`fc3b620`); the shared set came in step 7 (slice 6, below). `Reservation` already stores the entity. This is pure validation, so F-06 holds. Invoice intents run with `per_entity_max_uses: 1`, checked when the config loads, because a system of record that lags after a commit would otherwise fund a second payment.
 - **Forwarded state (P1, RV4 #17).** Today `abort` takes `&HostAuthority`, which A1 keeps off the agent path, yet P1 needs a release on agent-path events. And with no forwarded state, `abort(DefinitelyNotExecuted)` would also release a payment already sent. The engine gains:
   - `ResState::Forwarded`, set from `Held` by `mark_forwarded(rid)` at the point of forwarding (P1), and counted in `reserved`. The PEP forwards a payment only if this succeeds, so a reservation is released or forwarded, never both;
   - `release_unforwarded(rid)`, with no `HostAuthority`, for the agent-path events (a disconnect before forwarding, a failed re-check, a failed journal write), and also for the operator's decline, a step-up timeout and `end_episode`. It releases `Held` and `AwaitingStepUp` only, and refuses `Forwarded`. The caller logs the reason;
@@ -906,7 +906,20 @@ The order follows RV2: p256, peer identity and the lock file come before the bin
   - a handle to the PEP-wide set of entities with an unresolved payment, shared by every engine (RV4 #1);
   - the intent's ratchet level, as the starting `context_conf` (RV3 A3);
   - the episode's fresh eid, in `PepIntent.episode_id` (E1, RV3 A2).
+
+  Implemented in step 7 (slice 6):
+  - The signature is `PepEngine::new(&HostAuthority, intent, pins, seq, Shared, Ledger)`. `Ledger` holds `committed_minor`, `calls`, `entity_uses`, `unresolved` (keyed by (eid, rid)) and `context_conf`. `Ledger::empty()` is for an intent with no history; there is no `Default`.
+  - Restored reservations go in `Budget.restored`, never in `reservations`, and count in `reserved`.
+  - `ConfigError::InvalidLedger` rejects three things: a restored reservation under the new episode's own eid (it could share a new reservation's F-07 key), unresolved amounts that overflow, and a non-NFC entity.
+  - `Shared` gains `unresolved: Arc<UnresolvedEntities>`, keyed by the NFC entity alone, so an invoice id equal to a recipient id is blocked too (fail closed).
+    - `PepEngine::new` adds the ledger's entities to it, after validating the ledger.
+    - `settle(Aborted(Unknown))` adds its entity before changing any state. If the set is poisoned, nothing changes and the reservation stays `Forwarded`.
+    - `g_budget` checks the set for every payment. A poisoned set blocks every payment.
+    - Week 2 never removes an entry: Week 3's reconciliation replaces the set.
+  - The invoice-intent check (`per_entity_max_uses` must be 1) belongs to `config.rs`, at load. The engine tests keep 2 for invoices, to test `PaymentPending` itself.
 - **Batched taint (RV3 A9).** `LabelStore` gains `record_all(entries)`, and `apply` passes one call's taint entries in a single call (today it calls `record` once per index, engine.rs:1617-1619). So the journal-backed store writes them as one record, with one fsync.
+
+  Implemented in step 7 (slice 6) as `record_all(indexes, entry)`, since one call's entries share one label and writer. It replaces `record`, and is atomic: the in-memory store checks capacity for the whole batch (an index named twice counts once) before it changes anything.
 - **Step 10:**
   - `ToolPolicy.step_up_over_minor: Option<u64>`, used by `g_stepup` as the smaller of the intent's and the tool's thresholds;
   - the strict argument schema, checked in `g_canon` (new `PolicyError::SchemaViolation`).
