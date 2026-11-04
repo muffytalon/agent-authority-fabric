@@ -175,8 +175,16 @@ pub enum NumberMode {
     SafeInteger,
     /// RFC 8785 fractions and exponents, with magnitude at most 2^53 - 1.
     EcmaSafe,
-    /// Any finite IEEE-754 double (tool results). `int` is set only for safe integers.
+    /// Any finite IEEE-754 double, formatted per RFC 8785. `int` is set only for safe
+    /// integers.
     EcmaAny,
+    /// [`NumberMode::EcmaAny`], except that a plain integer token (no fraction or exponent)
+    /// outside ±(2^53 - 1) keeps its exact digits, of any length (`WEEK2_PLAN.md` J1 (b)).
+    /// Tool results and tool definitions use it, so a 64-bit id survives and a changed big
+    /// integer in a definition changes its digest. `int` stays `None` for such integers, so they
+    /// never serve as amounts. The bytes stay deterministic: leading zeros are rejected, and a
+    /// plain integer beyond the safe range cannot be `-0`.
+    ExactIntegers,
 }
 
 /// Limits and number rules for one parse.
@@ -208,19 +216,34 @@ impl ParseOptions {
         }
     }
 
-    /// The tool-result profile: any finite number, depth 64, and the given size limits.
-    /// Noncharacters are accepted, because results carry arbitrary text from tools.
+    /// The tool-result profile: any finite number, with big plain integers kept exactly
+    /// ([`NumberMode::ExactIntegers`]), depth 64, and the given size limits. Noncharacters are
+    /// accepted, because results carry arbitrary text from tools.
     #[must_use]
     pub const fn result(max_bytes: usize, max_nodes: usize) -> Self {
         Self {
-            numbers: NumberMode::EcmaAny,
+            numbers: NumberMode::ExactIntegers,
             max_bytes,
             max_depth: MAX_DEPTH,
             max_nodes,
             reject_noncharacters: false,
         }
     }
+
+    /// The definition profile for full upstream tool definitions, the lockfile payload and the
+    /// config's `pins` (`WEEK2_PLAN.md` RV4 #13): the result number rules, with
+    /// [`MAX_DEFINITION_BYTES`] and [`MAX_DEFINITION_NODES`]. Definitions hold values such as
+    /// `"minimum": 0.5` and can exceed the request profile's 8192 values.
+    #[must_use]
+    pub const fn definition() -> Self {
+        Self::result(MAX_DEFINITION_BYTES, MAX_DEFINITION_NODES)
+    }
 }
+
+/// Largest input the definition profile accepts (8 MiB).
+pub const MAX_DEFINITION_BYTES: usize = 8 * 1024 * 1024;
+/// Most values, containers included, the definition profile accepts.
+pub const MAX_DEFINITION_NODES: usize = 262_144;
 
 /// A string guaranteed to be in Unicode Normalization Form C.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -837,6 +860,12 @@ fn safe_integer(negative: bool, magnitude: u64, start: usize) -> Result<JcsNumbe
 fn ecma_number(token: &[u8], start: usize, mode: NumberMode) -> Result<JcsNumber, JcsError> {
     let malformed = JcsError::UnexpectedByte { offset: start };
     let text = core::str::from_utf8(token).map_err(|_| malformed)?;
+    if mode == NumberMode::ExactIntegers && is_unsafe_plain_integer(text) {
+        return Ok(JcsNumber {
+            canonical: text.to_owned(),
+            int: None,
+        });
+    }
     let parsed: f64 = text.parse().map_err(|_| malformed)?;
     if !parsed.is_finite() {
         return Err(JcsError::NumberNotFinite { offset: start });
@@ -858,6 +887,17 @@ fn ecma_number(token: &[u8], start: usize, mode: NumberMode) -> Result<JcsNumber
         .ok()
         .filter(|i| (MIN_SAFE_INTEGER..=MAX_SAFE_INTEGER).contains(i));
     Ok(JcsNumber { canonical, int })
+}
+
+/// Whether `text` is a plain integer token (an optional `-`, then digits) outside
+/// ±(2^53 - 1). The parser has already rejected leading zeros.
+fn is_unsafe_plain_integer(text: &str) -> bool {
+    let digits = text.strip_prefix('-').unwrap_or(text);
+    !digits.is_empty()
+        && digits.bytes().all(|byte| byte.is_ascii_digit())
+        && text.parse::<i64>().map_or(true, |value| {
+            !(MIN_SAFE_INTEGER..=MAX_SAFE_INTEGER).contains(&value)
+        })
 }
 
 struct Cursor<'a> {
@@ -1613,9 +1653,17 @@ mod tests {
         let fraction = parse_with(b"12.5", &options).unwrap().value;
         assert_eq!(fraction.to_canonical_string(), "12.5");
         assert_eq!(fraction.as_i64(), None);
+        // J1 (b): a big plain integer keeps its digits in results...
         let big = parse_with(b"18446744073709551615", &options).unwrap().value;
-        assert_eq!(big.to_canonical_string(), "18446744073709552000");
+        assert_eq!(big.to_canonical_string(), "18446744073709551615");
         assert_eq!(big.as_i64(), None);
+        // ...where RFC 8785's double formatting, still available as EcmaAny, would round it.
+        let ecma = ParseOptions {
+            numbers: NumberMode::EcmaAny,
+            ..options
+        };
+        let rounded = parse_with(b"18446744073709551615", &ecma).unwrap().value;
+        assert_eq!(rounded.to_canonical_string(), "18446744073709552000");
         let nanos = parse_with(b"1729771234123456789", &options).unwrap().value;
         assert_eq!(nanos.as_i64(), None);
         let safe = parse_with(b"30000.0", &options).unwrap().value;
@@ -1678,6 +1726,85 @@ mod tests {
         }
         let result = ParseOptions::result(1024, 64);
         assert!(parse_with(format!("\"{}\"", u("ffff")).as_bytes(), &result).is_ok());
+    }
+
+    #[test]
+    fn exact_integers_keep_their_digits_and_nothing_else() {
+        let options = ParseOptions::result(1 << 20, 64);
+        let canonical = |text: &str| {
+            parse_with(text.as_bytes(), &options)
+                .unwrap()
+                .value
+                .to_canonical_string()
+        };
+        for kept in [
+            "9007199254740992",
+            "-9007199254740992",
+            "12345678901234567890123",
+            "-18446744073709551616",
+        ] {
+            assert_eq!(canonical(kept), kept);
+            assert_eq!(
+                parse_with(kept.as_bytes(), &options)
+                    .unwrap()
+                    .value
+                    .as_i64(),
+                None
+            );
+        }
+        // Beyond f64's range a plain integer is still exact, of any length.
+        let googol_squared = format!("1{}", "0".repeat(400));
+        assert_eq!(canonical(&googol_squared), googol_squared);
+        // Safe integers, fractions and exponents keep RFC 8785 formatting.
+        assert_eq!(canonical("9007199254740991"), "9007199254740991");
+        assert_eq!(canonical("-0"), "0");
+        assert_eq!(canonical("1.0"), "1");
+        assert_eq!(canonical("1E2"), "100");
+        assert_eq!(
+            canonical("123456789012345678901.0"),
+            "123456789012345680000"
+        );
+        assert_eq!(canonical("1.5e300"), "1.5e+300");
+        assert_eq!(
+            parse_with(b"1e400", &options).unwrap_err(),
+            JcsError::NumberNotFinite { offset: 0 }
+        );
+        // Leading zeros are still rejected, so each integer has one spelling.
+        assert_eq!(
+            parse_with(b"012345678901234567890", &options).unwrap_err(),
+            JcsError::LeadingZero { offset: 1 }
+        );
+        // Canonical output parses back to itself.
+        let doc = br#"{"id":18446744073709551615,"n":[-12345678901234567890,0.5,7]}"#;
+        let once = parse_with(doc, &options)
+            .unwrap()
+            .value
+            .to_canonical_bytes();
+        let twice = parse_with(&once, &options)
+            .unwrap()
+            .value
+            .to_canonical_bytes();
+        assert_eq!(once, twice);
+        assert_eq!(once, doc.to_vec());
+        // The request profile is unchanged: big integers and fractions are refused.
+        assert!(parse(b"18446744073709551615").is_err());
+    }
+
+    #[test]
+    fn definition_profile_accepts_what_definitions_hold() {
+        let options = ParseOptions::definition();
+        assert_eq!(options.max_bytes, MAX_DEFINITION_BYTES);
+        let schema = br#"{"inputSchema":{"properties":{"ratio":{"maximum":18446744073709551615,"minimum":0.5,"type":"number"}},"type":"object"}}"#;
+        let parsed = parse_with(schema, &options).unwrap().value;
+        assert_eq!(parsed.to_canonical_bytes(), schema.to_vec());
+        let many = format!("[{}]", vec!["0"; 10_000].join(","));
+        assert_eq!(parse_with(many.as_bytes(), &options).unwrap().nodes, 10_001);
+        // The request profile refuses both.
+        assert!(parse(schema).is_err());
+        assert!(matches!(
+            parse(many.as_bytes()),
+            Err(JcsError::NodeLimitExceeded { .. })
+        ));
     }
 
     #[test]
