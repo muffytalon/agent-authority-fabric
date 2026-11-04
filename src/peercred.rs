@@ -915,6 +915,12 @@ mod tests {
         fn cross_namespace_peer_alive_with_pid_zero() {
             let dir = TempDir::with_mode(0o750);
             let path = dir.socket();
+            // The new user namespace maps only the caller's uid, so it gets no access to files
+            // owned by anyone else. CI runs this as root on a checkout under the runner's home
+            // directory, which root inside the namespace cannot traverse (exec failed with
+            // EACCES), so run a copy of this test binary from the caller's own temp directory.
+            let exe = dir.path.join("peercred-namespace-helper");
+            fs::copy(std::env::current_exe().unwrap(), &exe).unwrap();
             let mut child = Command::new("unshare")
                 .args([
                     "--user",
@@ -924,7 +930,8 @@ mod tests {
                     "--mount-proc",
                     "--",
                 ])
-                .arg(std::env::current_exe().unwrap())
+                .arg(&exe)
+                .current_dir(&dir.path)
                 .args([
                     "--exact",
                     "peercred::tests::pidfd::helper_namespace_listener",
