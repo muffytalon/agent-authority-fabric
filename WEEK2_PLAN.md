@@ -410,7 +410,7 @@ RV2 had T1, L1 and Q1 closing after step 2. RV2's own reordering (§2) moves the
 | A journal append or fsync fails before forwarding (R1) | `abort(DefinitelyNotExecuted)` | `PEP_UNAVAILABLE` |
 | Any non-payment call | Record and forward. On a timeout or error, `abandon` | `PEP_UNAVAILABLE` on failure |
 
-- **Engine calls (RV4 #17).** Before the point of forwarding, the table's `abort(DefinitelyNotExecuted)` is the crate-private `release_unforwarded`, which needs no `HostAuthority` and refuses a `Forwarded` reservation. After it, every outcome row is `settle`, behind `HostAuthority`. The operator's decline of an `AwaitingStepUp` reservation stays `abort` (§2a).
+- **Engine calls (RV4 #17).** Before the point of forwarding, the table's `abort(DefinitelyNotExecuted)` is the crate-private `release_unforwarded`, which needs no `HostAuthority` and refuses a `Forwarded` reservation. After it, every outcome row is `settle`, behind `HostAuthority`. The operator's decline of an `AwaitingStepUp` reservation uses `release_unforwarded` too, since nothing was sent (§2a).
 - **Detecting a disconnect (RV4 #17).** The connection thread is blocked waiting for the actor's reply, `UnixStream::peek` is unstable on 1.97.1, and nix's `poll` feature is off. So each connection gets a watcher thread on a `try_clone`d stream, blocked in `read` on a one-byte buffer.
   - A read of 0 bytes (the client closed or half-closed) or of any byte (a pipelined request, which one request per connection forbids) cancels the call. The watcher tells the actor, which calls `release_unforwarded` if the call is not yet forwarded.
   - A half-close counts as a disconnect. Neither SDK half-closes.
@@ -883,10 +883,12 @@ The order follows RV2: p256, peer identity and the lock file come before the bin
 
   The first two are in the engine since RV4 (`fc3b620`); the shared set comes with step 7. `Reservation` already stores the entity. This is pure validation, so F-06 holds. Invoice intents run with `per_entity_max_uses: 1`, checked when the config loads, because a system of record that lags after a commit would otherwise fund a second payment.
 - **Forwarded state (P1, RV4 #17).** Today `abort` takes `&HostAuthority`, which A1 keeps off the agent path, yet P1 needs a release on agent-path events. And with no forwarded state, `abort(DefinitelyNotExecuted)` would also release a payment already sent. The engine gains:
-  - `ResState::Forwarded`, set from `Held` by a crate-private `mark_forwarded(rid)` at the point of forwarding (P1), and counted in `reserved`;
-  - a crate-private `release_unforwarded(rid, reason)`, with no `HostAuthority`, for the agent-path events: a disconnect before forwarding, a failed re-check, a failed journal write, a step-up timeout and `end_episode`. It releases `Held` and `AwaitingStepUp` only, and refuses `Forwarded`;
-  - `settle(&HostAuthority, rid, outcome)` for a `Forwarded` reservation, from the upstream worker's report of the broker's explicit outcome: `executed` gives `Committed`, `refused` gives `Released`, and `unknown` or a timeout gives `NeedsReconcile`. It replaces `commit`;
-  - `abort` keeps only the operator's decline of an `AwaitingStepUp` reservation, and refuses `Forwarded`.
+  - `ResState::Forwarded`, set from `Held` by `mark_forwarded(rid)` at the point of forwarding (P1), and counted in `reserved`. The PEP forwards a payment only if this succeeds, so a reservation is released or forwarded, never both;
+  - `release_unforwarded(rid)`, with no `HostAuthority`, for the agent-path events (a disconnect before forwarding, a failed re-check, a failed journal write), and also for the operator's decline, a step-up timeout and `end_episode`. It releases `Held` and `AwaitingStepUp` only, and refuses `Forwarded`. The caller logs the reason;
+  - `settle(&HostAuthority, rid, Settlement)` for a `Forwarded` reservation, from the upstream worker's report of the broker's explicit outcome: `Executed` gives `Committed`, `Aborted(DefinitelyNotExecuted)` gives `Released`, and `Aborted(Unknown)`, after a timeout too, gives `NeedsReconcile`;
+  - `commit` and `abort` are gone: `settle` replaces both. `mark_forwarded` and `release_unforwarded` are public rather than crate-private, because the binary is a separate crate; they are safe to expose, since neither can end a forwarded payment.
+
+  Implemented in step 7 (slice 4).
 
   So once forwarded, a payment ends only through `settle`, and P1's promise no longer rests on actor code alone.
 - **Ledger restore (R1).** `PepEngine::new` takes, behind `&HostAuthority`, the intent's journaled ledger:

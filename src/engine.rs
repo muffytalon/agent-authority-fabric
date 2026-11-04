@@ -38,8 +38,8 @@ pub const MAX_RESULT_POINTER_BYTES: usize = 4_194_304;
 /// Total RFC 6901 pointer bytes the recorded results and trusted inputs of one episode may
 /// produce.
 pub const MAX_EPISODE_POINTER_BYTES: usize = 16_777_216;
-/// Maximum number of allowed calls still awaiting their result. The host must record, abandon
-/// or abort every allowed call.
+/// Maximum number of allowed calls still awaiting their result. The host must record, abandon,
+/// release or settle every allowed call.
 pub const MAX_IN_FLIGHT: usize = 64;
 /// Maximum number of ids (allowed calls and trusted inputs) one episode may spend. Ids are
 /// never reused, so this also bounds the set of spent ids.
@@ -863,16 +863,29 @@ pub struct PepIntent {
 /// State of a payment reservation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResState {
-    /// Reserved and approved; may be committed.
+    /// Reserved and approved; may be forwarded ([`PepEngine::mark_forwarded`]) or released.
     Held,
     /// Reserved, waiting for step-up approval; counted in `reserved`.
     AwaitingStepUp,
+    /// Sent upstream: set by [`PepEngine::mark_forwarded`] at the point of forwarding, and
+    /// counted in `reserved`. Only [`PepEngine::settle`], behind the [`HostAuthority`], ends
+    /// it (P1).
+    Forwarded,
     /// The payment executed.
     Committed,
     /// The payment definitely did not execute.
     Released,
     /// The outcome is unknown; still counted in `reserved` (fail closed).
     NeedsReconcile,
+}
+
+/// How a forwarded payment ended, from the broker's explicit outcome or an upstream timeout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Settlement {
+    /// The payment executed: the reservation is committed.
+    Executed,
+    /// The payment did not execute, or nobody knows whether it did.
+    Aborted(AbortOutcome),
 }
 
 /// Outcome reported when a payment is aborted.
@@ -907,7 +920,7 @@ pub struct Reservation {
 /// Two-phase payment budget.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Budget {
-    /// Total of `Held`, `AwaitingStepUp` and `NeedsReconcile` reservations.
+    /// Total of `Held`, `AwaitingStepUp`, `Forwarded` and `NeedsReconcile` reservations.
     pub reserved: u64,
     /// Total of committed payments.
     pub committed: u64,
@@ -1127,8 +1140,8 @@ pub enum Decision {
 }
 
 /// Capability for host-only operations: recording trusted input, approving a step-up and
-/// aborting a reservation. Each of them acts on a claim the agent must never be able to make
-/// (what the user typed, that a human approved, that a payment did not run). It cannot be
+/// settling a forwarded payment. Each of them acts on a claim the agent must never be able to
+/// make (what the user typed, that a human approved, how a payment ended). It cannot be
 /// copied, cloned or forged, and the process can obtain it only once.
 ///
 /// ```compile_fail
@@ -1171,26 +1184,6 @@ pub trait Engine {
     /// Returns [`PepError::Denied`] when a guard denies the call, or another [`PepError`] when
     /// the label store fails.
     fn evaluate(&mut self, call: &ToolCall) -> Result<Decision, PepError>;
-
-    /// Commits a `Held` reservation after the payment executed.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`PepError::InvalidTransition`] unless the reservation is `Held`.
-    fn commit(&mut self, reservation_id: u64) -> Result<(), PepError>;
-
-    /// Aborts a `Held` or `AwaitingStepUp` reservation. Releasing a reservation re-opens budget,
-    /// so only host code holding the [`HostAuthority`] may report the outcome.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`PepError::InvalidTransition`] for any other state.
-    fn abort(
-        &mut self,
-        host: &HostAuthority,
-        reservation_id: u64,
-        outcome: AbortOutcome,
-    ) -> Result<(), PepError>;
 }
 
 /// The policy enforcement engine for one episode.
@@ -1515,7 +1508,7 @@ impl PepEngine {
     /// # Errors
     ///
     /// Returns [`PepError::UnknownCall`] if the call is not in flight, or
-    /// [`PepError::InvalidTransition`] if it has a live reservation (use `abort`).
+    /// [`PepError::InvalidTransition`] if it has a live reservation (release or settle it).
     pub fn abandon(&mut self, call_id: &str) -> Result<(), PepError> {
         if !self.state.in_flight.contains_key(call_id) {
             return Err(PepError::UnknownCall);
@@ -1712,7 +1705,7 @@ impl PepEngine {
             }),
         };
         // The id is spent for good, so a late result for this call can never be recorded
-        // against a later call that reuses the id (abandon and abort drop `in_flight`).
+        // against a later call that reuses the id (abandon, release and settle drop `in_flight`).
         state.recorded_call_ids.insert(call_id.clone());
         state.in_flight.insert(
             call_id,
@@ -1793,17 +1786,111 @@ impl Engine for PepEngine {
             }
         }
     }
+}
 
-    fn commit(&mut self, reservation_id: u64) -> Result<(), PepError> {
-        let budget = &mut self.state.budget;
-        let reservation = budget
+impl PepEngine {
+    /// Marks a `Held` payment as sent, at the point of forwarding (P1). The PEP forwards a
+    /// payment only if this succeeds, so a reservation is either released or forwarded, never
+    /// both. An `AwaitingStepUp` reservation cannot be forwarded until it is approved (F-15).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PepError::UnknownReservation`] for an unknown id, or
+    /// [`PepError::InvalidTransition`] unless the reservation is `Held`.
+    pub fn mark_forwarded(&mut self, reservation_id: u64) -> Result<(), PepError> {
+        let reservation = self
+            .state
+            .budget
             .reservations
-            .get(&reservation_id)
+            .get_mut(&reservation_id)
             .ok_or(PepError::UnknownReservation)?;
         if reservation.state != ResState::Held {
             return Err(PepError::InvalidTransition);
         }
-        let amount = reservation.amount_minor;
+        reservation.state = ResState::Forwarded;
+        Ok(())
+    }
+
+    /// Releases a payment that was never sent: a `Held` or `AwaitingStepUp` reservation. This
+    /// is the agent path's only way to end a reservation (an agent disconnect before the point
+    /// of forwarding, a failed re-check, a failed journal write), and the operator's decline and
+    /// a step-up timeout use it too. It needs no [`HostAuthority`], because it refuses a
+    /// `Forwarded` reservation: once sent, a payment ends only through [`PepEngine::settle`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PepError::UnknownReservation`] for an unknown id, or
+    /// [`PepError::InvalidTransition`] unless the reservation is `Held` or `AwaitingStepUp`.
+    pub fn release_unforwarded(&mut self, reservation_id: u64) -> Result<(), PepError> {
+        let state = self.reservation_state(reservation_id)?;
+        if !matches!(state, ResState::Held | ResState::AwaitingStepUp) {
+            return Err(PepError::InvalidTransition);
+        }
+        self.release(reservation_id)
+    }
+
+    /// Ends a `Forwarded` payment with the broker's explicit outcome, or `Unknown` after an
+    /// upstream timeout (P1). Only host code holding the [`HostAuthority`] may report it.
+    /// - `Executed` commits: `reserved` drops and `committed` rises by the amount. The call stays
+    ///   in flight, so its result can still be recorded.
+    /// - `Aborted(DefinitelyNotExecuted)` releases the reservation, its amount and its entity
+    ///   use.
+    /// - `Aborted(Unknown)` makes it `NeedsReconcile`, still counted in `reserved` (fail closed).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PepError::UnknownReservation`] for an unknown id, or
+    /// [`PepError::InvalidTransition`] unless the reservation is `Forwarded`.
+    pub fn settle(
+        &mut self,
+        _host: &HostAuthority,
+        reservation_id: u64,
+        outcome: Settlement,
+    ) -> Result<(), PepError> {
+        if self.reservation_state(reservation_id)? != ResState::Forwarded {
+            return Err(PepError::InvalidTransition);
+        }
+        match outcome {
+            Settlement::Executed => self.commit(reservation_id),
+            Settlement::Aborted(AbortOutcome::DefinitelyNotExecuted) => {
+                self.release(reservation_id)
+            }
+            Settlement::Aborted(AbortOutcome::Unknown) => {
+                let call_id = self.set_state(reservation_id, ResState::NeedsReconcile)?;
+                self.state.in_flight.remove(&call_id);
+                Ok(())
+            }
+        }
+    }
+
+    fn reservation_state(&self, reservation_id: u64) -> Result<ResState, PepError> {
+        self.state
+            .budget
+            .reservations
+            .get(&reservation_id)
+            .map(|reservation| reservation.state)
+            .ok_or(PepError::UnknownReservation)
+    }
+
+    /// Sets a reservation's state and returns its call id.
+    fn set_state(&mut self, reservation_id: u64, next: ResState) -> Result<String, PepError> {
+        let reservation = self
+            .state
+            .budget
+            .reservations
+            .get_mut(&reservation_id)
+            .ok_or(PepError::UnknownReservation)?;
+        reservation.state = next;
+        Ok(reservation.call_id.clone())
+    }
+
+    fn commit(&mut self, reservation_id: u64) -> Result<(), PepError> {
+        let budget = &self.state.budget;
+        let amount = budget
+            .reservations
+            .get(&reservation_id)
+            .ok_or(PepError::UnknownReservation)?
+            .amount_minor;
         let reserved = budget
             .reserved
             .checked_sub(amount)
@@ -1812,57 +1899,37 @@ impl Engine for PepEngine {
             .committed
             .checked_add(amount)
             .ok_or(PepError::InvalidTransition)?;
-        budget.reserved = reserved;
-        budget.committed = committed;
-        if let Some(reservation) = budget.reservations.get_mut(&reservation_id) {
-            reservation.state = ResState::Committed;
-        }
+        self.set_state(reservation_id, ResState::Committed)?;
+        self.state.budget.reserved = reserved;
+        self.state.budget.committed = committed;
         Ok(())
     }
 
-    fn abort(
-        &mut self,
-        _host: &HostAuthority,
-        reservation_id: u64,
-        outcome: AbortOutcome,
-    ) -> Result<(), PepError> {
-        let state = &mut self.state;
-        let reservation = state
-            .budget
+    /// Releases a reservation: its amount leaves `reserved`, it gives back its entity use, its
+    /// witness may fund another payment, and its call leaves `in_flight`. `calls` keeps
+    /// counting it (SPEC §3.1).
+    fn release(&mut self, reservation_id: u64) -> Result<(), PepError> {
+        let budget = &self.state.budget;
+        let reservation = budget
             .reservations
             .get(&reservation_id)
             .ok_or(PepError::UnknownReservation)?;
-        if !matches!(reservation.state, ResState::Held | ResState::AwaitingStepUp) {
-            return Err(PepError::InvalidTransition);
-        }
-        let amount = reservation.amount_minor;
+        let reserved = budget
+            .reserved
+            .checked_sub(reservation.amount_minor)
+            .ok_or(PepError::InvalidTransition)?;
+        // A live reservation holds one use of its entity; a count of zero means the books
+        // disagree, so refuse rather than clamp.
+        let uses = budget
+            .entity_uses
+            .get(&reservation.entity)
+            .and_then(|uses| uses.checked_sub(1))
+            .ok_or(PepError::InvalidTransition)?;
         let entity = reservation.entity.clone();
-        let call_id = reservation.call_id.clone();
-        let next_state = match outcome {
-            AbortOutcome::DefinitelyNotExecuted => {
-                let reserved = state
-                    .budget
-                    .reserved
-                    .checked_sub(amount)
-                    .ok_or(PepError::InvalidTransition)?;
-                // A live reservation holds one use of its entity; a count of zero means the
-                // books disagree, so refuse rather than clamp.
-                let uses = state
-                    .budget
-                    .entity_uses
-                    .get(&entity)
-                    .and_then(|uses| uses.checked_sub(1))
-                    .ok_or(PepError::InvalidTransition)?;
-                state.budget.reserved = reserved;
-                state.budget.entity_uses.insert(entity, uses);
-                ResState::Released
-            }
-            AbortOutcome::Unknown => ResState::NeedsReconcile,
-        };
-        if let Some(reservation) = state.budget.reservations.get_mut(&reservation_id) {
-            reservation.state = next_state;
-        }
-        state.in_flight.remove(&call_id);
+        let call_id = self.set_state(reservation_id, ResState::Released)?;
+        self.state.budget.reserved = reserved;
+        self.state.budget.entity_uses.insert(entity, uses);
+        self.state.in_flight.remove(&call_id);
         Ok(())
     }
 }
@@ -2469,7 +2536,9 @@ fn blocks_payment(reservation: &Reservation, tool: &ToolPolicy, entity: &str) ->
     reservation.entity == entity
         && match reservation.state {
             ResState::NeedsReconcile => true,
-            ResState::Held | ResState::AwaitingStepUp => tool.amount_binding.is_some(),
+            ResState::Held | ResState::AwaitingStepUp | ResState::Forwarded => {
+                tool.amount_binding.is_some()
+            }
             ResState::Committed | ResState::Released => false,
         }
 }
@@ -3530,9 +3599,11 @@ mod tests {
         let mut engine = engine();
         lookup(&mut engine, 1, "INV-1001", "30000", "USD");
         let first = allowed(pay(&mut engine, 2, "INV-1001", 30_000));
-        engine
-            .commit(first.reservation.unwrap().reservation_id)
-            .unwrap();
+        forward_and_settle(
+            &mut engine,
+            first.reservation.unwrap().reservation_id,
+            EXECUTED,
+        );
         lookup(&mut engine, 3, "INV-1001", "0", "USD");
         assert_eq!(
             denied(pay(&mut engine, 4, "INV-1001", 30_000)),
@@ -3756,7 +3827,7 @@ mod tests {
             let ticket = allowed(pay(&mut engine, pay_id, "INV-1001", 1000))
                 .reservation
                 .unwrap();
-            engine.commit(ticket.reservation_id).unwrap();
+            forward_and_settle(&mut engine, ticket.reservation_id, EXECUTED);
         }
         lookup(&mut engine, 5, "INV-1001", "1000", "USD");
         assert_eq!(
@@ -4453,25 +4524,31 @@ mod tests {
     }
 
     #[test]
-    fn commit_awaiting_step_up_rejected() {
+    fn awaiting_step_up_cannot_be_forwarded_or_settled() {
+        // F-15: no forward, and no settlement, until a human approves.
+        let host = HostAuthority::for_tests();
         let (mut engine, approval) = awaiting_step_up();
-        assert_eq!(
-            engine.commit(approval.reservation_id),
-            Err(PepError::InvalidTransition)
-        );
-        let reservation = &engine.state().budget.reservations[&approval.reservation_id];
+        let id = approval.reservation_id;
+        assert_eq!(engine.mark_forwarded(id), Err(PepError::InvalidTransition));
+        for outcome in [EXECUTED, REFUSED, UNKNOWN] {
+            assert_eq!(
+                engine.settle(&host, id, outcome),
+                Err(PepError::InvalidTransition)
+            );
+        }
+        let reservation = &engine.state().budget.reservations[&id];
         assert_eq!(reservation.state, ResState::AwaitingStepUp);
         assert_eq!(engine.state().budget.reserved, 60_000);
     }
 
     #[test]
-    fn approve_step_up_then_commit() {
+    fn approve_step_up_then_forward_and_settle() {
         let host = HostAuthority::for_tests();
         let (mut engine, approval) = awaiting_step_up();
         engine
             .approve_step_up(&host, approval.reservation_id)
             .unwrap();
-        engine.commit(approval.reservation_id).unwrap();
+        forward_and_settle(&mut engine, approval.reservation_id, EXECUTED);
         assert_eq!(engine.state().budget.reserved, 0);
         assert_eq!(engine.state().budget.committed, 60_000);
     }
@@ -4494,29 +4571,16 @@ mod tests {
     }
 
     #[test]
-    fn abort_accepts_awaiting_step_up() {
-        let host = HostAuthority::for_tests();
+    fn decline_releases_awaiting_step_up() {
+        // The operator's decline, or a step-up timeout: nothing was sent.
         let (mut declined, approval) = awaiting_step_up();
         declined
-            .abort(
-                &host,
-                approval.reservation_id,
-                AbortOutcome::DefinitelyNotExecuted,
-            )
+            .release_unforwarded(approval.reservation_id)
             .unwrap();
         assert_eq!(declined.state().budget.reserved, 0);
         assert_eq!(
             declined.state().budget.reservations[&approval.reservation_id].state,
             ResState::Released
-        );
-        let (mut unknown, approval) = awaiting_step_up();
-        unknown
-            .abort(&host, approval.reservation_id, AbortOutcome::Unknown)
-            .unwrap();
-        assert_eq!(unknown.state().budget.reserved, 60_000);
-        assert_eq!(
-            unknown.state().budget.reservations[&approval.reservation_id].state,
-            ResState::NeedsReconcile
         );
     }
 
@@ -4569,6 +4633,17 @@ mod tests {
         );
     }
 
+    const EXECUTED: Settlement = Settlement::Executed;
+    const REFUSED: Settlement = Settlement::Aborted(AbortOutcome::DefinitelyNotExecuted);
+    const UNKNOWN: Settlement = Settlement::Aborted(AbortOutcome::Unknown);
+
+    /// Forwards a `Held` payment and settles it with the broker's outcome.
+    fn forward_and_settle(engine: &mut PepEngine, id: u64, outcome: Settlement) {
+        let host = HostAuthority::for_tests();
+        engine.mark_forwarded(id).unwrap();
+        engine.settle(&host, id, outcome).unwrap();
+    }
+
     fn held_payment() -> (PepEngine, u64) {
         let mut engine = engine();
         lookup(&mut engine, 1, "INV-1001", "30000", "USD");
@@ -4577,39 +4652,58 @@ mod tests {
     }
 
     #[test]
-    fn abort_unknown_keeps_reserved() {
+    fn unknown_settlement_keeps_reserved() {
         let host = HostAuthority::for_tests();
         let (mut engine, id) = held_payment();
-        engine.abort(&host, id, AbortOutcome::Unknown).unwrap();
+        forward_and_settle(&mut engine, id, UNKNOWN);
         assert_eq!(engine.state().budget.reserved, 30_000);
         assert_eq!(
             engine.state().budget.reservations[&id].state,
             ResState::NeedsReconcile
         );
-        assert_eq!(engine.commit(id), Err(PepError::InvalidTransition));
+        // Nothing ends it again: Week 3's reconciliation will.
+        assert_eq!(
+            engine.settle(&host, id, EXECUTED),
+            Err(PepError::InvalidTransition)
+        );
+        assert_eq!(
+            engine.release_unforwarded(id),
+            Err(PepError::InvalidTransition)
+        );
+        assert_eq!(engine.mark_forwarded(id), Err(PepError::InvalidTransition));
     }
 
     #[test]
-    fn abort_definitely_releases() {
-        let host = HostAuthority::for_tests();
+    fn refused_settlement_releases() {
         let (mut engine, id) = held_payment();
-        engine
-            .abort(&host, id, AbortOutcome::DefinitelyNotExecuted)
-            .unwrap();
+        forward_and_settle(&mut engine, id, REFUSED);
         let budget = &engine.state().budget;
         assert_eq!(budget.reserved, 0);
         assert_eq!(budget.entity_uses["INV-1001"], 0);
         assert_eq!(budget.calls, 1);
         assert_eq!(budget.reservations[&id].state, ResState::Released);
+        // A release before forwarding keeps the same books.
+        let (mut unsent, id) = held_payment();
+        unsent.release_unforwarded(id).unwrap();
+        assert_eq!(unsent.state().budget, engine.state().budget);
     }
 
     #[test]
-    fn abort_clears_in_flight() {
-        let host = HostAuthority::for_tests();
+    fn release_and_settlement_clear_in_flight() {
+        for end in ["release", "refused", "unknown"] {
+            let (mut engine, id) = held_payment();
+            assert!(engine.state().in_flight.contains_key("2"));
+            match end {
+                "release" => engine.release_unforwarded(id).unwrap(),
+                "refused" => forward_and_settle(&mut engine, id, REFUSED),
+                _ => forward_and_settle(&mut engine, id, UNKNOWN),
+            }
+            assert!(!engine.state().in_flight.contains_key("2"), "{end}");
+        }
+        // An executed payment stays in flight, so its result can still be recorded.
         let (mut engine, id) = held_payment();
+        forward_and_settle(&mut engine, id, EXECUTED);
         assert!(engine.state().in_flight.contains_key("2"));
-        engine.abort(&host, id, AbortOutcome::Unknown).unwrap();
-        assert!(!engine.state().in_flight.contains_key("2"));
     }
 
     #[test]
@@ -4630,14 +4724,64 @@ mod tests {
     }
 
     #[test]
-    fn commit_after_release_fails() {
+    fn nothing_ends_a_released_reservation() {
         let host = HostAuthority::for_tests();
         let (mut engine, id) = held_payment();
-        engine
-            .abort(&host, id, AbortOutcome::DefinitelyNotExecuted)
-            .unwrap();
-        assert_eq!(engine.commit(id), Err(PepError::InvalidTransition));
-        assert_eq!(engine.commit(99), Err(PepError::UnknownReservation));
+        engine.release_unforwarded(id).unwrap();
+        assert_eq!(engine.mark_forwarded(id), Err(PepError::InvalidTransition));
+        assert_eq!(
+            engine.settle(&host, id, EXECUTED),
+            Err(PepError::InvalidTransition)
+        );
+        assert_eq!(
+            engine.release_unforwarded(id),
+            Err(PepError::InvalidTransition)
+        );
+        assert_eq!(engine.mark_forwarded(99), Err(PepError::UnknownReservation));
+        assert_eq!(
+            engine.settle(&host, 99, EXECUTED),
+            Err(PepError::UnknownReservation)
+        );
+    }
+
+    /// P1, RV4 #17: once forwarded, nothing on the agent path can release a payment, and only
+    /// `settle` ends it.
+    #[test]
+    fn a_forwarded_payment_ends_only_through_settle() {
+        let host = HostAuthority::for_tests();
+        let (mut engine, id) = held_payment();
+        engine.mark_forwarded(id).unwrap();
+        assert_eq!(
+            engine.state().budget.reservations[&id].state,
+            ResState::Forwarded
+        );
+        assert_eq!(
+            engine.release_unforwarded(id),
+            Err(PepError::InvalidTransition)
+        );
+        assert_eq!(engine.mark_forwarded(id), Err(PepError::InvalidTransition));
+        assert_eq!(engine.state().budget.reserved, 30_000);
+        // Still live: a second amount-bound payment to the invoice waits for it.
+        lookup(&mut engine, 3, "INV-1001", "30000", "USD");
+        assert_eq!(
+            denied(pay(&mut engine, 4, "INV-1001", 30_000)),
+            (GuardId::Budget, PolicyError::PaymentPending)
+        );
+        engine.settle(&host, id, EXECUTED).unwrap();
+        assert_eq!(engine.state().budget.committed, 30_000);
+        assert_eq!(
+            engine.settle(&host, id, EXECUTED),
+            Err(PepError::InvalidTransition)
+        );
+    }
+
+    /// A ticket, and so a Call Proof, exists only for a `Held` reservation (F-15, T1).
+    #[test]
+    fn ticket_only_while_held() {
+        let (mut engine, id) = held_payment();
+        assert!(engine.ticket(id).is_ok());
+        engine.mark_forwarded(id).unwrap();
+        assert_eq!(engine.ticket(id), Err(PepError::InvalidTransition));
     }
 
     #[test]
@@ -4839,7 +4983,7 @@ mod tests {
             .copied()
             .max()
             .unwrap();
-        engine.commit(reservation).unwrap();
+        forward_and_settle(&mut engine, reservation, EXECUTED);
         allowed(pay(&mut engine, 6, "INV-1001", 30_000));
     }
 
@@ -4857,9 +5001,8 @@ mod tests {
 
     #[test]
     fn needs_reconcile_blocks_the_entity_until_resolved() {
-        let host = HostAuthority::for_tests();
         let (mut engine, id) = held_payment();
-        engine.abort(&host, id, AbortOutcome::Unknown).unwrap();
+        forward_and_settle(&mut engine, id, UNKNOWN);
         lookup(&mut engine, 3, "INV-1001", "30000", "USD");
         assert_eq!(
             denied(pay(&mut engine, 4, "INV-1001", 30_000)),
@@ -4887,9 +5030,8 @@ mod tests {
         let first = allowed(pay_to(&mut engine, 1, "rcpt_A", 100))
             .reservation
             .unwrap();
-        engine
-            .abort(&host, first.reservation_id, AbortOutcome::Unknown)
-            .unwrap();
+        engine.mark_forwarded(first.reservation_id).unwrap();
+        engine.settle(&host, first.reservation_id, UNKNOWN).unwrap();
         // A fresh trusted input passes G_prov; the unresolved payment still blocks the entity.
         fund(&mut engine, "u2", "rcpt_A", 100);
         assert_eq!(
@@ -4966,18 +5108,19 @@ mod tests {
 
     #[test]
     fn only_a_released_payment_frees_its_witness() {
-        let host = HostAuthority::for_tests();
         let (mut unknown, id) = held_payment();
-        unknown.abort(&host, id, AbortOutcome::Unknown).unwrap();
+        forward_and_settle(&mut unknown, id, UNKNOWN);
         assert_eq!(
             denied(pay(&mut unknown, 3, "INV-1001", 30_000)),
             (GuardId::Prov, PolicyError::ProvenanceConsumed)
         );
         let (mut released, id) = held_payment();
-        released
-            .abort(&host, id, AbortOutcome::DefinitelyNotExecuted)
-            .unwrap();
+        forward_and_settle(&mut released, id, REFUSED);
         allowed(pay(&mut released, 3, "INV-1001", 30_000));
+        // A payment released before it was sent frees its witness the same way.
+        let (mut unsent, id) = held_payment();
+        unsent.release_unforwarded(id).unwrap();
+        allowed(pay(&mut unsent, 3, "INV-1001", 30_000));
     }
 
     #[test]
@@ -5027,9 +5170,8 @@ mod tests {
 
     #[test]
     fn aborted_call_id_is_never_reused() {
-        let host = HostAuthority::for_tests();
         let (mut engine, id) = held_payment();
-        engine.abort(&host, id, AbortOutcome::Unknown).unwrap();
+        forward_and_settle(&mut engine, id, UNKNOWN);
         assert_eq!(
             denied(engine.evaluate_raw(&request(2, "get_ticket", r#"{"ticket_id":"T-1"}"#))),
             (GuardId::Canon, PolicyError::DuplicateCallId)
