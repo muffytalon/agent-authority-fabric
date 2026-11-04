@@ -10,7 +10,7 @@
 use core::fmt;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use crate::jcs::{self, JcsError, JcsObject, JcsValue, OriginRef, ParseOptions};
 
@@ -93,6 +93,13 @@ pub enum PolicyError {
     /// The tool is not in the pinned tool set.
     #[error("tool is not pinned")]
     ToolNotPinned,
+    /// The tool's server is not `Serving`: suspended after a failed poll, quarantined after a
+    /// definition mismatch, or not yet polled (L1). The agent cannot tell these apart.
+    #[error("tool's server is not serving")]
+    ToolQuarantined,
+    /// The payment's witness came from a tool whose server is not `Serving` (RV4 #2).
+    #[error("witness server is not serving")]
+    WitnessQuarantined,
     /// The pins do not match the intent's release epoch or lockfile digest.
     #[error("pins do not match the intent release")]
     PinEpochMismatch,
@@ -221,6 +228,9 @@ pub enum ConfigError {
     /// A tool is pinned under a key other than its name, or under a reserved name.
     #[error("invalid tool name")]
     InvalidToolName,
+    /// A tool's `server_id` is not 1 to 64 characters of `[A-Za-z0-9_.-]`.
+    #[error("invalid server id")]
+    InvalidServerId,
     /// A mutating-internal tool declares no store location, so its writes could not be
     /// tainted (F-08).
     #[error("mutating tool has no store location")]
@@ -729,6 +739,10 @@ pub struct AmountBinding {
 pub struct ToolPolicy {
     /// Tool name.
     pub name: String,
+    /// The lockfile `server_id` of the server that serves the tool (L1). Its state in
+    /// [`ServerStates`] decides whether the tool may be called, and whether a record it
+    /// produced may fund a payment.
+    pub server_id: String,
     /// Digest of the tool's schema.
     pub schema_digest: String,
     /// What the tool does.
@@ -1003,6 +1017,9 @@ pub struct InFlight {
     pub arguments: JcsValue,
     /// The call's store location, if any.
     pub store_key: Option<StoreKey>,
+    /// Best-effort confidentiality of the call's inputs when it was allowed. A denial before
+    /// the point of forwarding ratchets `context_conf` to it (F-09).
+    pub input_conf: Confidentiality,
 }
 
 /// Everything the engine knows about one episode.
@@ -1186,6 +1203,94 @@ pub trait Engine {
     fn evaluate(&mut self, call: &ToolCall) -> Result<Decision, PepError>;
 }
 
+/// The state of one pinned server, as the drift poller last saw it (L1, RV4 #9).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServerState {
+    /// Its last poll matched the pins.
+    Serving,
+    /// Not yet polled, or its last poll failed. The next matching poll lifts it.
+    Suspended,
+    /// A poll found a definition that differs from the pins. Permanent for the loaded
+    /// lockfile; the journal keeps it across restarts (R1).
+    Quarantined,
+}
+
+/// Every pinned server's state, shared by all episodes. A server nobody has reported on is
+/// `Suspended`, so no tool is callable before its server's first matching poll.
+#[derive(Debug, Default)]
+pub struct ServerStates {
+    states: RwLock<BTreeMap<String, ServerState>>,
+}
+
+impl ServerStates {
+    /// No server reported yet: every server is `Suspended`.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// A poll matched the pins: the server serves again, unless it is quarantined.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Poisoned`] if the lock was poisoned.
+    pub fn set_serving(&self, server_id: &str) -> Result<(), StoreError> {
+        self.update(server_id, ServerState::Serving)
+    }
+
+    /// A poll failed: the server is suspended, unless it is quarantined.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Poisoned`] if the lock was poisoned.
+    pub fn suspend(&self, server_id: &str) -> Result<(), StoreError> {
+        self.update(server_id, ServerState::Suspended)
+    }
+
+    /// A poll found drift: the server is quarantined for good.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Poisoned`] if the lock was poisoned.
+    pub fn quarantine(&self, server_id: &str) -> Result<(), StoreError> {
+        self.update(server_id, ServerState::Quarantined)
+    }
+
+    /// The server's state. An unknown server is `Suspended`; a poisoned lock reads as
+    /// `Quarantined` (fail closed).
+    #[must_use]
+    pub fn state(&self, server_id: &str) -> ServerState {
+        self.states
+            .read()
+            .map_or(ServerState::Quarantined, |states| {
+                states
+                    .get(server_id)
+                    .copied()
+                    .unwrap_or(ServerState::Suspended)
+            })
+    }
+
+    fn update(&self, server_id: &str, next: ServerState) -> Result<(), StoreError> {
+        let mut states = self.states.write().map_err(|_| StoreError::Poisoned)?;
+        let entry = states
+            .entry(server_id.to_owned())
+            .or_insert(ServerState::Suspended);
+        if *entry != ServerState::Quarantined {
+            *entry = next;
+        }
+        Ok(())
+    }
+}
+
+/// The PEP-wide state that every episode's engine shares.
+#[derive(Debug, Clone)]
+pub struct Shared {
+    /// The F-08 label store.
+    pub labels: Arc<dyn LabelStore>,
+    /// Every pinned server's state (L1).
+    pub servers: Arc<ServerStates>,
+}
+
 /// The policy enforcement engine for one episode.
 #[derive(Debug)]
 pub struct PepEngine {
@@ -1193,6 +1298,7 @@ pub struct PepEngine {
     seq: SeqPolicy,
     state: EpisodeState,
     labels: Arc<dyn LabelStore>,
+    servers: Arc<ServerStates>,
 }
 
 struct RoleArgs<'a> {
@@ -1285,7 +1391,7 @@ impl PepEngine {
         mut intent: PepIntent,
         pins: ToolPins,
         seq: SeqPolicy,
-        labels: Arc<dyn LabelStore>,
+        shared: Shared,
     ) -> Result<Self, PepError> {
         validate_config(&intent, &pins)?;
         intent.entities.ids = intent.entities.ids.normalized();
@@ -1293,8 +1399,96 @@ impl PepEngine {
             pins,
             seq,
             state: EpisodeState::new(intent),
-            labels,
+            labels: shared.labels,
+            servers: shared.servers,
         })
+    }
+
+    /// Re-runs, just before the point of forwarding, the checks that can change while a call
+    /// waits (P1, RV3 A4): the release epoch, the tool's server state, and for a payment the
+    /// state of the server that produced its witness (RV4 #2). The caller also confirms the
+    /// episode is live, and on a failure calls [`PepEngine::release_unforwarded`]. A denial
+    /// ratchets `context_conf` to the call's [`InFlight::input_conf`] (F-09).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PepError::UnknownCall`] if the call is not in flight, or a
+    /// [`PepError::Denied`] from `G_pin` or `G_prov`.
+    pub fn recheck_before_forward(&mut self, call_id: &str) -> Result<(), PepError> {
+        let input_conf = self
+            .state
+            .in_flight
+            .get(call_id)
+            .ok_or(PepError::UnknownCall)?
+            .input_conf;
+        let result = self.recheck(call_id);
+        if result.is_err() {
+            // F-09: the agent learns of this denial, so it ratchets like any other.
+            self.state.context_conf = self.state.context_conf.max(input_conf);
+        }
+        result
+    }
+
+    fn recheck(&self, call_id: &str) -> Result<(), PepError> {
+        let in_flight = self
+            .state
+            .in_flight
+            .get(call_id)
+            .ok_or(PepError::UnknownCall)?;
+        let tool = self
+            .pins
+            .tools
+            .get(&in_flight.tool)
+            .ok_or(PepError::UnknownCall)?;
+        self.pin_checks(tool)?;
+        let reservation = self
+            .state
+            .budget
+            .reservations
+            .values()
+            .find(|reservation| reservation.call_id == call_id);
+        if let Some(reservation) = reservation {
+            // A reservation always has its witness; a missing one fails closed.
+            let record = self
+                .state
+                .records
+                .get(&reservation.witness_seq)
+                .ok_or(deny(GuardId::Prov, PolicyError::WitnessQuarantined))?;
+            self.witness_server_check(record)?;
+        }
+        Ok(())
+    }
+
+    /// The `G_pin` checks after the tool is found: the release epoch and the tool's server.
+    fn pin_checks(&self, tool: &ToolPolicy) -> Result<(), PepError> {
+        let intent = &self.state.intent;
+        if self.pins.release_epoch != intent.release_epoch
+            || self.pins.lockfile_digest != intent.lockfile_digest
+        {
+            return Err(deny(GuardId::Pin, PolicyError::PinEpochMismatch));
+        }
+        if self.servers.state(&tool.server_id) != ServerState::Serving {
+            return Err(deny(GuardId::Pin, PolicyError::ToolQuarantined));
+        }
+        Ok(())
+    }
+
+    /// A witness produced by a pinned tool counts only while that tool's server serves. A
+    /// trusted input has no server.
+    fn witness_server_check(&self, record: &Recorded) -> Result<(), PepError> {
+        if record.tool == TRUSTED_INPUT_TOOL {
+            return Ok(());
+        }
+        let serving = self
+            .pins
+            .tools
+            .get(&record.tool)
+            .is_some_and(|tool| self.servers.state(&tool.server_id) == ServerState::Serving);
+        if serving {
+            Ok(())
+        } else {
+            Err(deny(GuardId::Prov, PolicyError::WitnessQuarantined))
+        }
     }
 
     /// Parses raw JSON-RPC request bytes with JCS-strict-NFC, then evaluates the call.
@@ -1568,17 +1762,16 @@ impl PepEngine {
         let not_pinned = deny(GuardId::Pin, PolicyError::ToolNotPinned);
         let name = call.name().ok_or(not_pinned)?;
         let tool = self.pins.tools.get(name).ok_or(not_pinned)?;
-        if self.pins.release_epoch != intent.release_epoch
-            || self.pins.lockfile_digest != intent.lockfile_digest
-        {
-            return Err(deny(GuardId::Pin, PolicyError::PinEpochMismatch));
-        }
+        self.pin_checks(tool)?;
 
         // 2. G_canon
         let canon = g_canon(state, &self.pins, tool, call)?;
 
         // 3. G_prov
         let witness = g_prov(state, tool, &canon.roles)?;
+        if let Some(witness) = &witness {
+            self.witness_server_check(witness.record)?;
+        }
 
         // 4. G_entity
         let entity = g_entity(intent, &state.budget, tool, &canon.roles)?;
@@ -1617,7 +1810,7 @@ impl PepEngine {
 
     /// The only mutation point. The fallible label writes run first, so nothing ever needs
     /// rolling back; everything after them was computed by the guards and cannot fail.
-    fn apply(&mut self, plan: Plan) -> Result<Decision, PepError> {
+    fn apply(&mut self, plan: Plan, input_conf: Confidentiality) -> Result<Decision, PepError> {
         let Plan {
             call_id,
             tool,
@@ -1714,6 +1907,7 @@ impl PepEngine {
                 action_digest,
                 arguments,
                 store_key,
+                input_conf,
             },
         );
         state.last_tool = Some(tool);
@@ -1778,7 +1972,7 @@ impl Engine for PepEngine {
     fn evaluate(&mut self, call: &ToolCall) -> Result<Decision, PepError> {
         let call_max_conf = self.pre_pass(call);
         match self.check(call) {
-            Ok(plan) => self.apply(plan),
+            Ok(plan) => self.apply(plan, call_max_conf),
             Err(error) => {
                 // F-09: a denial involving confidential inputs raises the context level.
                 self.state.context_conf = self.state.context_conf.max(call_max_conf);
@@ -1992,6 +2186,17 @@ fn validate_tool_name(key: &str, tool: &ToolPolicy) -> Result<(), ConfigError> {
     let is_nfc = jcs::JcsString::new(name).as_str() == name;
     if key != name || name.is_empty() || !is_nfc || name.starts_with(RESERVED_TOOL_PREFIX) {
         return Err(ConfigError::InvalidToolName);
+    }
+    // The broker routes `/mcp/{server_id}`, so the id must be a plain path segment, never a
+    // dot-segment that path normalisation would resolve to another route.
+    let server = tool.server_id.as_str();
+    if !(1..=64).contains(&server.len())
+        || matches!(server, "." | "..")
+        || !server
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-'))
+    {
+        return Err(ConfigError::InvalidServerId);
     }
     Ok(())
 }
@@ -2898,9 +3103,20 @@ mod tests {
         }
     }
 
+    /// The shared state for a test engine: `labels`, with the fixture servers `a` (the
+    /// default for every pinned tool), `b` and `sor` (a separate system of record) serving.
+    fn serving(labels: Arc<dyn LabelStore>) -> Shared {
+        let servers = Arc::new(ServerStates::new());
+        for server in ["a", "b", "sor"] {
+            servers.set_serving(server).unwrap();
+        }
+        Shared { labels, servers }
+    }
+
     fn tool(name: &str, effect: EffectClass, args: Vec<ArgSpec>) -> ToolPolicy {
         ToolPolicy {
             name: name.to_owned(),
+            server_id: "a".to_owned(),
             schema_digest: "sha-256:test".to_owned(),
             effect,
             args,
@@ -3107,7 +3323,7 @@ mod tests {
             intent(ids, limits),
             pins(),
             SeqPolicy::Unconstrained,
-            shared.clone(),
+            serving(shared.clone()),
         )
         .unwrap()
     }
@@ -3210,7 +3426,7 @@ mod tests {
     }
 
     fn config_error(intent: PepIntent, pins: ToolPins) -> ConfigError {
-        match PepEngine::new(intent, pins, SeqPolicy::Unconstrained, store()) {
+        match PepEngine::new(intent, pins, SeqPolicy::Unconstrained, serving(store())) {
             Err(PepError::InvalidConfig(error)) => error,
             other => panic!("expected InvalidConfig, got {other:?}"),
         }
@@ -3280,13 +3496,269 @@ mod tests {
             intent(invoices(), limits("USD")),
             stale,
             SeqPolicy::Unconstrained,
-            store(),
+            serving(store()),
         )
         .unwrap();
         assert_eq!(
             denied(engine.evaluate_raw(&request(1, "get_ticket", r#"{"ticket_id":"T-1"}"#))),
             (GuardId::Pin, PolicyError::PinEpochMismatch)
         );
+    }
+
+    // ---- Server states (L1, RV4 #2, #9) ----
+
+    /// The fixture pins with `get_invoice` served by `sor`, a system of record apart from the
+    /// payment server `a`.
+    fn sor_pins() -> ToolPins {
+        let mut pins = pins();
+        pins.tools.get_mut("get_invoice").unwrap().server_id = "sor".to_owned();
+        pins
+    }
+
+    /// An engine on `pins`, with the server states the test drives.
+    fn engine_with_servers(pins: ToolPins) -> (PepEngine, Arc<ServerStates>) {
+        let shared = serving(store());
+        let servers = shared.servers.clone();
+        let engine = PepEngine::new(
+            intent(invoices(), limits("USD")),
+            pins,
+            SeqPolicy::Unconstrained,
+            shared,
+        )
+        .unwrap();
+        (engine, servers)
+    }
+
+    fn ticket(id: u64) -> Vec<u8> {
+        request(id, "get_ticket", r#"{"ticket_id":"T-1"}"#)
+    }
+
+    const NOT_SERVING: (GuardId, PolicyError) = (GuardId::Pin, PolicyError::ToolQuarantined);
+    const WITNESS_NOT_SERVING: (GuardId, PolicyError) =
+        (GuardId::Prov, PolicyError::WitnessQuarantined);
+
+    #[test]
+    fn only_a_serving_server_takes_calls() {
+        let (mut engine, servers) = engine_with_servers(pins());
+        allowed(engine.evaluate_raw(&ticket(1)));
+        servers.suspend("a").unwrap();
+        assert_eq!(denied(engine.evaluate_raw(&ticket(2))), NOT_SERVING);
+        servers.set_serving("a").unwrap();
+        allowed(engine.evaluate_raw(&ticket(3)));
+        servers.quarantine("a").unwrap();
+        assert_eq!(denied(engine.evaluate_raw(&ticket(4))), NOT_SERVING);
+        // Only server `a` is affected.
+        servers.set_serving("b").unwrap();
+        assert_eq!(servers.state("b"), ServerState::Serving);
+    }
+
+    #[test]
+    fn quarantine_is_permanent() {
+        let (mut engine, servers) = engine_with_servers(pins());
+        servers.quarantine("a").unwrap();
+        servers.set_serving("a").unwrap();
+        servers.suspend("a").unwrap();
+        servers.set_serving("a").unwrap();
+        assert_eq!(servers.state("a"), ServerState::Quarantined);
+        assert_eq!(denied(engine.evaluate_raw(&ticket(1))), NOT_SERVING);
+    }
+
+    #[test]
+    fn a_server_never_polled_is_suspended() {
+        let servers = Arc::new(ServerStates::new());
+        assert_eq!(servers.state("a"), ServerState::Suspended);
+        let mut engine = PepEngine::new(
+            intent(invoices(), limits("USD")),
+            pins(),
+            SeqPolicy::Unconstrained,
+            Shared {
+                labels: store(),
+                servers,
+            },
+        )
+        .unwrap();
+        assert_eq!(denied(engine.evaluate_raw(&ticket(1))), NOT_SERVING);
+    }
+
+    #[test]
+    fn a_poisoned_server_table_reads_as_quarantined() {
+        let servers = Arc::new(ServerStates::new());
+        servers.set_serving("a").unwrap();
+        let poisoner = servers.clone();
+        let handle = std::thread::spawn(move || {
+            let _guard = poisoner.states.write().unwrap();
+            panic!("poisoning the server table on purpose");
+        });
+        assert!(handle.join().is_err());
+        assert_eq!(servers.state("a"), ServerState::Quarantined);
+        assert_eq!(servers.set_serving("a"), Err(StoreError::Poisoned));
+    }
+
+    #[test]
+    fn a_witness_from_a_server_not_serving_funds_nothing() {
+        // RV4 #2: the payment server serves, but the lookup that witnesses the amount came from
+        // a server that has since stopped serving.
+        let (mut engine, servers) = engine_with_servers(sor_pins());
+        lookup(&mut engine, 1, "INV-1001", "30000", "USD");
+        lookup(&mut engine, 2, "INV-1002", "20000", "USD");
+        servers.suspend("sor").unwrap();
+        assert_eq!(
+            denied(pay(&mut engine, 3, "INV-1001", 30_000)),
+            WITNESS_NOT_SERVING
+        );
+        assert_eq!(engine.state().budget.reserved, 0);
+        servers.set_serving("sor").unwrap();
+        allowed(pay(&mut engine, 4, "INV-1001", 30_000));
+        servers.quarantine("sor").unwrap();
+        assert_eq!(
+            denied(pay(&mut engine, 5, "INV-1002", 20_000)),
+            WITNESS_NOT_SERVING
+        );
+        assert_eq!(engine.state().budget.reserved, 30_000);
+    }
+
+    #[test]
+    fn a_trusted_input_witness_has_no_server() {
+        let shared = serving(store());
+        let servers = shared.servers.clone();
+        let mut engine = PepEngine::new(
+            intent(recipients(), limits("USD")),
+            sor_pins(),
+            SeqPolicy::Unconstrained,
+            shared,
+        )
+        .unwrap();
+        servers.quarantine("sor").unwrap();
+        let host = HostAuthority::for_tests();
+        engine
+            .record_trusted_input(
+                &host,
+                "u1",
+                br#"{"entity":"rcpt_A","amount_minor":100}"#,
+                Confidentiality::Internal,
+            )
+            .unwrap();
+        allowed(pay_to(&mut engine, 1, "rcpt_A", 100));
+        engine.recheck_before_forward("1").unwrap();
+    }
+
+    #[test]
+    fn recheck_before_forward_sees_a_new_quarantine() {
+        let (mut engine, servers) = engine_with_servers(pins());
+        allowed(engine.evaluate_raw(&ticket(1)));
+        engine.recheck_before_forward("1").unwrap();
+        servers.quarantine("a").unwrap();
+        assert_eq!(
+            engine.recheck_before_forward("1"),
+            Err(deny(NOT_SERVING.0, NOT_SERVING.1))
+        );
+        assert_eq!(
+            engine.recheck_before_forward("2"),
+            Err(PepError::UnknownCall)
+        );
+    }
+
+    #[test]
+    fn a_lookup_server_quarantined_during_step_up_blocks_the_forward() {
+        // The human approves after the witness's server drifted (RV3 A4, RV4 #2).
+        let host = HostAuthority::for_tests();
+        let (mut engine, servers) = engine_with_servers(sor_pins());
+        lookup(&mut engine, 1, "INV-1001", "60000", "USD");
+        let approval = pending(pay(&mut engine, 2, "INV-1001", 60_000));
+        servers.quarantine("sor").unwrap();
+        engine
+            .approve_step_up(&host, approval.reservation_id)
+            .unwrap();
+        assert_eq!(
+            engine.recheck_before_forward(&approval.call_id),
+            Err(deny(WITNESS_NOT_SERVING.0, WITNESS_NOT_SERVING.1))
+        );
+        engine.release_unforwarded(approval.reservation_id).unwrap();
+        assert_eq!(engine.state().budget.reserved, 0);
+    }
+
+    #[test]
+    fn recheck_fails_closed_without_the_witness_record() {
+        let (mut engine, _servers) = engine_with_servers(sor_pins());
+        lookup(&mut engine, 1, "INV-1001", "30000", "USD");
+        allowed(pay(&mut engine, 2, "INV-1001", 30_000));
+        engine.recheck_before_forward("2").unwrap();
+        // Not reachable through the API: every reservation's witness stays recorded.
+        engine.state.records.clear();
+        assert_eq!(
+            engine.recheck_before_forward("2"),
+            Err(deny(WITNESS_NOT_SERVING.0, WITNESS_NOT_SERVING.1))
+        );
+    }
+
+    #[test]
+    fn a_recheck_denial_ratchets_context_conf() {
+        let shared = store();
+        let mut writer = engine_on(&shared, invoices(), limits("USD"));
+        let host = HostAuthority::for_tests();
+        writer
+            .record_trusted_input(
+                &host,
+                "s",
+                br#"{"note":"secret"}"#,
+                Confidentiality::Confidential,
+            )
+            .unwrap();
+        allow(
+            &mut writer,
+            &request(1, "save_note", r#"{"key":"k1","text":"x"}"#),
+        );
+        let servers = Arc::new(ServerStates::new());
+        servers.set_serving("a").unwrap();
+        let mut reader = PepEngine::new(
+            intent(invoices(), limits("USD")),
+            pins(),
+            SeqPolicy::Unconstrained,
+            Shared {
+                labels: shared,
+                servers: servers.clone(),
+            },
+        )
+        .unwrap();
+        allow(&mut reader, &request(1, "get_note", r#"{"key":"k1"}"#));
+        reader.recheck_before_forward("1").unwrap();
+        assert_eq!(reader.state().context_conf, Confidentiality::Public);
+        servers.quarantine("a").unwrap();
+        assert!(reader.recheck_before_forward("1").is_err());
+        assert_eq!(reader.state().context_conf, Confidentiality::Confidential);
+    }
+
+    #[test]
+    fn server_ids_validated() {
+        let with_server = |server: &str| {
+            let mut custom = pins();
+            custom.tools.get_mut("get_ticket").unwrap().server_id = server.to_owned();
+            PepEngine::new(
+                intent(invoices(), limits("USD")),
+                custom,
+                SeqPolicy::Unconstrained,
+                serving(store()),
+            )
+        };
+        for server in [
+            "",
+            ".",
+            "..",
+            "a/b",
+            "a b",
+            "caf\u{e9}",
+            "a%2F",
+            &"s".repeat(65),
+        ] {
+            assert_eq!(
+                with_server(server).err(),
+                Some(PepError::InvalidConfig(ConfigError::InvalidServerId)),
+                "{server:?}"
+            );
+        }
+        for server in ["sor", "billing.v2_eu-1", "...", &"s".repeat(64)] {
+            assert!(with_server(server).is_ok(), "{server:?}");
+        }
     }
 
     #[test]
@@ -3299,7 +3771,7 @@ mod tests {
             intent(invoices(), limits("USD")),
             pins(),
             SeqPolicy::Transitions(transitions),
-            store(),
+            serving(store()),
         )
         .unwrap();
         assert_eq!(
@@ -3688,7 +4160,7 @@ mod tests {
             intent(invoices(), limits("USD")),
             custom,
             SeqPolicy::Unconstrained,
-            store(),
+            serving(store()),
         )
         .unwrap();
         allow(
@@ -3870,7 +4342,7 @@ mod tests {
             intent(invoices(), limits("USD")),
             custom,
             SeqPolicy::Unconstrained,
-            store(),
+            serving(store()),
         )
         .unwrap();
         allow(
@@ -4079,7 +4551,7 @@ mod tests {
                 intent(invoices(), limits("USD")),
                 pins,
                 SeqPolicy::Unconstrained,
-                shared.clone(),
+                serving(shared.clone()),
             )
             .unwrap()
         };
@@ -4357,7 +4829,7 @@ mod tests {
             intent(invoices(), limits("USD")),
             custom,
             SeqPolicy::Unconstrained,
-            store(),
+            serving(store()),
         )
         .unwrap();
         allow(
@@ -5540,7 +6012,7 @@ mod tests {
             intent(recipients(), limits("USD")),
             nested_pins(),
             SeqPolicy::Unconstrained,
-            store(),
+            serving(store()),
         )
         .unwrap();
         let host = HostAuthority::for_tests();
@@ -5572,7 +6044,7 @@ mod tests {
             intent(invoices(), limits("USD")),
             nested_pins(),
             SeqPolicy::Unconstrained,
-            store(),
+            serving(store()),
         )
         .unwrap();
         let redirect =
@@ -5636,7 +6108,7 @@ mod tests {
             intent(recipients(), limits("USD")),
             custom,
             SeqPolicy::Unconstrained,
-            store(),
+            serving(store()),
         )
         .unwrap();
         for (name, arguments) in [
@@ -5898,7 +6370,7 @@ mod tests {
                 intent(invoices(), limits("USD")),
                 custom,
                 SeqPolicy::Unconstrained,
-                store(),
+                serving(store()),
             )
             .err()
         };

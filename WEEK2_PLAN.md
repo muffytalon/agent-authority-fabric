@@ -876,6 +876,13 @@ The order follows RV2: p256, peer identity and the lock file come before the bin
 - **Server states (L1, RV4 #9).** A shared `Arc<ServerStates>` holds each server's state: `Serving`, `Suspended` (a failed poll; the next matching poll lifts it) or `Quarantined` (a definition mismatch; permanent for the loaded lockfile digest, and journaled, R1). G_pin denies a tool whose server is not `Serving`, with a new `PolicyError::ToolQuarantined` for both states, so the agent cannot tell them apart. Because it is a guard, F-09's ratchet still runs.
 - **Witness servers (RV4 #2).** G_prov also denies a payment whose witness record came from a tool on a server that is not `Serving` (new `PolicyError::WitnessQuarantined`). `validate_binding` lets `lookup_tool` live on another server, which is the realistic layout (a system of record and a PSP), so a drifted lookup server's Trusted amount, recorded before detection, could otherwise fund a payment to the healthy server after it. A trusted input has no server.
 - **Re-check before forwarding (P1, RV3 A4).** A new `PepEngine::recheck_before_forward(call_id)` re-runs G_pin's server-state and epoch checks, and for a payment G_prov's witness-server check (RV4 #2), for a call already allowed or approved. The actor calls it just before the point of forwarding, and checks the episode's liveness itself. On a failure it calls `release_unforwarded` (RV4 #17).
+
+  Implemented in step 7 (slice 5):
+  - `ToolPolicy` gains `server_id`, checked at config load: 1 to 64 characters of `[A-Za-z0-9_.-]`, and not `.` or `..`, since the broker routes `/mcp/{server_id}` (`ConfigError::InvalidServerId`).
+  - `PepEngine::new` takes a `Shared { labels, servers }`, the PEP-wide state; slice 6 adds the unresolved set to it.
+  - A server nobody has reported on reads as `Suspended`, and a poisoned lock as `Quarantined`. `set_serving` and `suspend` never lift a quarantine.
+  - A witness from a tool that is not pinned is denied.
+  - `recheck_before_forward` takes `&mut self`: a denial there reaches the agent, so it ratchets `context_conf` (F-09) to the call's input confidentiality, which `InFlight::input_conf` records when the call is allowed. A reservation whose witness record is missing fails closed.
 - **Pending-payment check (P1, RV4 #1).** `g_budget` denies a payment with `PolicyError::PaymentPending` when its entity (after NFC) matches:
   - a `NeedsReconcile` reservation's `entity`, for any payment;
   - a `Held`, `AwaitingStepUp` or `Forwarded` reservation's `entity`, for an amount-bound payment. Two live reservations on one invoice carry different F-07 keys, so the provider cannot dedupe them, and the agent needs no failure to get them: it only has to race inside the upstream window;
