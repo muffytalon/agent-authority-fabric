@@ -1,9 +1,9 @@
 # ryu-js (Boa project): real API and output behaviour compared with pep-sidecar's `=1.0.3` pin and its `ecma_number` call site (as of 2026-10-27)
 
 Local evidence used throughout (reading local files and running the project's own commands, not web searches):
-- **PROJECT** = `C:\Users\mitam\OneDrive\Documents\Cryptographic Biscuits\agent-authority-fabric\` (Cargo.toml, Cargo.lock, src\jcs.rs).
+- **PROJECT** = the repository root (`Cargo.toml`, `Cargo.lock`, `src/jcs.rs`).
 - **LOCAL** = the real crates.io package unpacked by Cargo in WSL: `/home/fletchling/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ryu-js-1.0.3/`. Its `.crate` file's SHA-256 equals the crates.io checksum (see Q1), so its text is the published 1.0.3 source, the same source docs.rs renders.
-- **RUN** = commands run in WSL on 2026-10-27 with `CARGO_TARGET_DIR=$HOME/.cargo-target/pep-sidecar RUSTFLAGS='-D warnings'`, `--locked --offline` (no change to the lockfile and no network access). Scripts: `C:\Users\mitam\AppData\Local\Temp\claude\c--Users-mitam-OneDrive-Documents-Cryptographic-Biscuits-agent-authority-fabric\cf2570fd-3856-4ec6-89eb-48c92f577416\scratchpad\run_ryu_tests.sh` and `...\scratchpad\run_ryu_clippy.sh` (same directory).
+- **RUN** = commands run in WSL on 2026-10-27 with `CARGO_TARGET_DIR=$HOME/.cargo-target/pep-sidecar RUSTFLAGS='-D warnings'`, `--locked --offline` (no change to the lockfile and no network access). Scripts: `run_ryu_tests.sh` and `run_ryu_clippy.sh`, in a scratch directory outside the repo.
 
 ## Q1. Does 1.0.3 exist, is it yanked, when was it published, what is the latest stable version, and which repository is official?
 

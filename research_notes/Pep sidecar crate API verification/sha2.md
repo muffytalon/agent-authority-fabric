@@ -2,7 +2,7 @@
 
 Provenance: web facts come from the crates.io JSON API, docs.rs (rendered pages and published sources), and the official RustCrypto GitHub repos. All of them were read through a summarizing fetch tool, so "verbatim" means verbatim as that tool returned it. Where the tool returned lines without indentation, I restored indentation and closing braces in the code blocks and say so. Independent cross-check: the SHA-256 checksums of sha2 0.11.1, digest 0.11.3 and hybrid-array 0.4.15 are identical in the crates.io API, in the upstream RustCrypto/hashes `Cargo.lock`, and in the project's local `Cargo.lock`. That corroborates the extracted data.
 
-Call site under test ([src/jcs.rs, local](<C:\Users\mitam\OneDrive\Documents\Cryptographic Biscuits\agent-authority-fabric\src\jcs.rs>), lines 8-10 and 599-603):
+Call site under test ([src/jcs.rs, local](<../../src/jcs.rs>), lines 8-10 and 599-603):
 
 ```rust
 use base64::Engine as _;
@@ -16,7 +16,7 @@ pub fn sha256_b64url(data: &[u8]) -> String {
 }
 ```
 
-Manifest line ([Cargo.toml, local](<C:\Users\mitam\OneDrive\Documents\Cryptographic Biscuits\agent-authority-fabric\Cargo.toml>), line 18): `sha2 = { version = "=0.11.1", default-features = false }  # 2026-10-12, MSRV 1.88`. The package has `edition = "2024"` and `rust-version = "1.88"` (lines 4-5).
+Manifest line ([Cargo.toml, local](<../../Cargo.toml>), line 18): `sha2 = { version = "=0.11.1", default-features = false }  # 2026-10-12, MSRV 1.88`. The package has `edition = "2024"` and `rust-version = "1.88"` (lines 4-5).
 
 ## Q1. Does sha2 0.11.1 exist as a stable, non-yanked release? When was it published? What are the latest stable version and the newest 0.10.x?
 
@@ -53,7 +53,7 @@ Yes. 0.11.1 is a real, non-yanked stable release published on 2026-10-12. As of 
   — [crates.io versions API](https://crates.io/api/v1/crates/sha2/versions)
 - The upstream CHANGELOG headings are `## 0.11.1 (2026-10-12)` and `## 0.11.0 (2026-03-25)`. — [sha2 CHANGELOG.md (RustCrypto/hashes master)](https://raw.githubusercontent.com/RustCrypto/hashes/master/sha2/CHANGELOG.md)
 - The newest 0.10.x is 0.10.9: `"created_at": "2025-04-30T14:38:09.894118Z"`, `"yanked": false`, `"rust_version": null`, `"edition": "2018"`, `"checksum": "a7507d819769d01a365ab707794a4084392c824f54a7a6a7862f8c3d0892b283"`, `"license": "MIT OR Apache-2.0"`. — [crates.io sha2 0.10.9 API](https://crates.io/api/v1/crates/sha2/0.10.9)
-- The project's lockfile records `name = "sha2"`, `version = "0.11.1"`, `checksum = "47d7069beb7d6ac7b9acd1039986e73443f24234f41074da099d6f994ac9ad19"`, with dependencies `"cfg-if"`, `"cpufeatures"` and `"digest"`. The checksum is byte-identical to crates.io. — [Cargo.lock, local](<C:\Users\mitam\OneDrive\Documents\Cryptographic Biscuits\agent-authority-fabric\Cargo.lock>) (lines 145-154); [crates.io versions API](https://crates.io/api/v1/crates/sha2/versions)
+- The project's lockfile records `name = "sha2"`, `version = "0.11.1"`, `checksum = "47d7069beb7d6ac7b9acd1039986e73443f24234f41074da099d6f994ac9ad19"`, with dependencies `"cfg-if"`, `"cpufeatures"` and `"digest"`. The checksum is byte-identical to crates.io. — [Cargo.lock, local](<../../Cargo.lock>) (lines 145-154); [crates.io versions API](https://crates.io/api/v1/crates/sha2/versions)
 - In the upstream workspace lock, `sha2` `0.11.1` is a path member (no source or checksum) with dependencies `"cfg-if"`, `"cpufeatures"`, `"digest"` and `"hex-literal"` (hex-literal is a dev-dependency). — [RustCrypto/hashes Cargo.lock (master)](https://raw.githubusercontent.com/RustCrypto/hashes/master/Cargo.lock)
 
 ### Inferences
@@ -78,7 +78,7 @@ sha2 0.11.1 declares `rust-version = "1.88"` and `edition = "2024"`. That equals
 - Conflict: the 0.11.1 README badge URL is `https://img.shields.io/badge/rustc-1.85+-blue.svg`, and the docs.rs crate page shows a `rustc-1.85+` badge. — [docs.rs: sha2 0.11.1 README.md source](https://docs.rs/crate/sha2/0.11.1/source/README.md); [docs.rs sha2 0.11.1 crate root](https://docs.rs/sha2/0.11.1/sha2/). Both are contradicted by `rust-version = "1.88"` in the [published manifest](https://docs.rs/crate/sha2/0.11.1/source/Cargo.toml) and by the 0.11.1 CHANGELOG line "MSRV bumped to 1.88 ([#926])" ([sha2 CHANGELOG.md](https://raw.githubusercontent.com/RustCrypto/hashes/master/sha2/CHANGELOG.md)).
 - digest 0.11.3 has `"rust_version": "1.85"` and `"edition": "2024"`. — [crates.io digest versions API](https://crates.io/api/v1/crates/digest/versions)
 - hybrid-array 0.4.15 has `"rust_version": "1.85"` and `"edition": "2024"`. — [crates.io hybrid-array API](https://crates.io/api/v1/crates/hybrid-array)
-- The project declares `edition = "2024"` and `rust-version = "1.88"`. — [Cargo.toml, local](<C:\Users\mitam\OneDrive\Documents\Cryptographic Biscuits\agent-authority-fabric\Cargo.toml>)
+- The project declares `edition = "2024"` and `rust-version = "1.88"`. — [Cargo.toml, local](<../../Cargo.toml>)
 
 ### Inferences
 - The chain is 1.88 (sha2 0.11.1) ≤ 1.88 (project `rust-version`) ≤ 1.97.0 (toolchain), so there is no MSRV conflict. The README badge is simply stale. Cargo enforces the manifest's `rust-version`, not the badge.
@@ -116,7 +116,7 @@ sha2 0.11.1 has exactly three features: `alloc`, `oid` and `zeroize`, with `defa
   ```json
   {"alloc":[],"block-api":["dep:block-buffer"],"default":["block-api"],"dev":["blobby"],"getrandom":["common/getrandom","rand_core"],"mac":["dep:ctutils"],"oid":["dep:const-oid"],"rand_core":["common/rand_core"],"zeroize":["dep:zeroize","block-buffer?/zeroize"]}
   ```
-- The project's lockfile has no `const-oid`, `zeroize`, `ctutils` or `blobby` packages, and its `digest` entry depends only on `"block-buffer"` and `"crypto-common"`. — [Cargo.lock, local](<C:\Users\mitam\OneDrive\Documents\Cryptographic Biscuits\agent-authority-fabric\Cargo.lock>) (lines 62-70)
+- The project's lockfile has no `const-oid`, `zeroize`, `ctutils` or `blobby` packages, and its `digest` entry depends only on `"block-buffer"` and `"crypto-common"`. — [Cargo.lock, local](<../../Cargo.lock>) (lines 62-70)
 
 ### Inferences
 - With `default-features = false` and no features enabled, the project still gets `sha2::Sha256` plus the blanket `Digest` impl, which is everything the call site uses. It loses `AssociatedOid` (the OID constant) and whatever `digest/alloc` gates, and the project uses neither.
@@ -197,7 +197,7 @@ In 0.11.1, `Sha256` is a newtype struct generated by `digest::buffer_fixed!` aro
   | typenum | 1.20.1, `b6f5e870…dda20` | 1.20.1, `b6f5e870…dda20` |
   | libc | **0.2.191**, `65cd87c9…240a` | **0.2.190**, `ce5d3ddc…be78` |
 
-  — [Cargo.lock, local](<C:\Users\mitam\OneDrive\Documents\Cryptographic Biscuits\agent-authority-fabric\Cargo.lock>); [RustCrypto/hashes Cargo.lock (master)](https://raw.githubusercontent.com/RustCrypto/hashes/master/Cargo.lock)
+  — [Cargo.lock, local](<../../Cargo.lock>); [RustCrypto/hashes Cargo.lock (master)](https://raw.githubusercontent.com/RustCrypto/hashes/master/Cargo.lock)
 
 ### Inferences
 - `sha2::{Digest, Sha256}` are the real public paths of the real crate. No "stand-in" API is involved.
@@ -288,7 +288,7 @@ In digest 0.11.3 the signature is `fn digest(data: impl AsRef<[u8]>) -> Output<S
       U: ArraySize<ArrayType<T> = [T; N]>,
   ```
 - The docs.rs `Array` page sidebar lists these Trait Implementations: `AsRef<[T]>`, `AsRef<Array<T, U>>`, `AsRef<[T; N]>`, `Borrow<[T]>`, `Deref`, `From<Array<T, U>>` (for `[T; N]`), `PartialEq`, `PartialEq<Array<T, U>>` and `PartialEq<[T; N]>`. It also shows the inherent method `pub const fn as_slice(&self) -> &[T]`. — [docs.rs hybrid_array::Array (0.4.15)](https://docs.rs/hybrid-array/0.4.15/hybrid_array/struct.Array.html)
-- hybrid-array 0.4.15 is the newest and the max stable version (`"max_stable_version": "0.4.15"`, no 0.5.x), with `"created_at": "2026-09-08T18:21:39.618460Z"`, `"yanked": false` and `"checksum": "27f864f10dfb56725ce5ce5472bc52252c8f93a4ab86327122cebf62c5f59a17"`. That checksum matches the local lockfile. — [crates.io hybrid-array API](https://crates.io/api/v1/crates/hybrid-array); [Cargo.lock, local](<C:\Users\mitam\OneDrive\Documents\Cryptographic Biscuits\agent-authority-fabric\Cargo.lock>) (lines 72-79)
+- hybrid-array 0.4.15 is the newest and the max stable version (`"max_stable_version": "0.4.15"`, no 0.5.x), with `"created_at": "2026-09-08T18:21:39.618460Z"`, `"yanked": false` and `"checksum": "27f864f10dfb56725ce5ce5472bc52252c8f93a4ab86327122cebf62c5f59a17"`. That checksum matches the local lockfile. — [crates.io hybrid-array API](https://crates.io/api/v1/crates/hybrid-array); [Cargo.lock, local](<../../Cargo.lock>) (lines 72-79)
 - The official 0.11.1 docs example uses exactly this one-shot form. — [docs.rs sha2 0.11.1 crate root](https://docs.rs/sha2/0.11.1/sha2/)
   ```rust
   use sha2::{Sha256, Digest};
@@ -350,7 +350,7 @@ There are no asm or SHA-extension features left to configure. On aarch64, sha2 a
 
   The README makes no statement about Apple, macOS or aarch64-apple-darwin. — [docs.rs: sha2 0.11.1 README.md source](https://docs.rs/crate/sha2/0.11.1/source/README.md)
 - sha2 0.11.1, "Fixed": "Loading of round constants in AArch64 backends to satisfy the Stacked Borrows model ([#922])". 0.11.0, "Removed": "`asm`, `asm-aarch64`, `loongarch64_asm`, and `compress` crate features ([#542])". — [sha2 CHANGELOG.md](https://raw.githubusercontent.com/RustCrypto/hashes/master/sha2/CHANGELOG.md)
-- In both the project lock and the upstream lock, `cpufeatures` 0.3.1 depends on `libc`, with checksum `5ca28b0ae3115b884660db4118d803791fd6756b6e88f39c0f3f7859060d7566`. — [Cargo.lock, local](<C:\Users\mitam\OneDrive\Documents\Cryptographic Biscuits\agent-authority-fabric\Cargo.lock>) (lines 44-51); [RustCrypto/hashes Cargo.lock (master)](https://raw.githubusercontent.com/RustCrypto/hashes/master/Cargo.lock)
+- In both the project lock and the upstream lock, `cpufeatures` 0.3.1 depends on `libc`, with checksum `5ca28b0ae3115b884660db4118d803791fd6756b6e88f39c0f3f7859060d7566`. — [Cargo.lock, local](<../../Cargo.lock>) (lines 44-51); [RustCrypto/hashes Cargo.lock (master)](https://raw.githubusercontent.com/RustCrypto/hashes/master/Cargo.lock)
 - In 0.10.9, `asm` pulled in `sha2-asm`: `"asm":["sha2-asm"]`. — [crates.io sha2 0.10.9 API](https://crates.io/api/v1/crates/sha2/0.10.9)
 
 ### Inferences
