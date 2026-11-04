@@ -52,7 +52,7 @@ Cargo.toml enforces [lints.rust] and [lints.clippy] with -D warnings. Do NOT wea
 
         serde_json silently drops duplicate keys, and while serde_json keeps 64-bit integers exact, I-JSON and JavaScript peers round integers outside [-(2^53 - 1), +(2^53 - 1)], causing peers to read different numbers. Always parse raw wire bytes via jcs::canonicalize / PepEngine::evaluate_raw(&[u8]) BEFORE any downstream processing.
 
-        Canonicalize "-0" to "0" per RFC 8785 §3.2.2.3; reject leading zeros ("00", "-01"), lone UTF-16 surrogates, and integers outside [-(2^53 - 1), +(2^53 - 1)] on requests and on values that authorize decisions (keep the lenient-numbers cargo feature for general RFC 8785 float formatting in tool results).
+        Canonicalize "-0" to "0" per RFC 8785 §3.2.2.3; reject leading zeros ("00", "-01"), lone UTF-16 surrogates, and integers outside [-(2^53 - 1), +(2^53 - 1)] on requests and on values that authorize decisions (the lenient-numbers cargo feature only widens the request profile to RFC 8785 fractions and exponents, still within that range; it does not affect tool results, which always use the result profile, and it is a test configuration).
 
         Normalize strings and keys to Unicode NFC before UTF-16 code-unit sorting and reject post-NFC duplicate keys.
 
@@ -66,13 +66,13 @@ Cargo.toml enforces [lints.rust] and [lints.clippy] with -D warnings. Do NOT wea
 
         Compute downstream payment idempotency keys as "pep-" + b64url(SHA-256(episode_id.to_be_bytes() || reservation_id.to_be_bytes() || action_digest.as_bytes())).
 
-    Two-Phase Budget & Ambiguous Aborts:
+    Two-Phase Budget & Ambiguous Aborts (F-10):
 
         AbortOutcome::DefinitelyNotExecuted releases the reservation and decrements reserved.
 
         AbortOutcome::Unknown (e.g., network timeout) transitions the reservation to ResState::NeedsReconcile and MUST keep the amount counted inside budget.reserved (fail closed).
 
-        Journal each payment reservation when it is made, and fsync its forwarded record and the call's F-08 taint and F-09 ratchet records before the call is forwarded. At boot, truncate a torn tail under the journal lock; reservations forwarded with no outcome, or with outcome unknown, return as NeedsReconcile, keyed by their original (eid, rid), and count against their intent.
+        Journal each payment reservation when it is made, and fsync its forwarded record and the call's F-08 taint records before the call is forwarded, and any F-09 ratchet rise before the reply that depends on it. At boot, truncate a torn tail under the journal lock; reservations forwarded with no outcome, or with outcome unknown, return as NeedsReconcile, keyed by their original (eid, rid), and count against their intent.
 
     Cross-Episode Taint & Causality Laundering (F-08, F-09):
 
@@ -88,7 +88,7 @@ Cargo.toml enforces [lints.rust] and [lints.clippy] with -D warnings. Do NOT wea
 
     Trusted Values & Host Authority (F-13):
 
-        Trusted values come only from record_trusted_input (which requires &HostAuthority) or from the signed trusted_fields of a tool pinned as Trusted, with no taint. Agent connection threads never hold HostAuthority; they send an episode's actor messages that cannot express approve, trusted input, end or abort. Inside the actor, only the host-message handler takes &HostAuthority; the agent-message handler's signature never does. approve_step_up, record_trusted_input and end_episode run only for control-socket messages from the operator uid. No agent message changes a reservation: an agent disconnect releases one only before its point of forwarding, and after that point a reservation ends only through the broker's explicit outcome or an upstream timeout. Undeclared arguments not present in the tool's pinned argument policy are rejected, at every depth. The one exception is a read-only tool that is not a sink, has no trusted_fields and declares only Data arguments: no guard reads its arguments, so it may take extra flags such as verbose (until the Week 2 lockfile pins full argument schemas).
+        Trusted values come only from record_trusted_input (which requires &HostAuthority) or from the signed trusted_fields of a tool pinned as Trusted, with no taint. Agent connection threads never hold HostAuthority; they send an episode's actor messages that cannot express approve, trusted input, end or abort. Inside the actor, only the host-message handler takes &HostAuthority; the agent-message handler's signature never does. approve_step_up, record_trusted_input and end_episode run only for control-socket messages from the operator uid. No agent message changes a reservation: an agent disconnect releases one only before its point of forwarding, through release_unforwarded, which needs no HostAuthority and refuses a Forwarded reservation; after that point a reservation ends only through settle, behind HostAuthority, with the broker's explicit outcome or an upstream timeout. Undeclared arguments not present in the tool's pinned argument policy are rejected, at every depth. The one exception is a read-only tool that is not a sink, has no trusted_fields and declares only Data arguments: no guard reads its arguments, so it may take extra flags such as verbose (until the Week 2 lockfile pins full argument schemas).
 
     Payment Amount Witness & Binding (F-14):
 
