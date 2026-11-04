@@ -181,6 +181,17 @@ pub enum PolicyError {
     /// The episode has spent its quota of call ids.
     #[error("episode call limit exceeded")]
     CallLimitExceeded,
+    /// The episode cannot record another result: its recorded results plus the calls still in
+    /// flight have reached [`MAX_RECORDS`]. Denying here, before anything runs, keeps a call
+    /// from executing with no result the engine can record (RV4 #18).
+    #[error("episode records exhausted")]
+    RecordsExhausted,
+    /// A payment to the same entity is still unresolved: a `NeedsReconcile` reservation blocks
+    /// every payment to its entity (P1), and a `Held` or `AwaitingStepUp` one also blocks
+    /// another amount-bound payment, which would pay the same invoice twice under a different
+    /// idempotency key (RV4 #1).
+    #[error("a payment to this entity is pending")]
+    PaymentPending,
     /// The inputs are more confidential than the destination allows.
     #[error("confidentiality violation")]
     ConfidentialityViolation,
@@ -1399,7 +1410,9 @@ impl PepEngine {
         if self.state.recorded_call_ids.contains(&source_call_id) {
             return Err(deny(GuardId::Canon, PolicyError::DuplicateCallId));
         }
-        if self.state.records.len() >= MAX_RECORDS {
+        // Every call in flight keeps a record slot, so a trusted input cannot take the slot of
+        // a call that has already been allowed.
+        if records_full(&self.state) {
             return Err(StoreError::CapacityExceeded.into());
         }
         let value = jcs::parse(raw)?;
@@ -1569,7 +1582,7 @@ impl PepEngine {
         // 7. G_budget (computes the plan, applies nothing)
         let taint_writes = planned_writes(tool, canon.store_key.as_ref(), &canon.roles);
         let payment = payment_inputs(tool, amount, entity, witness.as_ref())?;
-        let (payment, label_quota_after) = g_budget(state, payment, taint_writes.len())?;
+        let (payment, label_quota_after) = g_budget(state, tool, payment, taint_writes.len())?;
 
         // 8. G_label
         let input = g_label(&*self.labels, state, tool, &canon, witness.as_ref())?;
@@ -2422,8 +2435,30 @@ fn payment_inputs(
     }
 }
 
+/// Whether the recorded results and the calls still in flight, each of which may record one
+/// result, already fill [`MAX_RECORDS`]. An overflow counts as full (fail closed).
+fn records_full(state: &EpisodeState) -> bool {
+    state
+        .records
+        .len()
+        .checked_add(state.in_flight.len())
+        .is_none_or(|pending| pending >= MAX_RECORDS)
+}
+
+/// Whether a reservation blocks a new payment of `tool` to `entity` (see
+/// [`PolicyError::PaymentPending`]).
+fn blocks_payment(reservation: &Reservation, tool: &ToolPolicy, entity: &str) -> bool {
+    reservation.entity == entity
+        && match reservation.state {
+            ResState::NeedsReconcile => true,
+            ResState::Held | ResState::AwaitingStepUp => tool.amount_binding.is_some(),
+            ResState::Committed | ResState::Released => false,
+        }
+}
+
 fn g_budget(
     state: &EpisodeState,
+    tool: &ToolPolicy,
     payment: Option<PaymentInputs>,
     writes: usize,
 ) -> Result<(Option<PaymentPlan>, usize), PepError> {
@@ -2433,6 +2468,9 @@ fn g_budget(
     }
     if state.recorded_call_ids.len() >= MAX_CALLS_PER_EPISODE {
         return Err(fail(PolicyError::CallLimitExceeded));
+    }
+    if records_full(state) {
+        return Err(fail(PolicyError::RecordsExhausted));
     }
     let quota_after = state
         .label_quota_remaining
@@ -2449,6 +2487,13 @@ fn g_budget(
     };
     let limits = &state.intent.limits;
     let budget = &state.budget;
+    if budget
+        .reservations
+        .values()
+        .any(|reservation| blocks_payment(reservation, tool, &entity))
+    {
+        return Err(fail(PolicyError::PaymentPending));
+    }
     let new_reserved = budget
         .reserved
         .checked_add(amount)
@@ -3636,9 +3681,14 @@ mod tests {
     #[test]
     fn entity_uses_limited() {
         let mut engine = engine();
+        // Each payment settles before the next: a second one while the first is Held is
+        // refused as PaymentPending (one_lookup_funds_one_payment).
         for (lookup_id, pay_id) in [(1, 2), (3, 4)] {
             lookup(&mut engine, lookup_id, "INV-1001", "1000", "USD");
-            allowed(pay(&mut engine, pay_id, "INV-1001", 1000));
+            let ticket = allowed(pay(&mut engine, pay_id, "INV-1001", 1000))
+                .reservation
+                .unwrap();
+            engine.commit(ticket.reservation_id).unwrap();
         }
         lookup(&mut engine, 5, "INV-1001", "1000", "USD");
         assert_eq!(
@@ -4602,8 +4652,148 @@ mod tests {
         );
         assert_eq!(engine.state().budget.reserved, 30_000);
         assert_eq!(engine.state().budget.calls, 1);
+        // A fresh lookup does not fund a second payment while the first is still Held: both
+        // would carry different idempotency keys, so the provider could not dedupe (RV4 #1).
         lookup(&mut engine, 4, "INV-1001", "30000", "USD");
-        allowed(pay(&mut engine, 5, "INV-1001", 30_000));
+        assert_eq!(
+            denied(pay(&mut engine, 5, "INV-1001", 30_000)),
+            (GuardId::Budget, PolicyError::PaymentPending)
+        );
+        assert_eq!(engine.state().budget.calls, 1);
+        // Once the first settles, the unconsumed lookup funds the next one. (Invoice intents
+        // run with per_entity_max_uses 1, so there the entity limit stops it; this fixture
+        // uses 2 to test the mechanism.)
+        let reservation = engine
+            .state()
+            .budget
+            .reservations
+            .keys()
+            .copied()
+            .max()
+            .unwrap();
+        engine.commit(reservation).unwrap();
+        allowed(pay(&mut engine, 6, "INV-1001", 30_000));
+    }
+
+    #[test]
+    fn step_up_wait_blocks_a_second_bound_payment() {
+        let mut engine = engine();
+        lookup(&mut engine, 1, "INV-1001", "60000", "USD");
+        pending(pay(&mut engine, 2, "INV-1001", 60_000));
+        lookup(&mut engine, 3, "INV-1001", "60000", "USD");
+        assert_eq!(
+            denied(pay(&mut engine, 4, "INV-1001", 60_000)),
+            (GuardId::Budget, PolicyError::PaymentPending)
+        );
+    }
+
+    #[test]
+    fn needs_reconcile_blocks_the_entity_until_resolved() {
+        let host = HostAuthority::for_tests();
+        let (mut engine, id) = held_payment();
+        engine.abort(&host, id, AbortOutcome::Unknown).unwrap();
+        lookup(&mut engine, 3, "INV-1001", "30000", "USD");
+        assert_eq!(
+            denied(pay(&mut engine, 4, "INV-1001", 30_000)),
+            (GuardId::Budget, PolicyError::PaymentPending)
+        );
+        // Another entity is not blocked.
+        lookup(&mut engine, 5, "INV-1002", "30000", "USD");
+        allowed(pay(&mut engine, 6, "INV-1002", 30_000));
+    }
+
+    /// Records a trusted input that funds one payment of `amount` to `recipient`.
+    fn fund(engine: &mut PepEngine, input: &str, recipient: &str, amount: u64) {
+        let host = HostAuthority::for_tests();
+        let value = format!(r#"{{"entity":"{recipient}","amount_minor":{amount}}}"#);
+        engine
+            .record_trusted_input(&host, input, value.as_bytes(), Confidentiality::Internal)
+            .unwrap();
+    }
+
+    #[test]
+    fn needs_reconcile_blocks_unbound_payments_too() {
+        let mut engine = engine_on(&store(), recipients(), limits("USD"));
+        let host = HostAuthority::for_tests();
+        fund(&mut engine, "u1", "rcpt_A", 100);
+        let first = allowed(pay_to(&mut engine, 1, "rcpt_A", 100))
+            .reservation
+            .unwrap();
+        engine
+            .abort(&host, first.reservation_id, AbortOutcome::Unknown)
+            .unwrap();
+        // A fresh trusted input passes G_prov; the unresolved payment still blocks the entity.
+        fund(&mut engine, "u2", "rcpt_A", 100);
+        assert_eq!(
+            denied(pay_to(&mut engine, 2, "rcpt_A", 100)),
+            (GuardId::Budget, PolicyError::PaymentPending)
+        );
+    }
+
+    #[test]
+    fn held_unbound_payments_may_overlap() {
+        // Without an amount binding there is no invoice to pay twice: each payment needs its
+        // own fresh trusted input, and per_entity_max_uses bounds them.
+        let mut engine = engine_on(&store(), recipients(), limits("USD"));
+        fund(&mut engine, "u1", "rcpt_A", 100);
+        allowed(pay_to(&mut engine, 1, "rcpt_A", 100));
+        fund(&mut engine, "u2", "rcpt_A", 100);
+        allowed(pay_to(&mut engine, 2, "rcpt_A", 100));
+    }
+
+    /// Fills the episode with trusted inputs until `free` record slots remain.
+    fn fill_records(engine: &mut PepEngine, free: usize) {
+        let host = HostAuthority::for_tests();
+        let mut n = 0;
+        while engine.state().records.len() + free < MAX_RECORDS {
+            engine
+                .record_trusted_input(
+                    &host,
+                    &format!("fill{n}"),
+                    br#"{"n":1}"#,
+                    Confidentiality::Public,
+                )
+                .unwrap();
+            n += 1;
+        }
+    }
+
+    #[test]
+    fn calls_denied_once_no_result_can_be_recorded() {
+        let mut engine = engine();
+        // A recorded lookup, so the payment below passes G_prov and reaches G_budget.
+        lookup(&mut engine, 10, "INV-1001", "1000", "USD");
+        fill_records(&mut engine, 1);
+        // One slot left: one call may run, and it holds that slot while in flight.
+        allow(
+            &mut engine,
+            &request(1, "get_invoice", r#"{"invoice_id":"INV-1002"}"#),
+        );
+        // Before RV4 #18 this payment passed every guard and could commit, and only then
+        // failed to record its result.
+        assert_eq!(
+            denied(pay(&mut engine, 2, "INV-1001", 1000)),
+            (GuardId::Budget, PolicyError::RecordsExhausted)
+        );
+        assert_eq!(
+            denied(engine.evaluate_raw(&request(3, "get_invoice", r#"{"invoice_id":"INV-1002"}"#))),
+            (GuardId::Budget, PolicyError::RecordsExhausted)
+        );
+        // A trusted input cannot take the slot the in-flight call holds.
+        let host = HostAuthority::for_tests();
+        assert_eq!(
+            engine.record_trusted_input(&host, "late", br#"{"n":1}"#, Confidentiality::Public),
+            Err(StoreError::CapacityExceeded.into())
+        );
+        // The allowed call can still record its result.
+        engine
+            .record_result_raw("1", &invoice_result("INV-1002", "1000", "USD"))
+            .unwrap();
+        assert_eq!(engine.state().records.len(), MAX_RECORDS);
+        assert_eq!(
+            denied(engine.evaluate_raw(&request(4, "get_invoice", r#"{"invoice_id":"INV-1002"}"#))),
+            (GuardId::Budget, PolicyError::RecordsExhausted)
+        );
     }
 
     #[test]
