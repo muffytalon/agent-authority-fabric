@@ -13,7 +13,9 @@
 
 pub mod engine;
 pub mod forward;
+pub mod http;
 pub mod jcs;
+pub mod mcp;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod peercred;
 pub mod tokens;

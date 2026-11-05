@@ -4081,6 +4081,41 @@ mod tests {
         );
     }
 
+    /// M1, RV3 F6: the transport hands the engine the agent's params under the PEP's id, the
+    /// engine keys the call by `mcp::engine_call_id`, and the agent's own id comes back only
+    /// on the reply.
+    #[test]
+    fn the_transport_request_round_trips() {
+        let mut engine = engine();
+        let body = r#"{"jsonrpc":"2.0","id":"agent-7","method":"tools/call","params":{"name":"get_invoice","arguments":{"invoice_id":"INV-1001"},"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{},"dev.pep-sidecar/episode":"eyJ.t"}}}"#;
+        let head = format!(
+            "POST /mcp HTTP/1.1\r\nHost: pep.local\r\nAccept: application/json, text/event-stream\r\nContent-Type: application/json\r\nMCP-Protocol-Version: 2026-07-28\r\nMcp-Method: tools/call\r\nMcp-Name: get_invoice\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        );
+        let head = crate::http::parse_head(head.as_bytes(), "/mcp").unwrap();
+        let Ok(crate::mcp::Inbound::Request(request)) = crate::mcp::check(&head, body.as_bytes())
+        else {
+            panic!("the request should route");
+        };
+        let decision = allow(&mut engine, &request.engine_request(UPSTREAM_ID));
+        let call_id = crate::mcp::engine_call_id(UPSTREAM_ID);
+        assert_eq!(decision.call_id, call_id);
+        let result = engine
+            .record_result_raw(
+                &call_id,
+                &complete(&invoice_result("INV-1001", "30000", "USD")),
+            )
+            .unwrap();
+        let reply = crate::mcp::result_reply(&request.id, &result);
+        let reply = String::from_utf8(reply.body.unwrap()).unwrap();
+        assert!(reply.starts_with(r#"{"id":"agent-7","jsonrpc":"2.0","result":{"#));
+        assert_eq!(
+            jcs::canonicalize(reply.as_bytes()).unwrap(),
+            reply.as_bytes()
+        );
+        assert!(!reply.contains(UPSTREAM_ID));
+    }
+
     #[test]
     fn reused_call_id_denied() {
         let mut engine = engine();

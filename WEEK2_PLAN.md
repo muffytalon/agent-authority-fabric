@@ -177,7 +177,7 @@ RV2 had T1, L1 and Q1 closing after step 2. RV2's own reordering (§2) moves the
 - **Closing condition (met 2026-11-03):** a spike reaches a throwaway Unix-socket HTTP server with custom headers from:
   - **the TypeScript SDK v2:** a custom `fetch` with an undici `Agent({ connect: { socketPath } })`.
     - **Run on 2026-11-03, and it works (Appendix A).** `@modelcontextprotocol/client` 2.4.0 connected over a Unix socket and ran the same four methods.
-    - **Two conditions.** The client must be built with `versionNegotiation: { mode: { pin: '2026-07-28' } }`: the SDK's default is `'legacy'`, which sends a 2025 `initialize` that the PEP answers with 404.
+    - **Two conditions.** The client must be built with `versionNegotiation: { mode: { pin: '2026-07-28' } }`: the SDK's default is `'legacy'`, which sends a 2025 `initialize` that the stand-in answered with 404. That `initialize` has no `MCP-Protocol-Version` or `Mcp-Method`, so the real PEP stops it at U1 step 9, with 400 and -32020 (step 7, `mcp.rs`). The client fails either way.
     - Its `fetch` and `Agent` must both come from the `undici` package (8.12.3 here). Node 24's built-in `fetch` bundles undici 7.30.1 and rejects that `Agent` (`UND_ERR_INVALID_ARG`).
     - The TypeScript half of D2 is closed;
   - **the Python SDK v2,** which uses httpx2 and documents no Unix-socket support [26]. Its `streamable_http_client` takes an `http_client: httpx2.AsyncClient` [26], so the route is an `httpx2.AsyncHTTPTransport(uds=…)` inside that client.
@@ -945,6 +945,30 @@ The order follows RV2: p256, peer identity and the lock file come before the bin
 | `src/main.rs` | The `pep-sidecar` binary:<br>• std threads, with two bounded connection pools: the agent's, and the control socket's (H1);<br>• one actor thread per episode (A1), plus an upstream worker per forwarded call (P1);<br>• connection threads verify Episode Tokens, apply the rate limit, and send agent messages to the episode's actor;<br>• the control thread sends host messages;<br>• a `lock-scan` subcommand (L1). |
 | `src/bin/pepctl.rs` | `lock sign` and key generation (keys from `/dev/urandom`); Week 6 adds `explain` and `replay` |
 | `src/bin/` stubs | The stub broker, the stub tool server and the scripted operator, under the same lints |
+
+**Transport as built (step 7).**
+- **`http.rs`:**
+  - `parse_head` is sans-IO.
+  - `read_request(stream, endpoint, Deadlines)` drives it over any `TimedRead` (a `UnixStream`, or a test double), setting the timeout to the time left before every read.
+  - Each refusal has its own `Malformed` reason, for the decision log. The reply is 400 for all of them; a timeout, an early close or a read error closes the connection with no reply.
+  - Bytes past the body are never parsed, and the body of a request that is not a POST is never read.
+- **`mcp.rs`:**
+  - `check` runs U1 steps 2 to 13. It returns `Inbound::Ignored` for `notifications/cancelled`, an `AgentRequest` for the actor, or the only reply.
+  - `AgentRequest::episode_token` applies M1's token rule.
+  - `engine_request(pep_id)` gives the engine the agent's params under the PEP's ULID, and the engine keys the call by `engine_call_id`, the ULID's canonical JSON, quotes included.
+  - The reply builders write canonical JSON, with one message per code: the error bodies, `discover_result`, `tools_list_result`, and `listen_reply`. `listen_reply` is the SSE head without `Content-Length`, then the acknowledgement, then the completion result.
+- **Choices the plan left open:**
+  - `Content-Type` takes only a `charset=utf-8` parameter.
+  - `Accept` may be split across several fields.
+  - Header values must be visible ASCII, so obs-text is refused.
+  - `=?base64?…?=` must be padded standard base64.
+  - An `Mcp-Name` on a method that has no name counts as a mismatch.
+  - Params that are not an object get -32602 at step 10.
+  - Top-level members other than `jsonrpc`, `id`, `method` and `params` get -32600.
+- **The D2 replay (RV3 E4):**
+  - The spike logs hold parsed params and headers, not wire bytes, so the test rebuilds each of the 73 logged requests from its log line, then frames and checks it.
+  - 70 route; the legacy `initialize` gets 400 and -32020 (D2); and both `notifications/cancelled` get 202.
+  - With the client-wide `Pep-Episode` header, every logged `tools/list` and `tools/call` yields a token.
 
 **Config** (JSON parsed by `jcs`; keys as SEC1 or JWK). Every section uses the request number profile, safe integers only, except `pins`. `pins` uses the definition profile: J1's exact-digit result numbers, with caps of 8 MiB and 262,144 values, because full upstream definitions hold values such as `"minimum": 0.5` and can exceed 8,192 values. The lockfile, `lockfile_digest` and every `tool_schema_digest` use the definition profile too (RV4 #13):
 
