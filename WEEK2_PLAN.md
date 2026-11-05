@@ -365,6 +365,14 @@ RV2 had T1, L1 and Q1 closing after step 2. RV2's own reordering (§2) moves the
 - **Why:** it is the surface both SDKs ran in the D2 spike, and it keeps upstream text the lockfile has not pinned from ever reaching the agent.
 - **Note:** SPEC §2's `origin_hash` vector keeps `cid` `"7"`. It tests the formula, and is no longer an id the PEP would assign.
 - **SPEC:** §2 `cid`, and the token bindings in §3.3 (§6).
+- **Amended 2026-11-05 (step 7, the transport details the design left open).** Checked against the SDK sources the D2 spike ran: Python 2.3.0's `mcp/shared/inbound.py` and `mcp_types`, and TypeScript 2.4.0's client.
+  - **`Content-Type`:** `application/json`, optionally with `charset=utf-8`, case-insensitive. Any other parameter gets 400 (U1 step 4). JSON is UTF-8 (RFC 8259), and both SDKs send the bare type.
+  - **`Accept`:** may be split across several fields (RFC 9110 lists); together they must name both types.
+  - **Header values:** visible ASCII, space and tab only, so obs-text gets 400 (U1 step 1). Both SDKs base64-wrap any value outside that range, or one with leading or trailing whitespace, so trimming the whitespace around a value is safe.
+  - **`=?base64?…?=`:** padded, canonical standard base64 of UTF-8. That is what both SDKs write (Python `b64encode`, TypeScript `btoa`), and Python's own decoder also refuses non-canonical input. Anything else gets -32020. The decoded value is NFC-normalized before it is compared, like every parsed string.
+  - **A stray `Mcp-Name`,** on a method that has no name, gets -32020. The Python reference server ignores one; the PEP refuses it because it compares the header. Neither SDK sends one: all 27 in the spike logs were on `tools/call`.
+  - **Extra top-level members,** beyond `jsonrpc`, `id`, `method` and `params`, get -32600. The 2026-07-28 wire models ignore extra members, so this is stricter than the schema. Nothing in the PEP reads or forwards such a member, but a client that sends one is not the client the harness pins. Both SDKs build requests from exactly those four members. Step 7's spike runs against the real PEP confirm it.
+  - **Params that are not an object** have no `_meta`, so they get -32602 (U1 step 10).
 
 ### M2. Results that are not `complete`
 **Evidence:**
@@ -772,6 +780,10 @@ The unsigned lockfile v1 payload is also the config's `pins` section from step 7
 - **Decided:** the single denial shape and the reply order above. `PEP_DENIED` is JSON-RPC code -31403, and `PEP_UNAVAILABLE` is -31503. Both lie outside JSON-RPC's reserved block (-32768 to -32000), and they echo HTTP 403 and 503.
 - **Why:** with one shape, and one code per message, the code reveals no more than the message already does (F-09).
 - **SPEC:** §1 (§6).
+- **Amended 2026-11-05 (step 7).** The M1 amendment of the same date settles what steps 1, 4, 6, 10 and 11 refuse. The order is unchanged.
+  - A request that is malformed at step 6 never echoes an id that is itself invalid; it gets `null`.
+  - Step 9 precedes the router, so the TypeScript SDK's unpinned `initialize`, which carries no `MCP-Protocol-Version` or `Mcp-Method`, gets 400 and -32020, not 404 (D2).
+  - The Python reference server checks `_meta` before the headers. U1 keeps its own order: the two differ only for a request that fails both, and either reply refuses it.
 
 ### J1. Result fidelity
 - **Evidence:**
@@ -957,14 +969,7 @@ The order follows RV2: p256, peer identity and the lock file come before the bin
   - `AgentRequest::episode_token` applies M1's token rule.
   - `engine_request(pep_id)` gives the engine the agent's params under the PEP's ULID, and the engine keys the call by `engine_call_id`, the ULID's canonical JSON, quotes included.
   - The reply builders write canonical JSON, with one message per code: the error bodies, `discover_result`, `tools_list_result`, and `listen_reply`. `listen_reply` is the SSE head without `Content-Length`, then the acknowledgement, then the completion result.
-- **Choices the plan left open:**
-  - `Content-Type` takes only a `charset=utf-8` parameter.
-  - `Accept` may be split across several fields.
-  - Header values must be visible ASCII, so obs-text is refused.
-  - `=?base64?…?=` must be padded standard base64.
-  - An `Mcp-Name` on a method that has no name counts as a mismatch.
-  - Params that are not an object get -32602 at step 10.
-  - Top-level members other than `jsonrpc`, `id`, `method` and `params` get -32600.
+- **The details the design left open** are settled in M1's and U1's amendments of 2026-11-05.
 - **The D2 replay (RV3 E4):**
   - The spike logs hold parsed params and headers, not wire bytes, so the test rebuilds each of the 73 logged requests from its log line, then frames and checks it.
   - 70 route; the legacy `initialize` gets 400 and -32020 (D2); and both `notifications/cancelled` get 202.
