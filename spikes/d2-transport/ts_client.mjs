@@ -9,7 +9,11 @@ const viaUndici = (url, init) => undiciFetch(url, { ...init, dispatcher: agent }
 const viaGlobal = (url, init) => globalThis.fetch(url, { ...init, dispatcher: agent });
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const pin = { versionNegotiation: { mode: { pin: '2026-07-28' } } };
-const TOKEN = 'eyJ.spike.token';                     // a placeholder; the stand-in never verifies it
+import { readFileSync } from 'node:fs';
+// A placeholder the stand-in never verifies. Against the real PEP (real_pep.py) the harness writes a
+// real Episode Token to stdin, as it would for an agent (E1); the environment only says where to read it.
+const TOKEN = process.env.PEP_TOKEN_FROM_STDIN === '1' ? readFileSync(0, 'utf8').split('\n')[0].trim() : 'eyJ.spike.token';
+const REAL = process.env.PEP_REAL === '1';            // the real PEP has no `stale` tool
 
 function makeClient(options, fetchFn, transportOptions = {}) {
   const client = new Client({ name: 'pep-d2-spike', version: '0.0.1' }, options);
@@ -66,7 +70,7 @@ async function main() {
     };
     await call('unlisted call', 'get_invoice', 'INV-1');
     await call('call from a recreated client', 'get_invoice', 'INV-2');
-    await call('stale call (-32020, then re-list and resend)', 'stale', 'INV-3');
+    if (!REAL) await call('stale call (-32020, then re-list and resend)', 'stale', 'INV-3');
     console.log('client closed cleanly');
     return;
   }

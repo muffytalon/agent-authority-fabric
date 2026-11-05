@@ -13,7 +13,12 @@ import anyio, httpx2
 from mcp import Client
 from mcp.client.streamable_http import streamable_http_client
 
-TOKEN = "eyJ.spike.token"   # a placeholder; the stand-in never verifies it
+import os
+# A placeholder the stand-in never verifies. Against the real PEP (real_pep.py) the harness
+# writes a real Episode Token to stdin, as it would for an agent (E1); the environment only
+# says where to read it.
+TOKEN = sys.stdin.readline().strip() if os.environ.get("PEP_TOKEN_FROM_STDIN") == "1" else "eyJ.spike.token"
+REAL = os.environ.get("PEP_REAL") == "1"   # the real PEP has no `stale` tool
 
 async def main(sock: str, mode: str) -> None:
     transport = httpx2.AsyncHTTPTransport(uds=sock)
@@ -50,7 +55,8 @@ async def enforce(sock: str, mode: str) -> None:
                     print(f"{label} raised: {type(e).__name__}: {str(e)[:120]}")
         await call("unlisted call", "get_invoice", "INV-1")
         await call("call from a recreated client", "get_invoice", "INV-2")
-        await call("stale call (-32020, then re-list and resend)", "stale", "INV-3")
+        if not REAL:
+            await call("stale call (-32020, then re-list and resend)", "stale", "INV-3")
     print("client closed cleanly")
 
 if len(sys.argv) > 2 and sys.argv[2].startswith("enforce"):

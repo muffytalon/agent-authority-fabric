@@ -1,0 +1,3 @@
+unlisted call raised: MCPError: PEP_DENIED
+call from a recreated client raised: MCPError: PEP_DENIED
+client closed cleanly

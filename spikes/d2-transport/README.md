@@ -160,3 +160,18 @@ The SDK sources agree: Python's `ClientSession.validate_tool_result` calls `list
   - The "unknown message ID" error in `ts-main-cancelled-202` proved intermittent: it was missing from one run and present in the next. `run.sh` no longer requires it. The stable outcome, `closed: remote`, is still checked.
 - **`results/` is the output of `run.sh`** on 2026-11-03 at 12:49 UTC. All 11 runs reproduced their outcomes.
 - **One line is new since the recorded runs.** The Python `cancelled` client also logs "Error parsing SSE message" (an `anyio.BrokenResourceError`) before it raises `SubscriptionLost`. The recorded run kept only the last 15 lines of its output, so whether that line appeared then is unknown.
+
+## Real PEP runs (2026-11-05, step 7)
+
+`real_pep.py BIN_DIR [WORK]` repeats the token-enforcing scenarios against the real `pep-sidecar`, with the stub broker and a stub tool server, instead of the stand-in. The SDK environments come from `run.sh`'s work directory. Each scenario gets a fresh episode from the scripted operator. The harness writes the Episode Token to the client's stdin (E1): the clients read it there when `PEP_TOKEN_FROM_STDIN=1`, and `PEP_REAL=1` skips the stand-in's `stale` tool. The transcripts are in `results/real-*.txt`, with the token replaced.
+
+| SDK | Scenario | Result |
+|---|---|---|
+| Python 2.3.0 | `token` | discover, list, call and listen all succeed; listen closes gracefully |
+| Python 2.3.0 | `enforce-header` | the unlisted call and the recreated client's call succeed |
+| Python 2.3.0 | `enforce-meta-only` | both calls execute, then the SDK's own `tools/list`, which carries no token, is denied, so it raises `PEP_DENIED` (RV4 #11, as against the stand-in) |
+| TypeScript 2.4.0 | `token` | list, call and listen succeed; listen closes as `graceful` |
+| TypeScript 2.4.0 | `enforce-header` | both calls succeed |
+| TypeScript 2.4.0 | `enforce-meta-only` | both calls succeed: `callTool` does not list first |
+
+The results match the stand-in's, so the harness rule stands: set the token as a client-wide `Pep-Episode` header as well as in `_meta`.

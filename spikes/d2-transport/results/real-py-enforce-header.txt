@@ -1,0 +1,3 @@
+unlisted call: invoice INV-1 isError: False
+call from a recreated client: invoice INV-2 isError: False
+client closed cleanly

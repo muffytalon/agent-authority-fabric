@@ -207,6 +207,7 @@ RV2 had T1, L1 and Q1 closing after step 2. RV2's own reordering (§2) moves the
   - The spike missed it because its stand-in never enforced the token.
   - Fix: `tools/list`, which is read-only, accepts the token as a `Pep-Episode` header alone, and the harness sets that header client-wide (it reached those requests; tested). SPEC §3.3 says so.
   - **Token-enforcing runs (2026-11-04).** The stand-in gained an `enforce` variant that applies this rule, and four runs were added to `spikes/d2-transport/run.sh`; all 15 runs reproduce. With the token in `_meta` only, Python reported `PEP_DENIED` for two calls that had executed, and its -32020 retry failed; TypeScript reported its denied re-list through `onerror` and resent anyway. With the client-wide header as well, every call succeeded in both SDKs, the SDKs' own `tools/list` and -32020 re-lists included. The SDK sources show the same paths (spike README). Step 7 repeats the runs against the real PEP.
+  - **Repeated against the real PEP (2026-11-05, `spikes/d2-transport/real_pep.py`).** The real `pep-sidecar` ran with the stub broker and a stub tool server, a fresh episode per scenario, and the token on the client's stdin. The results matched the stand-in's. With the header, all six scenarios succeed in both SDKs. In Python with `_meta` only, the calls execute and the SDK still raises `PEP_DENIED`.
 - **Consequences for other decisions:**
   - M1: the transport must accept string JSON-RPC ids on every method. The engine already accepts string and safe-integer ids for `tools/call` (`canonical_call_id`). M1 now has the PEP assign its own id (RV3 F6);
   - `notifications/cancelled` handling belongs to U1, which stays open.
@@ -1075,6 +1076,30 @@ The order follows RV2: p256, peer identity and the lock file come before the bin
 - **`upstream.rs`:** one request per connection to `/mcp/{server_id}`. The broker's uid and gid are required on the connection, and only a whole 200 JSON reply counts.
 - **`poll.rs`:** a discover and every `tools/list` page, with no proof, compared with the pins. The cap is 64 pages; a cursor loop, a bad page or the deadline fails the poll. Step 10 runs the same poll on a timer.
 - **A smoke test of the binary,** with a Python broker and operator, passed: boot, a call, `end`, and a restart that replays the journal.
+
+**Stubs, decision log and end-to-end tests as built (step 7).**
+- **`stub-broker`** (`stubs::broker`):
+  - its own config: the socket, the PEP's uid and gid, the PEP's key file, the pins file, the static routes (`unix:` or `tcp:` endpoints with credential files), the replay cache, clock skew, connections, the upstream timeout and the log;
+  - proof-less forwarding for `server/discover` and `tools/list` only;
+  - Call Proofs verified against its lockfile, `_meta` reserved members stripped both ways, the server's credential and the F-07 key injected, and statuses mapped as P1 says.
+  - It refuses a proof issued in its own boot second (R1), so tests wait one second after starting it.
+- **`stub-tool`** (`stubs::tool`):
+  - pinned discover and definitions;
+  - a credential checked against a SHA-256 verifier in constant time;
+  - payments deduped on `Idempotency-Key` in a fsynced store, with `executed`, `declined` or `pending` from its invoice table;
+  - an execution log.
+  The misbehaviour modes come with steps 9 and 10.
+- **`stub-operator`:** one control request per run; the reply body goes to stdout.
+- **The decision log** (`decision_log.rs`, at `log.path`, rotated to `.1` at `log.max_bytes`):
+  - a decision for every `tools/call` (`allow`, `deny`, `step_up`, `unavailable`) and for the transport's refusals (`protocol_error`, refused tokens, the rate limit);
+  - the `allow` is flushed just before the upstream write, and an outcome record follows each leg or release.
+- **`tests/e2e.rs`** runs the real binaries over temporary sockets:
+  - a read, a payment, a step-up approval, and refused and unknown outcomes, with §2a's oracle join checked (tool log to broker log to PEP `allow`);
+  - a restart that replays spend and an unresolved invoice;
+  - a step-up timeout that sends nothing;
+  - a wrong credential that executes nothing;
+  - M1's router rows.
+- **Not yet end to end:** the remaining P1 rows (a decline, disconnects, a refused Call Proof, a broker timeout, a failed re-check, a failed journal write) are covered by the actor and serve unit tests.
 
 **PEP↔broker.**
 - **Transport:** Streamable HTTP over `/run/broker/broker.sock`, JSON only in both directions, with mutual peer checks on uid and gid (the broker requires 20002, the PEP requires 20003); SPIFFE is deferred.

@@ -1,0 +1,4 @@
+tools/list: [ 'get_invoice' ]
+tools/call: invoice INV-1 isError: false
+listen closed: graceful
+client closed cleanly
