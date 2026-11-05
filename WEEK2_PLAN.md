@@ -1055,6 +1055,27 @@ The order follows RV2: p256, peer identity and the lock file come before the bin
 - **Ratchet:** a rise is committed before the reply that depends on it, a denial included, or the reply becomes `PEP_UNAVAILABLE` (RV4 #4).
 - **Broker replies:** `forward::read_upstream_reply` reads them. The outcome comes from the result's `_meta` or the error's `data`, an unknown value reads as `unknown`, and an ambiguous reply is `unknown` too (P1).
 
+**The binary as built (step 7: `upstream.rs`, `registry.rs`, `serve.rs`, `poll.rs`, `main.rs`).**
+- **`main.rs` boots in this order:**
+  1. the config and `HostAuthority::claim`;
+  2. the journal's lock, torn tail and replay;
+  3. the journaled label store, the quarantines under the loaded digest, and the unresolved set;
+  4. per-boot Episode Token and Call Proof keys, the latter published as `pubkey_dir/call-proof.pub` (base64url SEC1, written atomically);
+  5. one poll of every server through the broker. A match serves the server, a difference quarantines it, after a fsynced `quarantine` record, and a failure suspends it;
+  6. the control socket, a reaper of idle episodes, and, last, the agent socket.
+- **`registry.rs`:**
+  - `start` behind `&HostAuthority`, one live episode per intent and `limits.episodes` in all.
+  - `admit` for connection threads: `verify_episode_token_with` matches the token to its own eid's intent digest, then a per-episode token bucket applies.
+  - `end` refuses the episode's tokens before its actor hears of it, and `reap` ends idle or expired episodes (`EpisodeStates::is_over`).
+  - An actor hands back `PepEngine::ledger` when it stops, and the intent's next episode starts from it. The actor tests check it equals the journal's replay. That check found a trusted input whose ratchet rise was not journaled, now fixed.
+- **`serve.rs`:**
+  - U1's order on the agent socket, and `/control` on the control socket. `tools/list` lists only serving servers.
+  - Each `tools/call` gets a fresh ULID, and a disconnect watcher runs until the reply is written.
+  - `accept_loop` caps each socket's connections. After a reply the handler half-closes and briefly drains, so unread client bytes cannot reset the connection before the client reads the reply.
+- **`upstream.rs`:** one request per connection to `/mcp/{server_id}`. The broker's uid and gid are required on the connection, and only a whole 200 JSON reply counts.
+- **`poll.rs`:** a discover and every `tools/list` page, with no proof, compared with the pins. The cap is 64 pages; a cursor loop, a bad page or the deadline fails the poll. Step 10 runs the same poll on a timer.
+- **A smoke test of the binary,** with a Python broker and operator, passed: boot, a call, `end`, and a restart that replays the journal.
+
 **PEP↔broker.**
 - **Transport:** Streamable HTTP over `/run/broker/broker.sock`, JSON only in both directions, with mutual peer checks on uid and gid (the broker requires 20002, the PEP requires 20003); SPIFFE is deferred.
 - **What it carries:**
