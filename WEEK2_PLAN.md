@@ -1098,8 +1098,10 @@ The order follows RV2: p256, peer identity and the lock file come before the bin
   - a restart that replays spend and an unresolved invoice;
   - a step-up timeout that sends nothing;
   - a wrong credential that executes nothing;
-  - M1's router rows.
-- **Not yet end to end:** the remaining P1 rows (a decline, disconnects, a refused Call Proof, a broker timeout, a failed re-check, a failed journal write) are covered by the actor and serve unit tests.
+  - M1's router rows;
+  - an operator decline;
+  - a Call Proof the broker refuses: the payment ends `refused`, the agent gets `PEP_UNAVAILABLE`, and the tool never runs.
+- **Not yet end to end:** the remaining P1 rows (disconnects, a broker timeout, a failed re-check, a failed journal write) are covered by the actor and serve unit tests. The broker timeout comes end to end with the tool servers' slow-drip mode (steps 9 and 10).
 
 **PEP↔broker.**
 - **Transport:** Streamable HTTP over `/run/broker/broker.sock`, JSON only in both directions, with mutual peer checks on uid and gid (the broker requires 20002, the PEP requires 20003); SPIFFE is deferred.

@@ -705,3 +705,100 @@ fn the_router_answers_every_method_as_m1_says() {
         None
     )));
 }
+
+/// Waits for the one payment awaiting approval, and returns it.
+fn awaiting(world: &World) -> JcsValue {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let pending = world.operator(r#"{"call":"pending"}"#);
+        if let Some(first) = pending.pointer("/result/approvals/0") {
+            return first.clone();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the payment never awaited approval"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn an_operator_decline_sends_nothing() {
+    let world = World::new(10_000, None).start();
+    let token = world.start_episode("pay");
+    world.call(1, "get_invoice", r#"{"invoice_id":"INV-2002"}"#, &token);
+    let waiting = {
+        let socket = world.path("pep/agent.sock");
+        let token = token.clone();
+        thread::spawn(move || {
+            call_at(
+                &socket,
+                2,
+                "pay_invoice",
+                r#"{"invoice_id":"INV-2002","amount":60000,"currency":"USD"}"#,
+                &token,
+            )
+        })
+    };
+    let payment = awaiting(&world);
+    let declined = world.operator(&format!(
+        r#"{{"call":"decline","eid":"{}","rid":{},"action_digest":"{}","amount_minor":60000}}"#,
+        text(&payment, "/eid").unwrap(),
+        payment.get("rid").unwrap().as_i64().unwrap(),
+        text(&payment, "/action_digest").unwrap()
+    ));
+    assert!(declined.get("result").is_some(), "{declined:?}");
+    assert!(denied(&waiting.join().unwrap()));
+    assert!(
+        !world
+            .lines("logs/tool-a.jsonl")
+            .iter()
+            .any(|line| text(line, "/tool").as_deref() == Some("pay_invoice"))
+    );
+    let journal = world.lines("state/journal.jsonl");
+    assert!(
+        journal
+            .iter()
+            .any(|line| text(line, "/result").as_deref() == Some("released"))
+    );
+}
+
+#[test]
+fn a_refused_call_proof_executes_nothing() {
+    // P1: the broker rejects the proof, so the payment was never sent: refused, released.
+    let world = World::new(10_000, None).start();
+    let token = world.start_episode("pay");
+    world.call(1, "get_invoice", r#"{"invoice_id":"INV-1001"}"#, &token);
+    // The broker now reads a key the PEP never signed with.
+    let stranger = pep_sidecar::tokens::Es256Signer::from_secret_bytes(&[9; 32]).unwrap();
+    {
+        use base64::Engine as _;
+        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(stranger.verifier().to_sec1_uncompressed());
+        fs::write(world.path("pub/call-proof.pub"), format!("{encoded}\n")).unwrap();
+    }
+    let reply = world.call(
+        2,
+        "pay_invoice",
+        r#"{"invoice_id":"INV-1001","amount":30000,"currency":"USD"}"#,
+        &token,
+    );
+    assert!(unavailable(&reply), "{reply:?}");
+    assert!(
+        !world
+            .lines("logs/tool-a.jsonl")
+            .iter()
+            .any(|line| text(line, "/tool").as_deref() == Some("pay_invoice"))
+    );
+    let broker = world.lines("logs/broker.jsonl");
+    assert!(
+        broker
+            .iter()
+            .any(|line| text(line, "/reason").as_deref() == Some("call proof refused"))
+    );
+    let journal = world.lines("state/journal.jsonl");
+    assert_eq!(
+        text(journal.last().unwrap(), "/result").as_deref(),
+        Some("refused")
+    );
+}
