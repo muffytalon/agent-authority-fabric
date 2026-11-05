@@ -15,11 +15,7 @@ use crate::http::{self, Deadlines, Request, TimedRead};
 /// Unix milliseconds, for logs.
 #[must_use]
 pub fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()
-        .and_then(|elapsed| u64::try_from(elapsed.as_millis()).ok())
-        .unwrap_or(0)
+    crate::decision_log::unix_ms()
 }
 
 /// A connected stream a stub serves.

@@ -28,6 +28,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
 use pep_sidecar::actor::Services;
 use pep_sidecar::config::{self, Config};
+use pep_sidecar::decision_log::DecisionLog;
 use pep_sidecar::engine::{HostAuthority, ServerStates, Shared, UnresolvedEntities, encode_ulid};
 use pep_sidecar::jcs;
 use pep_sidecar::journal::{Journal, JournaledLabels, Record, replay, spawn_writer};
@@ -142,6 +143,10 @@ fn run(path: &Path) -> Result<(), String> {
     first_polls(&config, &broker, &servers, &journal, &mut entropy)?;
 
     // 6. Serve.
+    let decisions = Arc::new(
+        DecisionLog::open(&config.log.path, config.log.max_bytes)
+            .map_err(|error| format!("decision log {}: {error}", config.log.path.display()))?,
+    );
     let limits = &config.limits;
     let services = Arc::new(Services {
         host: host.clone(),
@@ -153,6 +158,7 @@ fn run(path: &Path) -> Result<(), String> {
         step_up_timeout: millis(limits.step_up_timeout_ms),
         upstream_timeout: millis(limits.upstream_timeout_ms),
         now: unix_now,
+        log: decisions.clone(),
     });
     let registry = Registry::new(
         RegistryConfig {
@@ -224,6 +230,7 @@ fn run(path: &Path) -> Result<(), String> {
         read_timeout,
         call_timeout,
         now: unix_now,
+        log: decisions,
     };
     log("pep-sidecar: serving");
     accept_loop(agent.listener(), limits.connections, move |stream| {

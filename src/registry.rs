@@ -553,6 +553,7 @@ mod tests {
             step_up_timeout: Duration::from_secs(5),
             upstream_timeout: Duration::from_secs(5),
             now: unix_now,
+            log: Arc::new(crate::decision_log::DecisionLog::disabled()),
         });
         let config = RegistryConfig {
             intents: ["a", "b", "c"]
@@ -669,6 +670,7 @@ mod tests {
                     r#"{{"id":"{pep_id}","jsonrpc":"2.0","method":"tools/call","params":{{"arguments":{{"id":"T-1"}},"name":"get_ticket"}}}}"#
                 )
                 .into_bytes(),
+                peer_uid: 0,
                 reply,
             })
             .unwrap();

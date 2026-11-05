@@ -118,6 +118,7 @@ pub(crate) fn kit(upstream: Arc<dyn Upstream>, agent_uid: u32) -> Kit {
         step_up_timeout: Duration::from_secs(5),
         upstream_timeout: Duration::from_secs(5),
         now: unix_now,
+        log: Arc::new(crate::decision_log::DecisionLog::disabled()),
     });
     let intent = |name: &str, limit: u64, ids: EntitySet| IntentConfig {
         intent: PepIntent {

@@ -30,6 +30,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use crate::control::{Approval, ControlError, PendingPayment};
+use crate::decision_log::{Decision as LogDecision, DecisionLog, Ending, Verdict, unix_ms};
 use crate::engine::{
     AbortOutcome, Confidentiality, Decision, HostAuthority, Ledger, PEP_DENIED, PepEngine,
     ResState, Settlement, ToolPins, idempotency_key,
@@ -81,6 +82,8 @@ pub struct Services {
     pub upstream_timeout: Duration,
     /// Unix seconds, for proof times.
     pub now: fn() -> Result<u64, TokenError>,
+    /// The decision log (§2a).
+    pub log: Arc<DecisionLog>,
 }
 
 impl fmt::Debug for Services {
@@ -104,6 +107,8 @@ pub enum AgentMessage {
         pep_id: String,
         /// [`crate::mcp::AgentRequest::engine_request`] of it.
         request: Vec<u8>,
+        /// The connection's peer uid, for the decision log.
+        peer_uid: u32,
         /// Where to answer.
         reply: SyncSender<CallReply>,
     },
@@ -241,6 +246,11 @@ struct Call {
     rid: Option<u64>,
     prov: Vec<String>,
     reply: SyncSender<CallReply>,
+    peer_uid: u32,
+    /// When the engine decided it, for the outcome record's `pep_us`.
+    decided: Instant,
+    /// Its Call Proof's `jti`, once built.
+    jti: Option<String>,
 }
 
 struct Actor {
@@ -348,8 +358,9 @@ impl Actor {
             AgentMessage::Call {
                 pep_id,
                 request,
+                peer_uid,
                 reply,
-            } => self.on_call(pep_id, &request, reply),
+            } => self.on_call(pep_id, peer_uid, &request, reply),
             AgentMessage::Disconnected { pep_id } => {
                 // Before its point of forwarding a call is released; after it, the upstream
                 // leg decides (P1).
@@ -360,18 +371,43 @@ impl Actor {
         }
     }
 
-    fn on_call(&mut self, pep_id: String, request: &[u8], reply: SyncSender<CallReply>) {
+    fn on_call(
+        &mut self,
+        pep_id: String,
+        peer_uid: u32,
+        request: &[u8],
+        reply: SyncSender<CallReply>,
+    ) {
         if self.ended {
             answer(&reply, CallReply::Denied);
             return;
         }
         match self.engine.evaluate_raw(request) {
             Err(error) => {
-                let refusal = if error.to_agent_code() == PEP_DENIED {
-                    CallReply::Denied
+                let (refusal, verdict) = if error.to_agent_code() == PEP_DENIED {
+                    (CallReply::Denied, Verdict::Deny)
                 } else {
-                    CallReply::Unavailable
+                    (CallReply::Unavailable, Verdict::Unavailable)
                 };
+                let tool = crate::jcs::parse(request).ok().and_then(|value| {
+                    value
+                        .pointer("/params/name")
+                        .and_then(JcsValue::as_str)
+                        .map(str::to_owned)
+                });
+                self.services.log.decision(
+                    verdict,
+                    &LogDecision {
+                        eid: Some(self.eid()),
+                        peer_uid: Some(peer_uid),
+                        method: "tools/call",
+                        tool: tool.as_deref(),
+                        reason: Some(format!("{error:?}")),
+                        upstream_id: Some(&pep_id),
+                        ..LogDecision::default()
+                    },
+                    unix_ms(),
+                );
                 let refusal = self.ratchet(refusal);
                 answer(&reply, refusal);
             }
@@ -385,6 +421,9 @@ impl Actor {
                     rid: allowed.reservation.map(|ticket| ticket.reservation_id),
                     prov: allowed.prov,
                     reply,
+                    peer_uid,
+                    decided: Instant::now(),
+                    jti: None,
                 };
                 if self.journal_reserve(&call) {
                     self.forward(call);
@@ -400,8 +439,12 @@ impl Actor {
                     rid: Some(pending.reservation_id),
                     prov: pending.prov,
                     reply,
+                    peer_uid,
+                    decided: Instant::now(),
+                    jti: None,
                 };
                 if self.journal_reserve(&call) {
+                    self.log_decision(Verdict::StepUp, &call, None);
                     // A deadline beyond the clock's range fails closed: it expires now.
                     let deadline = Instant::now()
                         .checked_add(self.services.step_up_timeout)
@@ -451,17 +494,25 @@ impl Actor {
             answer(&call.reply, CallReply::Denied);
             return;
         }
-        if self.engine.recheck_before_forward(&call.engine_id).is_err() {
+        if let Err(error) = self.engine.recheck_before_forward(&call.engine_id) {
+            self.log_decision(Verdict::Deny, &call, Some(format!("recheck: {error:?}")));
             self.unforward(&call);
             let refusal = self.ratchet(CallReply::Denied);
             answer(&call.reply, refusal);
             return;
         }
-        let Some(request) = self.build_request(&call) else {
+        let Some((request, jti)) = self.build_request(&call) else {
+            self.log_decision(
+                Verdict::Unavailable,
+                &call,
+                Some("proof or request".to_owned()),
+            );
             self.unforward(&call);
             answer(&call.reply, CallReply::Unavailable);
             return;
         };
+        let mut call = call;
+        call.jti = Some(jti);
         // The worker exists before the point of forwarding, and gets the request only after
         // it: if its thread cannot start, nothing has been sent.
         let (go, ready) = mpsc::sync_channel::<UpstreamRequest>(1);
@@ -504,6 +555,8 @@ impl Actor {
                 return;
             }
         }
+        // RV3 A6: the allow record is flushed before the upstream write.
+        self.log_decision(Verdict::Allow, &call, None);
         let pep_id = call.pep_id.clone();
         self.legs.insert(pep_id.clone(), call);
         if go.send(request).is_err() {
@@ -516,7 +569,7 @@ impl Actor {
     }
 
     /// The Call Proof and the upstream request, built while a payment is still `Held`.
-    fn build_request(&self, call: &Call) -> Option<UpstreamRequest> {
+    fn build_request(&self, call: &Call) -> Option<(UpstreamRequest, String)> {
         let services = &self.services;
         let tool = services.pins.tools.get(&call.tool)?;
         let iat = (services.now)().ok()?;
@@ -541,7 +594,7 @@ impl Actor {
             None => None,
         };
         let claims = CallProofClaims {
-            jti,
+            jti: jti.clone(),
             iat,
             exp: iat.checked_add(CALL_PROOF_TTL_SECS)?,
             eid: self.eid(),
@@ -560,11 +613,61 @@ impl Actor {
             &proof,
         )
         .ok()
+        .map(|request| (request, jti))
+    }
+
+    /// Writes a decision record for `call`, with its payment's fields when it has one.
+    fn log_decision(&self, verdict: Verdict, call: &Call, reason: Option<String>) {
+        let eid = self.eid();
+        let state = self.engine.state();
+        let reservation = call.rid.and_then(|rid| state.budget.reservations.get(&rid));
+        let key = reservation
+            .map(|reservation| idempotency_key(eid, reservation.id, &reservation.action_digest));
+        self.services.log.decision(
+            verdict,
+            &LogDecision {
+                eid: Some(eid),
+                peer_uid: Some(call.peer_uid),
+                method: "tools/call",
+                tool: Some(&call.tool),
+                action_digest: Some(&call.action_digest),
+                reason,
+                rid: call.rid,
+                amount_minor: reservation.map(|reservation| reservation.amount_minor),
+                currency: reservation.map(|_| state.intent.limits.currency.as_str()),
+                entity: reservation.map(|reservation| reservation.entity.as_str()),
+                jti: call.jti.as_deref(),
+                idempotency_key: key.as_deref(),
+                upstream_id: Some(&call.pep_id),
+            },
+            unix_ms(),
+        );
+    }
+
+    /// Writes the outcome record of `call`.
+    fn log_outcome(&self, call: &Call, ending: Ending) {
+        let pep_us = u64::try_from(call.decided.elapsed().as_micros()).unwrap_or(u64::MAX);
+        self.services.log.outcome(
+            self.eid(),
+            &call.pep_id,
+            call.jti.as_deref(),
+            ending,
+            pep_us,
+            unix_ms(),
+        );
     }
 
     /// Ends a call before its point of forwarding: releases a payment's reservation (no
     /// `HostAuthority` needed), or drops a non-payment call.
     fn unforward(&mut self, call: &Call) {
+        self.log_outcome(
+            call,
+            if call.rid.is_some() {
+                Ending::Released
+            } else {
+                Ending::NotForwarded
+            },
+        );
         match call.rid {
             Some(rid) => {
                 if self.engine.release_unforwarded(rid).is_ok() {
@@ -746,17 +849,18 @@ impl Actor {
             return;
         };
         let reply = body.and_then(|body| forward::read_upstream_reply(body, pep_id).ok());
-        let outcome = match call.rid {
+        let (outcome, ending) = match call.rid {
             Some(rid) => self.settle_payment(host, &call, rid, reply),
             None => {
                 if let Some(result) = reply.and_then(|reply| reply.result) {
-                    self.record(&call.engine_id, &result)
+                    (self.record(&call.engine_id, &result), Ending::Executed)
                 } else {
                     self.drop_call(&call.engine_id);
-                    CallReply::Unavailable
+                    (CallReply::Unavailable, Ending::Abandoned)
                 }
             }
         };
+        self.log_outcome(&call, ending);
         answer(&call.reply, outcome);
     }
 
@@ -766,7 +870,7 @@ impl Actor {
         call: &Call,
         rid: u64,
         reply: Option<UpstreamReply>,
-    ) -> CallReply {
+    ) -> (CallReply, Ending) {
         let outcome = reply
             .as_ref()
             .and_then(|reply| reply.outcome)
@@ -775,15 +879,16 @@ impl Actor {
         match (outcome, result) {
             (BrokerOutcome::Executed, result) => {
                 if self.engine.settle(host, rid, Settlement::Executed).is_err() {
-                    return CallReply::Unavailable;
+                    return (CallReply::Unavailable, Ending::Executed);
                 }
                 self.journal_outcome(rid, OutcomeKind::Executed);
-                if let Some(result) = result {
+                let reply = if let Some(result) = result {
                     self.record(&call.engine_id, &result)
                 } else {
                     self.drop_call(&call.engine_id);
                     CallReply::Unavailable
-                }
+                };
+                (reply, Ending::Executed)
             }
             (BrokerOutcome::Refused, Some(result)) => {
                 // P1: record first, because the release drops the call from `in_flight`.
@@ -792,20 +897,20 @@ impl Actor {
                 // A leg's reservation is Forwarded, so settle cannot refuse it.
                 let _ = self.engine.settle(host, rid, refused);
                 self.journal_outcome(rid, OutcomeKind::Refused);
-                recorded
+                (recorded, Ending::Refused)
             }
             (BrokerOutcome::Refused, None) => {
                 let refused = Settlement::Aborted(AbortOutcome::DefinitelyNotExecuted);
                 let _ = self.engine.settle(host, rid, refused);
                 self.journal_outcome(rid, OutcomeKind::Refused);
-                CallReply::Unavailable
+                (CallReply::Unavailable, Ending::Refused)
             }
             (BrokerOutcome::Unknown, _) => {
                 let _ = self
                     .engine
                     .settle(host, rid, Settlement::Aborted(AbortOutcome::Unknown));
                 self.journal_outcome(rid, OutcomeKind::Unknown);
-                CallReply::Unavailable
+                (CallReply::Unavailable, Ending::Unknown)
             }
         }
     }
@@ -1006,6 +1111,7 @@ mod tests {
             step_up_timeout,
             upstream_timeout: Duration::from_secs(5),
             now: || Ok(1_800_000_000),
+            log: Arc::new(DecisionLog::disabled()),
         });
         let exited = Arc::new(Mutex::new(None));
         let slot = exited.clone();
@@ -1041,6 +1147,7 @@ mod tests {
                 .send(AgentMessage::Call {
                     pep_id: pep_id.clone(),
                     request: request.into_bytes(),
+                    peer_uid: 0,
                     reply,
                 })
                 .unwrap();
@@ -1470,6 +1577,7 @@ mod tests {
             harness.agent.send(AgentMessage::Call {
                 pep_id: encode_ulid(99),
                 request: Vec::new(),
+                peer_uid: 0,
                 reply
             }),
             Err(ActorGone)

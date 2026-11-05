@@ -529,6 +529,51 @@ fn reads_payments_a_step_up_and_every_broker_outcome() {
         .filter_map(|line| text(line, "/result"))
         .collect();
     assert_eq!(outcomes, ["executed", "executed", "refused", "unknown"]);
+    oracle_join(&world);
+}
+
+/// §2a's join: every execution in a tool log joins through the broker log (`upstream_id` to
+/// `jti`) to a PEP `allow` with the same `jti`, `upstream_id`, `action_digest` and F-07 key,
+/// and every `allow` has its outcome record.
+fn oracle_join(world: &World) {
+    let decisions = world.lines("logs/decisions.jsonl");
+    let broker = world.lines("logs/broker.jsonl");
+    let mut joined = 0;
+    for tool_log in ["logs/tool-a.jsonl", "logs/tool-b.jsonl"] {
+        for execution in world.lines(tool_log) {
+            let upstream_id = text(&execution, "/upstream_id").unwrap();
+            let hop = broker
+                .iter()
+                .find(|line| text(line, "/upstream_id").as_deref() == Some(upstream_id.as_str()))
+                .unwrap_or_else(|| panic!("no broker line for {upstream_id}"));
+            let jti = text(hop, "/jti").unwrap();
+            let allow = decisions
+                .iter()
+                .find(|line| {
+                    text(line, "/verdict").as_deref() == Some("allow")
+                        && text(line, "/jti").as_deref() == Some(jti.as_str())
+                })
+                .unwrap_or_else(|| panic!("no allow for {jti}"));
+            assert_eq!(text(allow, "/upstream_id"), Some(upstream_id.clone()));
+            assert_eq!(
+                text(allow, "/action_digest"),
+                text(&execution, "/action_digest")
+            );
+            assert_eq!(
+                text(allow, "/idempotency_key"),
+                text(&execution, "/idempotency_key")
+            );
+            assert!(decisions.iter().any(|line| {
+                text(line, "/outcome").is_some()
+                    && text(line, "/upstream_id") == Some(upstream_id.clone())
+            }));
+            joined += 1;
+        }
+    }
+    assert!(joined > 0);
+    // Nothing secret is logged: no token, no proof.
+    let raw = fs::read_to_string(world.path("logs/decisions.jsonl")).unwrap();
+    assert!(!raw.contains("eyJ"));
 }
 
 #[test]

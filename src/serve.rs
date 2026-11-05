@@ -23,6 +23,7 @@ use std::time::{Duration, Instant};
 use crate::actor::{AgentMessage, CallReply, HostMessage};
 use crate::config::Peer;
 use crate::control::{self, ControlError, ControlRequest};
+use crate::decision_log::{Decision, DecisionLog, Verdict, unix_ms};
 use crate::engine::{HostAuthority, ServerState, ServerStates};
 use crate::http::{self, Deadlines, HttpError, Status};
 use crate::lockfile::Lockfile;
@@ -54,6 +55,8 @@ pub struct AgentContext {
     pub call_timeout: Duration,
     /// Unix seconds, for token times.
     pub now: fn() -> Result<u64, TokenError>,
+    /// The decision log, for the transport's own refusals.
+    pub log: Arc<DecisionLog>,
 }
 
 /// What the control connection needs.
@@ -157,7 +160,19 @@ pub fn serve_agent(mut stream: UnixStream, context: &AgentContext) {
         };
     // 2 to 13.
     let reply = match mcp::check(&request.head, &request.body) {
-        Err(reply) => reply.to_http(),
+        Err(reply) => {
+            context.log.decision(
+                Verdict::ProtocolError,
+                &Decision {
+                    peer_uid: Some(peer.uid),
+                    method: request.head.headers.get("mcp-method").unwrap_or("-"),
+                    reason: Some(format!("HTTP {}", reply.status.code())),
+                    ..Decision::default()
+                },
+                unix_ms(),
+            );
+            reply.to_http()
+        }
         Ok(Inbound::Ignored) => mcp::accepted().to_http(),
         Ok(Inbound::Request(agent_request)) => {
             route(&mut stream, peer.uid, &agent_request, context)
@@ -185,13 +200,37 @@ fn route(
             let Ok(now) = (context.now)() else {
                 return mcp::unavailable(id).to_http();
             };
+            let method = if request.method == Method::ToolsList {
+                "tools/list"
+            } else {
+                "tools/call"
+            };
+            let refuse = |verdict, reason: &str| {
+                context.log.decision(
+                    verdict,
+                    &Decision {
+                        peer_uid: Some(peer_uid),
+                        method,
+                        reason: Some(reason.to_owned()),
+                        ..Decision::default()
+                    },
+                    unix_ms(),
+                );
+            };
             let Some(token) = request.episode_token() else {
+                refuse(Verdict::Deny, "no episode token");
                 return mcp::denied(id).to_http();
             };
             let agent = match context.registry.admit(token, peer_uid, now) {
                 Ok(agent) => agent,
-                Err(Admission::Denied) => return mcp::denied(id).to_http(),
-                Err(Admission::Unavailable) => return mcp::unavailable(id).to_http(),
+                Err(Admission::Denied) => {
+                    refuse(Verdict::Deny, "episode token refused");
+                    return mcp::denied(id).to_http();
+                }
+                Err(Admission::Unavailable) => {
+                    refuse(Verdict::Unavailable, "rate limit");
+                    return mcp::unavailable(id).to_http();
+                }
             };
             if request.method == Method::ToolsList {
                 let tools = context
@@ -199,7 +238,7 @@ fn route(
                     .tools_list(|server| context.servers.state(server) == ServerState::Serving);
                 return mcp::result_reply(id, &mcp::tools_list_result(&tools)).to_http();
             }
-            call(stream, request, &agent, context).to_http()
+            call(stream, peer_uid, request, &agent, context).to_http()
         }
     }
 }
@@ -208,6 +247,7 @@ fn route(
 /// reports the agent's disconnect (P1).
 fn call(
     stream: &UnixStream,
+    peer_uid: u32,
     request: &AgentRequest,
     agent: &crate::actor::AgentSender,
     context: &AgentContext,
@@ -220,6 +260,7 @@ fn call(
     let message = AgentMessage::Call {
         pep_id: pep_id.clone(),
         request: request.engine_request(&pep_id),
+        peer_uid,
         reply,
     };
     if agent.send(message).is_err() {
@@ -374,6 +415,7 @@ mod tests {
             read_timeout: Duration::from_secs(2),
             call_timeout: Duration::from_secs(5),
             now: unix_now,
+            log: Arc::new(DecisionLog::disabled()),
         }
     }
 
