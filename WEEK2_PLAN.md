@@ -1007,6 +1007,24 @@ The order follows RV2: p256, peer identity and the lock file come before the bin
 - **Limits:** the P1 and L1 defaults apply when a field is absent. `header_bytes` and `body_bytes` may not exceed the HTTP subset's caps, and a drift poll's deadline must be below its interval.
 - **Step 10** still adds the strict argument schema and per-tool `step_up_over_minor`.
 
+**Journal as built (step 7, `src/journal.rs`).**
+- **Lines:** one canonical JSON record per line: `reserve`, `forwarded`, `outcome` (`executed`, `refused`, `unknown`, `released`), `taint`, `ratchet` and `quarantine`. A line must re-encode to exactly itself, ULIDs included.
+- **Size:** lines are parsed under the definition profile. One call's taint record can hold 4,096 indexes with 1 KiB keys, beyond the request profile. A record beyond that profile is refused when written, so every line written can be read back at boot.
+- **Boot:**
+  - The lock is `peercred::take_lock`, the listener's own checked lock.
+  - The journal file is opened `O_NOFOLLOW`, mode 0600 and one link.
+  - The bytes after the last newline are truncated and fsynced.
+  - A blank or malformed complete line stops the PEP.
+- **`replay` is pure:**
+  - It refuses an inconsistent history: a repeated reservation, a forward or outcome with no reservation, a second forward or outcome, `released` after `forwarded`, or an upstream outcome with no `forwarded`.
+  - A taint location whose store is no longer pinned is skipped. No pinned tool can read it, and the record stays for a lockfile that pins the store again.
+- **The writer thread:**
+  - It groups the appends that arrive together into one write and at most one fsync.
+  - `append` waits for the write, for `reserve` and `outcome`; `commit` also waits for the fsync, for the rest.
+  - After any failure every later append is refused: after a failed fsync the file's state is unknown.
+  - A full queue fails closed rather than blocking.
+- **`JournaledLabels`:** it checks capacity, then commits the call's `taint` record, then applies it. A call with nothing to taint writes nothing, so reads pay no fsync.
+
 **Control protocol** (H1, E1). The same HTTP subset carries one JSON request per connection, and the peer's uid and gid must be 20004.
 
 | Call | Parameters | Result |

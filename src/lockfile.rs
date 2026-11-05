@@ -418,28 +418,21 @@ fn arg_spec(value: &JcsValue, path: &str) -> Result<ArgSpec, LoadError> {
 }
 
 fn confidentiality(text: &str, path: &str) -> Result<Confidentiality, LoadError> {
-    match text {
-        "public" => Ok(Confidentiality::Public),
-        "internal" => Ok(Confidentiality::Internal),
-        "confidential" => Ok(Confidentiality::Confidential),
-        "secret" => Ok(Confidentiality::Secret),
-        _ => Err(LoadError::at(
+    Confidentiality::from_name(text).ok_or_else(|| {
+        LoadError::at(
             path,
             Problem::Invalid("must be public, internal, confidential or secret"),
-        )),
-    }
+        )
+    })
 }
 
 fn integrity(text: &str, path: &str) -> Result<Integrity, LoadError> {
-    match text {
-        "trusted" => Ok(Integrity::Trusted),
-        "untrusted_external" => Ok(Integrity::UntrustedExternal),
-        "untrusted_agent_write" => Ok(Integrity::UntrustedAgentWrite),
-        _ => Err(LoadError::at(
+    Integrity::from_name(text).ok_or_else(|| {
+        LoadError::at(
             path,
             Problem::Invalid("must be trusted, untrusted_external or untrusted_agent_write"),
-        )),
-    }
+        )
+    })
 }
 
 /// RV4 #8: a read tool that returns stored data without naming its location declares the

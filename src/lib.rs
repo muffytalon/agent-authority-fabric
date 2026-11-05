@@ -16,6 +16,8 @@ pub mod engine;
 pub mod forward;
 pub mod http;
 pub mod jcs;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub mod journal;
 pub mod lockfile;
 pub mod mcp;
 #[cfg(any(target_os = "linux", target_os = "macos"))]

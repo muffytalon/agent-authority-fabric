@@ -414,8 +414,16 @@ impl BoundListener {
     }
 }
 
-/// Opens the lock file at `path` and takes an exclusive, non-blocking lock on it.
-fn take_lock(path: &Path, euid: u32) -> Result<File, PeerError> {
+/// Opens the lock file at `path` and takes an exclusive, non-blocking lock on it: `O_NOFOLLOW`
+/// and `O_NONBLOCK`, created mode 0600 if absent, and checked by fstat (a regular file, mode
+/// 0600, owned by `euid`, one link). The lock lasts as long as the returned file. The socket
+/// listener and the journal (R1) both lock this way.
+///
+/// # Errors
+///
+/// Returns [`PeerError::LockHeld`] if another process holds the lock, and another
+/// [`PeerError`] if the lock file fails its checks.
+pub fn take_lock(path: &Path, euid: u32) -> Result<File, PeerError> {
     let file = open_lock_file(path)?;
     check_lock_file(&file.metadata()?, euid)?;
     match file.try_lock() {

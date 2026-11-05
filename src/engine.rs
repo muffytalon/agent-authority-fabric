@@ -328,6 +328,32 @@ pub enum Confidentiality {
     Secret,
 }
 
+impl Confidentiality {
+    /// The level's name in the lockfile and the journal.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Public => "public",
+            Self::Internal => "internal",
+            Self::Confidential => "confidential",
+            Self::Secret => "secret",
+        }
+    }
+
+    /// The level named `name`.
+    #[must_use]
+    pub fn from_name(name: &str) -> Option<Self> {
+        [
+            Self::Public,
+            Self::Internal,
+            Self::Confidential,
+            Self::Secret,
+        ]
+        .into_iter()
+        .find(|level| level.name() == name)
+    }
+}
+
 /// Integrity level, ordered by taint: `Trusted` is the least tainted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Integrity {
@@ -337,6 +363,30 @@ pub enum Integrity {
     UntrustedExternal,
     /// Written by the agent (F-08).
     UntrustedAgentWrite,
+}
+
+impl Integrity {
+    /// The level's name in the lockfile and the journal.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Trusted => "trusted",
+            Self::UntrustedExternal => "untrusted_external",
+            Self::UntrustedAgentWrite => "untrusted_agent_write",
+        }
+    }
+
+    /// The level named `name`.
+    #[must_use]
+    pub fn from_name(name: &str) -> Option<Self> {
+        [
+            Self::Trusted,
+            Self::UntrustedExternal,
+            Self::UntrustedAgentWrite,
+        ]
+        .into_iter()
+        .find(|level| level.name() == name)
+    }
 }
 
 /// A confidentiality and integrity pair. Joining takes the maximum of each.
@@ -544,6 +594,19 @@ impl ContentDigest {
         is_taint_indexable(value).then(|| Self(jcs::digest_value(value)))
     }
 
+    /// A digest the journal recorded (R1): `sha-256:` and 43 base64url characters, the form
+    /// [`ContentDigest::of`] produces. Only the journal's replay rebuilds digests this way;
+    /// every digest it holds was made by `of`.
+    #[must_use]
+    pub fn from_journaled(text: &str) -> Option<Self> {
+        let encoded = text.strip_prefix("sha-256:")?;
+        (encoded.len() == 43
+            && encoded
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')))
+        .then(|| Self(text.to_owned()))
+    }
+
     /// The digest string.
     #[must_use]
     pub fn as_str(&self) -> &str {
@@ -646,19 +709,39 @@ impl InMemoryLabelStore {
     }
 }
 
+impl InMemoryLabelStore {
+    /// Whether `indexes` would fit: the store's entries plus those of `indexes` it does not
+    /// hold yet, counted once each, stay within its capacity.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Poisoned`] if the lock is poisoned.
+    pub fn fits(&self, indexes: &[TaintIndex]) -> Result<bool, StoreError> {
+        let entries = self.entries.lock().map_err(|_| StoreError::Poisoned)?;
+        Ok(fits_in(&entries, self.capacity, indexes))
+    }
+}
+
+fn fits_in(
+    entries: &BTreeMap<TaintIndex, StoredLabel>,
+    capacity: usize,
+    indexes: &[TaintIndex],
+) -> bool {
+    let new: BTreeSet<&TaintIndex> = indexes
+        .iter()
+        .filter(|index| !entries.contains_key(*index))
+        .collect();
+    entries
+        .len()
+        .checked_add(new.len())
+        .is_some_and(|total| total <= capacity)
+}
+
 impl LabelStore for InMemoryLabelStore {
     fn record_all(&self, indexes: &[TaintIndex], entry: LabelEntry) -> Result<(), StoreError> {
         let mut entries = self.entries.lock().map_err(|_| StoreError::Poisoned)?;
         // Capacity first, so a batch that does not fit changes nothing.
-        let new: BTreeSet<&TaintIndex> = indexes
-            .iter()
-            .filter(|index| !entries.contains_key(*index))
-            .collect();
-        if entries
-            .len()
-            .checked_add(new.len())
-            .is_none_or(|total| total > self.capacity)
-        {
+        if !fits_in(&entries, self.capacity, indexes) {
             return Err(StoreError::CapacityExceeded);
         }
         for index in indexes {
