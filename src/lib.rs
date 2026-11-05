@@ -27,6 +27,17 @@ pub mod mcp;
 pub mod peercred;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod registry;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub mod serve;
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects
+)]
+mod testkit;
 pub mod tokens;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod upstream;

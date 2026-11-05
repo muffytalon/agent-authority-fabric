@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use crate::actor::{self, AgentSender, HostMessage, HostSender, Services};
 use crate::config::IntentConfig;
 use crate::control::{ControlError, PendingPayment};
-use crate::engine::{HostAuthority, Ledger, PepEngine, Shared, ToolPins};
+use crate::engine::{HostAuthority, Ledger, PepEngine, Shared, ToolPins, encode_ulid};
 use crate::tokens::{
     EPISODE_MAX_LIFETIME_SECS, EpisodeClaims, EpisodeStates, Es256Signer, Es256Verifier,
     mint_episode_token, verify_episode_token_with,
@@ -367,6 +367,16 @@ impl Registry {
         Ok(live.agent.clone())
     }
 
+    /// A fresh PEP-assigned id for one agent call (M1): a ULID, unique across boots.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControlError::Unavailable`] if the clock or the entropy fails.
+    pub fn call_id(&self) -> Result<String, ControlError> {
+        let now = (self.services.now)().map_err(|_| ControlError::Unavailable)?;
+        self.new_id(now).map(encode_ulid)
+    }
+
     /// Milliseconds since the registry started, from the monotonic clock.
     fn now_ms(&self) -> u64 {
         u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX)
@@ -437,7 +447,7 @@ mod tests {
     use crate::actor::Upstream;
     use crate::engine::{
         Confidentiality, Entities, EntitySet, InMemoryLabelStore, Limits, PepIntent, SeqPolicy,
-        ServerStates, UnresolvedEntities, encode_ulid,
+        ServerStates, UnresolvedEntities,
     };
     use crate::forward::UpstreamRequest;
     use crate::jcs::{self, ParseOptions};
