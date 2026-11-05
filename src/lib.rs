@@ -25,6 +25,8 @@ pub mod lockfile;
 pub mod mcp;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod peercred;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub mod registry;
 pub mod tokens;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod upstream;

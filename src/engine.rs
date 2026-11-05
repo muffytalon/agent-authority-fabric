@@ -1919,6 +1919,45 @@ impl PepEngine {
         &self.state
     }
 
+    /// The intent's ledger as this episode leaves it, by the journal's replay rules (R1): the
+    /// next episode of the intent starts from it. A forwarded or `NeedsReconcile` reservation
+    /// is unresolved, kept by its (eid, rid); a reservation never forwarded counts as released,
+    /// in `calls` but not in its entity's uses.
+    #[must_use]
+    pub fn ledger(&self) -> Ledger {
+        let eid = self.state.intent.episode_id;
+        let budget = &self.state.budget;
+        let mut unresolved = budget.restored.clone();
+        let mut entity_uses = budget.entity_uses.clone();
+        for reservation in budget.reservations.values() {
+            match reservation.state {
+                ResState::Forwarded | ResState::NeedsReconcile => {
+                    unresolved.insert(
+                        (eid, reservation.id),
+                        RestoredReservation {
+                            entity: reservation.entity.clone(),
+                            amount_minor: reservation.amount_minor,
+                        },
+                    );
+                }
+                ResState::Held | ResState::AwaitingStepUp => {
+                    if let Some(uses) = entity_uses.get_mut(&reservation.entity) {
+                        *uses = uses.checked_sub(1).unwrap_or(*uses);
+                    }
+                }
+                ResState::Committed | ResState::Released => {}
+            }
+        }
+        entity_uses.retain(|_, uses| *uses > 0);
+        Ledger {
+            committed_minor: budget.committed,
+            calls: budget.calls,
+            entity_uses,
+            unresolved,
+            context_conf: self.state.context_conf,
+        }
+    }
+
     /// Best-effort confidentiality of the call's inputs. It cannot fail, so a denial at any
     /// guard can ratchet `context_conf` (F-09).
     fn pre_pass(&self, call: &ToolCall) -> Confidentiality {

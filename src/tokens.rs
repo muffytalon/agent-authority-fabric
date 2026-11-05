@@ -704,14 +704,42 @@ pub fn verify_episode_token(
     episodes: &EpisodeStates,
     now: u64,
 ) -> Result<EpisodeClaims, TokenError> {
+    verify_episode_token_with(
+        token,
+        verifier,
+        expect.peer_uid,
+        expect.release_epoch,
+        |_| Some(expect.intent_digest.to_owned()),
+        episodes,
+        now,
+    )
+}
+
+/// [`verify_episode_token`] for a PEP with several intents: the digest the token must carry is
+/// that of its own episode's intent, found by `intent_digest_of` from the token's `eid` once
+/// the signature, peer and epoch checks pass. An `eid` it does not know is
+/// [`TokenError::IntentMismatch`].
+///
+/// # Errors
+///
+/// As [`verify_episode_token`].
+pub fn verify_episode_token_with(
+    token: &str,
+    verifier: &Es256Verifier,
+    peer_uid: u32,
+    release_epoch: u64,
+    intent_digest_of: impl FnOnce(u128) -> Option<String>,
+    episodes: &EpisodeStates,
+    now: u64,
+) -> Result<EpisodeClaims, TokenError> {
     let claims = EpisodeClaims::from_object(&verifier.verify(token, EPISODE_TYP)?)?;
-    if claims.peer_uid != expect.peer_uid {
+    if claims.peer_uid != peer_uid {
         return Err(TokenError::PeerMismatch);
     }
-    if claims.release_epoch != expect.release_epoch {
+    if claims.release_epoch != release_epoch {
         return Err(TokenError::EpochMismatch);
     }
-    if claims.intent_digest != expect.intent_digest {
+    if intent_digest_of(claims.eid).as_deref() != Some(claims.intent_digest.as_str()) {
         return Err(TokenError::IntentMismatch);
     }
     episodes.admit(&claims, now)?;
@@ -802,6 +830,32 @@ impl EpisodeStates {
             .ok_or(TokenError::UnknownEpisode)?;
         entry.ended = true;
         Ok(())
+    }
+
+    /// Whether the episode `eid` can take no more calls: unknown, ended, idle or expired. The
+    /// registry ends such an episode, so its intent can start another (E1). A poisoned table
+    /// reads as over (fail closed); going idle ends the episode for good.
+    #[must_use]
+    pub fn is_over(&self, eid: u128, now: u64) -> bool {
+        let Ok(mut table) = lock(&self.table) else {
+            return true;
+        };
+        let clock = table.clock.max(now);
+        let Some(entry) = table.episodes.get_mut(&eid) else {
+            return true;
+        };
+        let idle = entry
+            .last_active
+            .checked_add(self.idle_secs)
+            .is_none_or(|deadline| clock > deadline);
+        let expired = entry
+            .expires
+            .checked_add(self.skew_secs)
+            .is_none_or(|limit| clock > limit);
+        if idle {
+            entry.ended = true;
+        }
+        entry.ended || expired
     }
 
     /// Admits one use of a verified token: the time window against the high-water clock, then
@@ -1866,6 +1920,73 @@ mod tests {
             }),
             Err(TokenError::IntentMismatch)
         ));
+    }
+
+    #[test]
+    fn the_intent_is_looked_up_by_eid() {
+        let signer = rfc_signer();
+        let check = |digest_of: &dyn Fn(u128) -> Option<String>| {
+            verify_episode_token_with(
+                EPISODE_VECTOR,
+                &signer.verifier(),
+                20_001,
+                7,
+                digest_of,
+                &episodes(),
+                T0,
+            )
+        };
+        assert_eq!(
+            check(&|eid| (eid == EID).then(|| ACTION.to_owned()))
+                .unwrap()
+                .eid,
+            EID
+        );
+        // Another intent's digest, or an eid the registry does not know.
+        assert!(matches!(
+            check(&|_| Some(SCHEMA.to_owned())),
+            Err(TokenError::IntentMismatch)
+        ));
+        assert!(matches!(check(&|_| None), Err(TokenError::IntentMismatch)));
+        // The lookup runs only after the signature, peer and epoch checks.
+        let looked_up = std::cell::Cell::new(false);
+        let result = verify_episode_token_with(
+            EPISODE_VECTOR,
+            &signer.verifier(),
+            20_009,
+            7,
+            |_| {
+                looked_up.set(true);
+                None
+            },
+            &episodes(),
+            T0,
+        );
+        assert!(matches!(result, Err(TokenError::PeerMismatch)));
+        assert!(!looked_up.get());
+    }
+
+    #[test]
+    fn is_over_reports_ended_idle_expired_and_unknown_episodes() {
+        let exp = T0 + EPISODE_MAX_LIFETIME_SECS;
+        let states = EpisodeStates::new(64, EPISODE_IDLE_SECS, CLOCK_SKEW_SECS);
+        states.start(EID, exp, T0).unwrap();
+        assert!(!states.is_over(EID, T0));
+        assert!(!states.is_over(EID, T0 + EPISODE_IDLE_SECS));
+        assert!(states.is_over(EID + 1, T0));
+        // Idle, and idle is final.
+        assert!(states.is_over(EID, T0 + EPISODE_IDLE_SECS + 1));
+        assert!(states.is_over(EID, T0));
+        // Expired, whatever its activity.
+        let states = EpisodeStates::new(64, u64::MAX / 2, CLOCK_SKEW_SECS);
+        states.start(EID, exp, T0).unwrap();
+        assert!(!states.is_over(EID, exp + CLOCK_SKEW_SECS));
+        assert!(states.is_over(EID, exp + CLOCK_SKEW_SECS + 1));
+        // Ended.
+        let states = EpisodeStates::new(64, EPISODE_IDLE_SECS, CLOCK_SKEW_SECS);
+        states.start(EID, exp, T0).unwrap();
+        states.end(EID).unwrap();
+        assert!(states.is_over(EID, T0));
     }
 
     #[test]

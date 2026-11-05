@@ -31,8 +31,8 @@ use std::time::{Duration, Instant};
 
 use crate::control::{Approval, ControlError, PendingPayment};
 use crate::engine::{
-    AbortOutcome, Confidentiality, Decision, HostAuthority, PEP_DENIED, PepEngine, ResState,
-    Settlement, ToolPins, idempotency_key,
+    AbortOutcome, Confidentiality, Decision, HostAuthority, Ledger, PEP_DENIED, PepEngine,
+    ResState, Settlement, ToolPins, idempotency_key,
 };
 use crate::forward::{self, BrokerOutcome, UpstreamReply, UpstreamRequest};
 use crate::jcs::JcsValue;
@@ -255,8 +255,9 @@ struct Actor {
 }
 
 /// Starts the actor of the episode `engine` runs, an episode of the intent named `intent`.
-/// `on_exit` runs when the actor stops: after `end`, once its last upstream leg is done, so
-/// the episode counts as live until then (E1).
+/// `on_exit` runs when the actor stops, with the intent's ledger as the episode leaves it
+/// ([`PepEngine::ledger`]): after `end`, once its last upstream leg is done, so the episode
+/// counts as live until then (E1).
 ///
 /// # Errors
 ///
@@ -265,7 +266,7 @@ pub fn spawn(
     engine: PepEngine,
     intent: String,
     services: Arc<Services>,
-    on_exit: Box<dyn FnOnce() + Send>,
+    on_exit: Box<dyn FnOnce(Ledger) + Send>,
 ) -> io::Result<(AgentSender, HostSender, JoinHandle<()>)> {
     let (agent, agent_rx) = mpsc::channel();
     let (host, host_rx) = mpsc::channel();
@@ -288,10 +289,7 @@ pub fn spawn(
     };
     let thread = thread::Builder::new()
         .name("episode".to_owned())
-        .spawn(move || {
-            actor.run(&host_rx, &agent_rx, &wake_rx);
-            on_exit();
-        })?;
+        .spawn(move || on_exit(actor.run(&host_rx, &agent_rx, &wake_rx)))?;
     Ok((agent_sender, host_sender, thread))
 }
 
@@ -310,7 +308,7 @@ impl Actor {
         host_rx: &Receiver<HostEvent>,
         agent_rx: &Receiver<AgentMessage>,
         wake_rx: &Receiver<()>,
-    ) {
+    ) -> Ledger {
         let host = Arc::clone(&self.services.host);
         loop {
             // H1: the host channel first.
@@ -318,7 +316,7 @@ impl Actor {
                 self.on_host(&host, event);
             }
             if self.ended && self.legs.is_empty() {
-                return;
+                return self.engine.ledger();
             }
             match agent_rx.try_recv() {
                 Ok(message) => {
@@ -336,7 +334,7 @@ impl Actor {
                 }
                 None => {
                     if wake_rx.recv().is_err() {
-                        return;
+                        return self.engine.ledger();
                     }
                 }
             }
@@ -586,6 +584,16 @@ impl Actor {
 
     /// Fsyncs a rise of the ratchet before `reply` goes out; `PEP_UNAVAILABLE` if it cannot.
     fn ratchet(&mut self, reply: CallReply) -> CallReply {
+        if self.journal_ratchet() {
+            reply
+        } else {
+            CallReply::Unavailable
+        }
+    }
+
+    /// Fsyncs the episode's ratchet level if it rose since the last record. `false` if the
+    /// journal refused it.
+    fn journal_ratchet(&mut self) -> bool {
         let level = self.engine.state().context_conf;
         if level > self.journaled_conf {
             let record = Record::Ratchet {
@@ -593,11 +601,11 @@ impl Actor {
                 conf: level,
             };
             if self.services.journal.commit(&[record]).is_err() {
-                return CallReply::Unavailable;
+                return false;
             }
             self.journaled_conf = level;
         }
-        reply
+        true
     }
 
     fn expire(&mut self, now: Instant) {
@@ -633,10 +641,19 @@ impl Actor {
                 conf,
                 reply,
             }) => {
+                // A trusted input raises the episode's level too, so the rise is made durable
+                // now, as any other is (R1, RV3 A3).
                 let result = self
                     .engine
                     .record_trusted_input(host, &input_id, &value, conf)
-                    .map_err(|_| ControlError::Refused);
+                    .map_err(|_| ControlError::Refused)
+                    .and_then(|()| {
+                        if self.journal_ratchet() {
+                            Ok(())
+                        } else {
+                            Err(ControlError::Unavailable)
+                        }
+                    });
                 drop(reply.try_send(result));
             }
             HostEvent::Control(HostMessage::Pending { reply }) => {
@@ -841,7 +858,7 @@ mod tests {
     use crate::lockfile::{Lockfile, parse_payload};
     use std::fs;
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     const EID: u128 = 0x0192_7a3c_0000_0000_0000_0000_0000_0001;
     const PINS: &str = r#"{"lockfile_version":1,"release_epoch":7,
@@ -921,7 +938,8 @@ mod tests {
         host: HostSender,
         servers: Arc<ServerStates>,
         broker: Arc<FakeBroker>,
-        exited: Arc<AtomicBool>,
+        /// The ledger the actor hands back when it stops.
+        exited: Arc<Mutex<Option<Ledger>>>,
         actor: Option<JoinHandle<()>>,
         next: u128,
     }
@@ -989,13 +1007,13 @@ mod tests {
             upstream_timeout: Duration::from_secs(5),
             now: || Ok(1_800_000_000),
         });
-        let exited = Arc::new(AtomicBool::new(false));
-        let flag = exited.clone();
+        let exited = Arc::new(Mutex::new(None));
+        let slot = exited.clone();
         let (agent, host, actor) = spawn(
             engine,
             "pay".to_owned(),
             services,
-            Box::new(move || flag.store(true, Ordering::SeqCst)),
+            Box::new(move |ledger| *slot.lock().unwrap() = Some(ledger)),
         )
         .unwrap();
         Harness {
@@ -1117,7 +1135,21 @@ mod tests {
         fn end(mut self) {
             self.host(|reply| HostMessage::End { reply });
             self.actor.take().unwrap().join().unwrap();
-            assert!(self.exited.load(Ordering::SeqCst));
+            // The in-memory ledger the next episode starts from is the one a restart would
+            // rebuild from the journal (R1).
+            let ledger = self
+                .exited
+                .lock()
+                .unwrap()
+                .take()
+                .expect("the actor handed back its ledger");
+            let replayed = crate::journal::replay(&self.records()).unwrap();
+            let journaled = replayed
+                .ledgers
+                .get("pay")
+                .cloned()
+                .unwrap_or_else(Ledger::empty);
+            assert_eq!(ledger, journaled);
         }
     }
 
@@ -1428,7 +1460,7 @@ mod tests {
         harness.host(|reply| HostMessage::End { reply });
         assert_eq!(waiting.recv_timeout(WAIT).unwrap(), CallReply::Denied);
         harness.actor.take().unwrap().join().unwrap();
-        assert!(harness.exited.load(Ordering::SeqCst));
+        assert!(harness.exited.lock().unwrap().is_some());
         assert_eq!(
             strip_digests(harness.payments()),
             vec![reserve(1, 60_000), outcome(1, OutcomeKind::Released)]
