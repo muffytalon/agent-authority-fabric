@@ -1035,6 +1035,26 @@ The order follows RV2: p256, peer identity and the lock file come before the bin
 | `pending` | — | Awaiting approvals: `eid`, `rid`, `tool`, `arguments`, `action_digest`, `amount_minor` |
 | `approve` / `decline` | `eid`, `rid`, `action_digest`, `amount_minor`, all matched against the `AwaitingStepUp` reservation | — |
 
+**Control protocol and episode actor as built (step 7, `src/control.rs`, `src/actor.rs`).**
+- **Control requests:** one JSON object per connection, `{"call": …}` plus the table's members, all strict, with eids as canonical ULIDs.
+  - A reply is `{"result": …}`, or `{"error": code}`. The codes are `bad_request` (400), `unknown_intent`, `intent_busy`, `episodes_full`, `unknown_episode`, `not_awaiting`, `mismatch`, `refused` and `unavailable`.
+  - The operator is trusted, so errors name the cause; the agent never sees them.
+- **The actor is a library module.** `main.rs` wires it to sockets, so its logic is tested without them.
+  - The agent channel carries only `Call` and `Disconnected`, and its handler takes no `&HostAuthority`.
+  - The host channel carries `Approve`, `Decline`, `TrustedInput`, `Pending` and `End`, plus the actor's own upstream workers' replies. The host channel is drained before each agent message (H1).
+- **A call's path:**
+  - A payment's `reserve` record is appended as soon as it is reserved.
+  - Just before forwarding come `recheck_before_forward`, the episode still live, and the Call Proof and request, built while the reservation is still `Held`.
+  - The worker thread starts before the point of forwarding, and gets the request only after the `forwarded` fsync. A thread that cannot start, or any failure before that point, therefore releases the payment through `release_unforwarded`.
+  - The broker's reply is settled on the host path.
+- **Approvals:** an approval is matched on eid, rid, `action_digest` and amount (H1). A step-up times out after `step_up_timeout_ms`.
+- **Ending:**
+  - A disconnect before the point of forwarding, a decline, a timeout and `End` release the payment, with an `outcome: released` record.
+  - After `End` the actor answers in-flight legs and stops when the last one is done; `on_exit` frees the intent's slot (E1).
+  - A call queued behind `End` is dropped unread, so its reply channel closes, and the connection thread answers `PEP_DENIED`.
+- **Ratchet:** a rise is committed before the reply that depends on it, a denial included, or the reply becomes `PEP_UNAVAILABLE` (RV4 #4).
+- **Broker replies:** `forward::read_upstream_reply` reads them. The outcome comes from the result's `_meta` or the error's `data`, an unknown value reads as `unknown`, and an ambiguous reply is `unknown` too (P1).
+
 **PEP↔broker.**
 - **Transport:** Streamable HTTP over `/run/broker/broker.sock`, JSON only in both directions, with mutual peer checks on uid and gid (the broker requires 20002, the PEP requires 20003); SPIFFE is deferred.
 - **What it carries:**

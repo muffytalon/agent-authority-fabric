@@ -11,6 +11,8 @@
 //! The architecture is specified in `SPEC.md`; the Week 1 design is in `WEEK1_PLAN.md`.
 #![forbid(unsafe_code)]
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub mod actor;
 pub mod config;
 pub mod control;
 pub mod engine;
