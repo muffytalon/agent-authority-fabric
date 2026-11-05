@@ -7,6 +7,7 @@
 //! reply, which the actor treats as an unknown outcome.
 
 use std::io::{self, Write};
+use std::net::TcpStream;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -76,42 +77,146 @@ impl BrokerClient {
         request: &UpstreamRequest,
         timeout: Duration,
     ) -> Result<Vec<u8>, UpstreamError> {
-        let deadline = Instant::now()
-            .checked_add(timeout)
-            .ok_or(UpstreamError::Timeout)?;
-        let mut stream = UnixStream::connect(&self.socket).map_err(UpstreamError::Connect)?;
-        require_peer(&stream, self.uid, self.gid)?;
-        let left = deadline
-            .checked_duration_since(Instant::now())
-            .filter(|left| !left.is_zero())
-            .ok_or(UpstreamError::Timeout)?;
-        stream
-            .set_write_timeout(Some(left))
-            .map_err(UpstreamError::Write)?;
-        stream
-            .write_all(&request_bytes(request))
-            .map_err(|error| match error.kind() {
-                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => UpstreamError::Timeout,
-                _ => UpstreamError::Write(error),
-            })?;
-        let response = http::read_response(&mut stream, deadline, self.max_body).map_err(
-            |error| match error {
-                HttpError::Timeout => UpstreamError::Timeout,
-                other => UpstreamError::Response(other),
-            },
-        )?;
-        if response.status != 200 {
-            return Err(UpstreamError::Status(response.status));
-        }
-        if !response
+        let headers: Vec<(&str, String)> = request
             .headers
-            .get("content-type")
-            .is_some_and(is_json_content_type)
-        {
-            return Err(UpstreamError::ContentType);
-        }
-        Ok(response.body)
+            .iter()
+            .map(|(name, value)| (*name, value.clone()))
+            .collect();
+        post(&Post {
+            endpoint: &Endpoint::Unix(self.socket.clone()),
+            path: &format!("/mcp/{}", request.server_id),
+            host: "broker",
+            headers: &headers,
+            body: &request.body,
+            timeout,
+            max_body: self.max_body,
+            peer: Some((self.uid, self.gid)),
+        })
     }
+}
+
+/// Where an HTTP server listens: a Unix socket, or a TCP address (the broker reaches each
+/// tool server on its own network, N1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Endpoint {
+    /// `unix:/path`.
+    Unix(PathBuf),
+    /// `tcp:host:port`.
+    Tcp(String),
+}
+
+impl Endpoint {
+    /// Parses `unix:/absolute/path` or `tcp:host:port`.
+    #[must_use]
+    pub fn parse(text: &str) -> Option<Self> {
+        if let Some(path) = text.strip_prefix("unix:") {
+            return path
+                .starts_with('/')
+                .then(|| Self::Unix(PathBuf::from(path)));
+        }
+        let address = text.strip_prefix("tcp:")?;
+        let (host, port) = address.rsplit_once(':')?;
+        (!host.is_empty() && port.parse::<u16>().is_ok()).then(|| Self::Tcp(address.to_owned()))
+    }
+}
+
+/// A connected stream of either kind.
+enum Connection {
+    Unix(UnixStream),
+    Tcp(TcpStream),
+}
+
+/// One POST of a JSON body.
+#[derive(Debug, Clone, Copy)]
+pub struct Post<'a> {
+    /// Where the server listens.
+    pub endpoint: &'a Endpoint,
+    /// The request target.
+    pub path: &'a str,
+    /// The `Host` header.
+    pub host: &'a str,
+    /// The other headers; `Content-Length` and `Connection: close` are added.
+    pub headers: &'a [(&'a str, String)],
+    /// The body.
+    pub body: &'a [u8],
+    /// The deadline for the whole exchange, from now.
+    pub timeout: Duration,
+    /// The largest reply body read.
+    pub max_body: usize,
+    /// Over a Unix socket, the uid and gid the server must have (RV3 F7). Over TCP no peer
+    /// check is possible, and the caller authenticates otherwise (the broker's per-server
+    /// credential).
+    pub peer: Option<(u32, u32)>,
+}
+
+/// Sends `request` and returns the body of a 200 JSON reply that arrives whole within its
+/// timeout.
+///
+/// # Errors
+///
+/// Returns an [`UpstreamError`] for every other end of the exchange.
+pub fn post(request: &Post<'_>) -> Result<Vec<u8>, UpstreamError> {
+    let Post {
+        endpoint,
+        path,
+        host,
+        headers,
+        body,
+        timeout,
+        max_body,
+        peer,
+    } = *request;
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .ok_or(UpstreamError::Timeout)?;
+    let mut connection = match endpoint {
+        Endpoint::Unix(socket) => {
+            let stream = UnixStream::connect(socket).map_err(UpstreamError::Connect)?;
+            if let Some((uid, gid)) = peer {
+                require_peer(&stream, uid, gid)?;
+            }
+            Connection::Unix(stream)
+        }
+        Endpoint::Tcp(address) => {
+            Connection::Tcp(TcpStream::connect(address).map_err(UpstreamError::Connect)?)
+        }
+    };
+    let left = deadline
+        .checked_duration_since(Instant::now())
+        .filter(|left| !left.is_zero())
+        .ok_or(UpstreamError::Timeout)?;
+    let bytes = request_bytes(path, host, headers, body);
+    let written = match &mut connection {
+        Connection::Unix(stream) => stream
+            .set_write_timeout(Some(left))
+            .and_then(|()| stream.write_all(&bytes)),
+        Connection::Tcp(stream) => stream
+            .set_write_timeout(Some(left))
+            .and_then(|()| stream.write_all(&bytes)),
+    };
+    written.map_err(|error| match error.kind() {
+        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => UpstreamError::Timeout,
+        _ => UpstreamError::Write(error),
+    })?;
+    let response = match &mut connection {
+        Connection::Unix(stream) => http::read_response(stream, deadline, max_body),
+        Connection::Tcp(stream) => http::read_response(stream, deadline, max_body),
+    }
+    .map_err(|error| match error {
+        HttpError::Timeout => UpstreamError::Timeout,
+        other => UpstreamError::Response(other),
+    })?;
+    if response.status != 200 {
+        return Err(UpstreamError::Status(response.status));
+    }
+    if !response
+        .headers
+        .get("content-type")
+        .is_some_and(is_json_content_type)
+    {
+        return Err(UpstreamError::ContentType);
+    }
+    Ok(response.body)
 }
 
 impl Upstream for BrokerClient {
@@ -121,23 +226,19 @@ impl Upstream for BrokerClient {
 }
 
 /// The request on the wire.
-fn request_bytes(request: &UpstreamRequest) -> Vec<u8> {
-    let mut out = format!(
-        "POST /mcp/{} HTTP/1.1\r\nHost: broker\r\n",
-        request.server_id
-    )
-    .into_bytes();
-    for (name, value) in &request.headers {
+fn request_bytes(path: &str, host: &str, headers: &[(&str, String)], body: &[u8]) -> Vec<u8> {
+    let mut out = format!("POST {path} HTTP/1.1\r\nHost: {host}\r\n").into_bytes();
+    for (name, value) in headers {
         out.extend_from_slice(format!("{name}: {value}\r\n").as_bytes());
     }
     out.extend_from_slice(
         format!(
             "Content-Length: {}\r\nConnection: close\r\n\r\n",
-            request.body.len()
+            body.len()
         )
         .as_bytes(),
     );
-    out.extend_from_slice(&request.body);
+    out.extend_from_slice(body);
     out
 }
 

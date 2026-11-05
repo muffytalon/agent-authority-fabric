@@ -164,6 +164,8 @@ impl Headers {
 pub struct RequestHead {
     /// The method, case-sensitive.
     pub method: String,
+    /// The request target, which the reader's predicate accepted.
+    pub target: String,
     /// The header fields.
     pub headers: Headers,
     /// The body length, when `Content-Length` is present.
@@ -214,6 +216,12 @@ impl TimedRead for std::os::unix::net::UnixStream {
     }
 }
 
+impl TimedRead for std::net::TcpStream {
+    fn set_read_timeout(&mut self, timeout: Option<Duration>) -> io::Result<()> {
+        std::net::TcpStream::set_read_timeout(self, timeout)
+    }
+}
+
 /// Reads one request for `endpoint` from `stream`, within `deadlines`.
 ///
 /// # Errors
@@ -226,9 +234,23 @@ pub fn read_request<S: TimedRead + ?Sized>(
     endpoint: &str,
     deadlines: Deadlines,
 ) -> Result<Request, HttpError> {
+    read_request_matching(stream, &|target| target == endpoint, deadlines)
+}
+
+/// [`read_request`] for a server with several targets, such as the broker's
+/// `/mcp/{server_id}`: any target `accept` admits.
+///
+/// # Errors
+///
+/// As [`read_request`].
+pub fn read_request_matching<S: TimedRead + ?Sized>(
+    stream: &mut S,
+    accept: &dyn Fn(&str) -> bool,
+    deadlines: Deadlines,
+) -> Result<Request, HttpError> {
     let (buf, head_end) = read_head(stream, deadlines.head)?;
     let (head_bytes, rest) = buf.split_at_checked(head_end).ok_or(HttpError::Io)?;
-    let head = parse_head(head_bytes, endpoint)?;
+    let head = parse_head_matching(head_bytes, accept)?;
     if !head.is_post() {
         return Ok(Request {
             head,
@@ -366,13 +388,26 @@ fn has_bare_line_ending(bytes: &[u8]) -> bool {
 ///
 /// Returns the [`Malformed`] reason for a head to refuse with 400.
 pub fn parse_head(head: &[u8], endpoint: &str) -> Result<RequestHead, Malformed> {
-    let (method, headers) = head_lines(head, |line| parse_request_line(line, endpoint))?;
+    parse_head_matching(head, &|target| target == endpoint)
+}
+
+/// [`parse_head`] for any target `accept` admits.
+///
+/// # Errors
+///
+/// As [`parse_head`].
+pub fn parse_head_matching(
+    head: &[u8],
+    accept: &dyn Fn(&str) -> bool,
+) -> Result<RequestHead, Malformed> {
+    let ((method, target), headers) = head_lines(head, |line| parse_request_line(line, accept))?;
     if !headers.contains("host") {
         return Err(Malformed::MissingHost);
     }
     let content_length = content_length(&headers, MAX_BODY_BYTES)?;
     Ok(RequestHead {
         method,
+        target,
         headers,
         content_length,
     })
@@ -440,7 +475,10 @@ fn content_length(headers: &Headers, cap: usize) -> Result<Option<usize>, Malfor
 }
 
 /// Checks `method SP target SP HTTP/1.1` and returns the method.
-fn parse_request_line(line: &str, endpoint: &str) -> Result<String, Malformed> {
+fn parse_request_line(
+    line: &str,
+    accept: &dyn Fn(&str) -> bool,
+) -> Result<(String, String), Malformed> {
     let mut parts = line.split(' ');
     let (Some(method), Some(target), Some(version), None) =
         (parts.next(), parts.next(), parts.next(), parts.next())
@@ -453,10 +491,10 @@ fn parse_request_line(line: &str, endpoint: &str) -> Result<String, Malformed> {
     if version != "HTTP/1.1" {
         return Err(Malformed::Version);
     }
-    if target != endpoint {
+    if !accept(target) {
         return Err(Malformed::Target);
     }
-    Ok(method.to_owned())
+    Ok((method.to_owned(), target.to_owned()))
 }
 
 /// Parses `name ":" OWS value OWS`.

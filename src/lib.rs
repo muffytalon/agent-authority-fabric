@@ -31,6 +31,8 @@ pub mod poll;
 pub mod registry;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod serve;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub mod stubs;
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 #[allow(
     clippy::unwrap_used,
