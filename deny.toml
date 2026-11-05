@@ -5,8 +5,9 @@
 # whenever a pin in Cargo.toml changes.
 
 [graph]
-# The two targets of the CLAUDE.md §2 verification loop.
-targets = ["x86_64-unknown-linux-gnu", "aarch64-apple-darwin"]
+# The two targets of the CLAUDE.md §2 verification loop, and the static musl target of the
+# trusted images (B1).
+targets = ["x86_64-unknown-linux-gnu", "aarch64-apple-darwin", "x86_64-unknown-linux-musl"]
 all-features = true
 
 [advisories]

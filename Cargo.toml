@@ -61,3 +61,10 @@ mem_forget = "deny"
 # Approved pedantic opt-outs: jcs::JcsValue, peercred::PeerError; long guard/parser fns.
 module_name_repetitions = "allow"
 too_many_lines = "allow"
+
+# B1 (2026-11-05). With the R1 journal, a panic fails closed: the process ends, every token
+# dies with its per-boot key, and the journal keeps every budget. Overflow checks cover the
+# dependencies and binaries too; the library already denies unchecked arithmetic.
+[profile.release]
+panic = "abort"
+overflow-checks = true

@@ -27,7 +27,7 @@ RV2's repo claims were re-checked on 2026-11-03, and its p256 build was reproduc
   - `tokens.rs`.
 
   The crypto crate, peer identity, the lock file and `tokens.rs` come first (§2), so the binary is never built against placeholder security checks. The binary comes next, then Compose, so every later step is tested in the real topology.
-- **Decisions:** 18 (§1). 16 are CLOSED: D2 first, then the 13 that block steps 3–7, in step 2 (2026-11-03), then N1 and O1 (2026-11-04). B1 and S1 stay OPEN until just before the step each blocks. The largest closed in step 2 are:
+- **Decisions:** 18 (§1). 17 are CLOSED: D2 first, then the 13 that block steps 3–7, in step 2 (2026-11-03), then N1 and O1 (2026-11-04), then B1 (2026-11-05). S1 stays OPEN until just before step 9. The largest closed in step 2 are:
   - **M1:** the MCP 2026-07-28 surface beyond `tools/call`;
   - **M2:** results that are not `complete`;
   - **P1:** payment outcomes under MCP's rule that a disconnect is a cancellation;
@@ -101,10 +101,10 @@ Gate 1 is evaluated on the release profile in the Compose topology (§4), not in
 | G6 | Decisions | Every §1 decision CLOSED, with its rationale recorded |
 
 ## 1. Decision register
-Status: 16 of 18 are CLOSED. Two stay OPEN, each until just before the step it blocks:
+Status: 17 of 18 are CLOSED. One stays OPEN until just before the step it blocks:
 - **Step 2** closed the 14 that block steps 3–7: D2 before it, and the other 13 in it. All 13 closed as recommended. Three needed a further choice, made in step 2: T1's Call Proof server binding, U1's two error codes and L1's signer rule.
 - **N1 and O1** closed on 2026-11-04, as recommended after RV4's amendments.
-- **B1** closes before step 8.
+- **B1** closed on 2026-11-05, before step 8.
 - **S1** closes before step 9.
 
 RV2 had T1, L1 and Q1 closing after step 2. RV2's own reordering (§2) moves them into step 2: crypto, peer identity and tokens now come before the binary, and the config's `pins` section uses the lockfile v1 payload. "Recommendation" is a label, not a decision; each closed decision ends with a **Decision** block. RV3's questions for step 2 are listed at the end of this section, with where each is now answered.
@@ -125,7 +125,7 @@ RV2 had T1, L1 and Q1 closing after step 2. RV2's own reordering (§2) moves the
 | T1 | Token profiles | Decided: rfc8725bis-10 rules with a header allowlist and strict base64url. Call Proof `typ` `pep-callproof+jwt` on every forwarded call, bound to its server by a `server_id` claim, with `aud` the broker. Low-S required on both token types. Revocation keyed by eid. A per-episode rate limit sizes the replay cache | 6 | CLOSED 2026-11-03 |
 | L1 | Lockfile v1 content | Decided: engine-named fields and the full canonical definitions. The unsigned payload is also the config's `pins`. DER signatures only, with a threshold of distinct keys per role (Gate 1: `release` 1, `security` 1). Drift found by polling; any drift quarantines the whole server, and a failed poll suspends it (RV4 #9) | 7, 10 | CLOSED 2026-11-03 |
 | O1 | Latency definition | Decided: agent-side time minus the tool server's own time, under open-loop load with stated provisioning, with PEP and broker residence reported beside it (amended after RV4 #15) | 9 | CLOSED 2026-11-04 |
-| B1 | Release build profile | `overflow-checks = true`; `panic = "abort"` only together with R1 (a); the release binary builds with default features | 8 | Before step 8 |
+| B1 | Release build profile | `overflow-checks = true`; `panic = "abort"` only together with R1 (a); the release binary builds with default features | 8 | CLOSED 2026-11-05 |
 | U1 | Wire shapes of denials and errors | Decided: one shape for every policy denial (`PEP_DENIED` -31403, `PEP_UNAVAILABLE` -31503); MCP-mandated errors keep their codes; one total reply order | 7 | CLOSED 2026-11-03 |
 | J1 | Result fidelity | Decided: (b) the result profile keeps the exact digits of integers beyond ±(2^53−1) | 7 | CLOSED 2026-11-03 |
 | A1 | Engine threading | Decided: (ii) one actor thread per episode | 7 | CLOSED 2026-11-03 |
@@ -745,6 +745,22 @@ The unsigned lockfile v1 payload is also the config's `pins` section from step 7
 - **`panic = "abort"`:** only together with R1 (a). Then a crash fails closed: it voids every token, and the journal keeps every budget. Under R1 (b), keep `panic = "unwind"`.
 - **musl:** add `x86_64-unknown-linux-musl` to `rust-toolchain.toml` only if the images are static (distroless or scratch), and then to `deny.toml`'s `[graph] targets` as well. Otherwise build in an image whose glibc matches.
 - **Features (RV3 F4).** The release binary builds with default features. `lenient-numbers` changes the request profile the agent faces (jcs.rs:29-32), so it stays a test configuration.
+
+**Decision: CLOSED 2026-11-05: abort with overflow checks, and a split image base.**
+- **Decided:**
+  - `[profile.release]` sets `panic = "abort"` and `overflow-checks = true`. The release binary builds with default features.
+  - **The trusted components** (the PEP, the broker and the operator) are static `x86_64-unknown-linux-musl` binaries on `scratch`, with a hand-built root: a real `/run` owned by root, and the state directories with §4's owners and modes. `rust-toolchain.toml` and `deny.toml`'s `[graph] targets` gain the musl target.
+  - **The tool servers,** and the Gate 1 agent's SDK image, build for glibc in `rust:1.97.1-bookworm` and run on the matching `debian:bookworm-slim`.
+- **Why:**
+  - With R1 (a), a panic fails closed: it voids every token, and the journal keeps every budget. Unwinding could leave half-broken state behind, such as a dead actor that holds its intent busy.
+  - The trusted components get the smallest image: no shell, no package manager, no libc. All their dependencies are pure Rust, so the musl build needs no C toolchain.
+  - The tool server sits outside the trusted computing base, and plays the attacker in Gate 1. The servers that replace the stubs in Week 4 (Python tools) need glibc, and musl's resolver and locale quirks would cost more to debug than the image size saves. Its hardening comes from the container instead: a read-only root, no capabilities, non-root, and a network of its own.
+- **Not adopted:**
+  - `distroless/static`, whose extras go unused: there is no TLS (Unix sockets, and plain HTTP on internal networks), times are UTC milliseconds, and the uids are numeric. `scratch` avoids a third-party base.
+  - A faster allocator (mimalloc or jemalloc) for musl: it would bring C code into the build and new `unsafe` dependencies. Step 9's latency harness measures musl's allocator first, and the swap is revisited only if O1's numbers need it.
+  - rustls: Week 2 has no TLS.
+- **Raised by:** the user's review of the image base, which proposed the split; it was checked against the all-`scratch` recommendation before being adopted.
+- **SPEC:** none.
 
 ### U1. Wire shapes of denials and errors
 - **Policy and token denials.** Every one gets the same shape, so the agent cannot tell which guard fired:
