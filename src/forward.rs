@@ -11,7 +11,7 @@
 //! `name` and `arguments`, equals the engine's.
 
 use crate::engine::{decode_ulid, encode_ulid};
-use crate::jcs::{JcsObject, JcsString, JcsValue};
+use crate::jcs::{self, JcsObject, JcsString, JcsValue, ParseOptions};
 
 /// The MCP revision the PEP speaks upstream.
 pub const PROTOCOL_VERSION: &str = "2026-07-28";
@@ -23,6 +23,9 @@ pub const CLIENT_NAME: &str = "pep-sidecar";
 pub const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Longest tool name MCP recommends, and the lockfile allows (L1).
 pub const MAX_TOOL_NAME: usize = 128;
+/// `_meta` key, in a result or an error's `data`, of the broker's payment outcome (P1). The
+/// broker strips any `dev.pep-sidecar/*` key a tool server sent, so a present key is its own.
+pub const OUTCOME_META_KEY: &str = "dev.pep-sidecar/outcome";
 
 /// One upstream request: the body, and the headers derived from it. The HTTP layer adds
 /// `Content-Length` and `Connection: close`.
@@ -51,6 +54,87 @@ pub enum ForwardError {
     /// The body could not be encoded.
     #[error("request could not be encoded")]
     Encoding,
+    /// The broker's reply is not one JSON-RPC response to this request: not JSON, a batch,
+    /// another id, both or neither of `result` and `error`, or a result that is not an object.
+    #[error("ambiguous upstream reply")]
+    Ambiguous,
+}
+
+/// The broker's explicit outcome for a payment (P1, RV3 B6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BrokerOutcome {
+    /// The tool server executed the payment.
+    Executed,
+    /// It did not: declined, or the broker refused the Call Proof.
+    Refused,
+    /// No one knows. Any value the PEP does not recognize reads as this.
+    Unknown,
+}
+
+/// What the broker answered: its outcome, when it gave one, and the tool's result, if any.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpstreamReply {
+    /// The outcome, from the result's `_meta` or the error's `data`.
+    pub outcome: Option<BrokerOutcome>,
+    /// The result object's canonical bytes, for
+    /// [`crate::engine::PepEngine::record_result_raw`], which drops its `_meta`. `None` for an
+    /// error reply.
+    pub result: Option<Vec<u8>>,
+}
+
+/// Reads the broker's JSON-only reply to the request whose id was `upstream_id` (M1). The
+/// caller has already checked that the reply came from the broker's uid, and was 200 with
+/// `Content-Type: application/json`.
+///
+/// # Errors
+///
+/// Returns [`ForwardError::Ambiguous`] for anything but one JSON-RPC response to this
+/// request; the caller treats it as an unknown outcome.
+pub fn read_upstream_reply(body: &[u8], upstream_id: &str) -> Result<UpstreamReply, ForwardError> {
+    let value = jcs::parse_with(body, &ParseOptions::definition())
+        .map_err(|_| ForwardError::Ambiguous)?
+        .value;
+    let object = value.as_object().ok_or(ForwardError::Ambiguous)?;
+    let known = object
+        .entries()
+        .iter()
+        .all(|(key, _)| matches!(key.as_str(), "jsonrpc" | "id" | "result" | "error"));
+    if !known
+        || object.get("jsonrpc").and_then(JcsValue::as_str) != Some("2.0")
+        || object.get("id").and_then(JcsValue::as_str) != Some(upstream_id)
+    {
+        return Err(ForwardError::Ambiguous);
+    }
+    let outcome_in = |holder: Option<&JcsValue>| {
+        holder
+            .and_then(|holder| holder.get(OUTCOME_META_KEY))
+            .map(|outcome| match outcome.as_str() {
+                Some("executed") => BrokerOutcome::Executed,
+                Some("refused") => BrokerOutcome::Refused,
+                _ => BrokerOutcome::Unknown,
+            })
+    };
+    match (object.get("result"), object.get("error")) {
+        (Some(result), None) => {
+            if result.as_object().is_none() {
+                return Err(ForwardError::Ambiguous);
+            }
+            Ok(UpstreamReply {
+                outcome: outcome_in(result.get("_meta")),
+                result: Some(result.to_canonical_bytes()),
+            })
+        }
+        (None, Some(error)) => {
+            if error.as_object().is_none() {
+                return Err(ForwardError::Ambiguous);
+            }
+            Ok(UpstreamReply {
+                outcome: outcome_in(error.get("data")),
+                result: None,
+            })
+        }
+        _ => Err(ForwardError::Ambiguous),
+    }
 }
 
 /// Builds the upstream `tools/call` for an allowed call.
@@ -206,6 +290,63 @@ mod tests {
             digest,
             "sha-256:j3XfycsYi2G8jSVocXUTiPN2JWbcwQfOK1L4pLAdI1E"
         );
+    }
+
+    #[test]
+    fn upstream_replies() {
+        let reply = |body: &str| read_upstream_reply(body.as_bytes(), ID);
+        // A payment result with the broker's outcome; big integers keep their digits (J1).
+        let executed = reply(&format!(
+            r#"{{"jsonrpc":"2.0","id":"{ID}","result":{{"resultType":"complete","content":[],"structuredContent":{{"n":18446744073709551615}},"_meta":{{"dev.pep-sidecar/outcome":"executed"}}}}}}"#
+        ))
+        .unwrap();
+        assert_eq!(executed.outcome, Some(BrokerOutcome::Executed));
+        let result = String::from_utf8(executed.result.unwrap()).unwrap();
+        assert!(result.contains("18446744073709551615"));
+        let reparsed = jcs::parse_with(result.as_bytes(), &ParseOptions::definition()).unwrap();
+        assert_eq!(reparsed.value.to_canonical_bytes(), result.as_bytes());
+        // No outcome: a non-payment result.
+        let plain = reply(&format!(
+            r#"{{"jsonrpc":"2.0","id":"{ID}","result":{{"resultType":"complete"}}}}"#
+        ))
+        .unwrap();
+        assert_eq!(plain.outcome, None);
+        // A refused Call Proof: an error with the outcome in `data`, and no result.
+        let refused = reply(&format!(
+            r#"{{"jsonrpc":"2.0","id":"{ID}","error":{{"code":-31403,"message":"refused","data":{{"dev.pep-sidecar/outcome":"refused"}}}}}}"#
+        ))
+        .unwrap();
+        assert_eq!(
+            refused,
+            UpstreamReply {
+                outcome: Some(BrokerOutcome::Refused),
+                result: None
+            }
+        );
+        // An outcome the PEP does not know is unknown.
+        for outcome in [r#""pending""#, "1", r#""Executed""#] {
+            let odd = reply(&format!(
+                r#"{{"jsonrpc":"2.0","id":"{ID}","result":{{"_meta":{{"dev.pep-sidecar/outcome":{outcome}}}}}}}"#
+            ))
+            .unwrap();
+            assert_eq!(odd.outcome, Some(BrokerOutcome::Unknown), "{outcome}");
+        }
+        // Anything but one response to this request is ambiguous.
+        for body in [
+            String::new(),
+            "{".to_owned(),
+            format!(r#"[{{"jsonrpc":"2.0","id":"{ID}","result":{{}}}}]"#),
+            r#"{"jsonrpc":"2.0","id":"01JBAE0Z1TFCQ9Y41W9NF6YYMC","result":{}}"#.to_owned(),
+            format!(r#"{{"jsonrpc":"2.0","id":"{ID}"}}"#),
+            format!(r#"{{"jsonrpc":"2.0","id":"{ID}","result":{{}},"error":{{}}}}"#),
+            format!(r#"{{"jsonrpc":"2.0","id":"{ID}","result":[]}}"#),
+            format!(r#"{{"jsonrpc":"2.0","id":"{ID}","error":"x"}}"#),
+            format!(r#"{{"jsonrpc":"1.0","id":"{ID}","result":{{}}}}"#),
+            format!(r#"{{"jsonrpc":"2.0","id":"{ID}","result":{{}},"extra":1}}"#),
+            format!(r#"{{"jsonrpc":"2.0","id":"{ID}","result":{{}},"result":{{}}}}"#),
+        ] {
+            assert_eq!(reply(&body), Err(ForwardError::Ambiguous), "{body}");
+        }
     }
 
     #[test]

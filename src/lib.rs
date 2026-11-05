@@ -12,6 +12,7 @@
 #![forbid(unsafe_code)]
 
 pub mod config;
+pub mod control;
 pub mod engine;
 pub mod forward;
 pub mod http;
