@@ -226,18 +226,7 @@ pub fn read_request<S: TimedRead + ?Sized>(
     endpoint: &str,
     deadlines: Deadlines,
 ) -> Result<Request, HttpError> {
-    let mut buf = Vec::with_capacity(READ_CHUNK);
-    let mut scanned = 0;
-    let head_end = loop {
-        if let Some(end) = scan_head(&buf, &mut scanned)? {
-            break end;
-        }
-        let room = MAX_HEAD_BYTES
-            .checked_add(1)
-            .and_then(|cap| cap.checked_sub(buf.len()))
-            .ok_or(Malformed::HeadTooLarge)?;
-        read_some(stream, &mut buf, deadlines.head, room)?;
-    };
+    let (buf, head_end) = read_head(stream, deadlines.head)?;
     let (head_bytes, rest) = buf.split_at_checked(head_end).ok_or(HttpError::Io)?;
     let head = parse_head(head_bytes, endpoint)?;
     if !head.is_post() {
@@ -247,16 +236,46 @@ pub fn read_request<S: TimedRead + ?Sized>(
         });
     }
     let length = head.content_length.ok_or(Malformed::MissingContentLength)?;
-    // One request per connection: bytes past the body are never parsed.
+    let body = read_body(stream, rest, length, deadlines.body)?;
+    Ok(Request { head, body })
+}
+
+/// Reads until a whole head has arrived. Returns the bytes read and the head's length.
+fn read_head<S: TimedRead + ?Sized>(
+    stream: &mut S,
+    deadline: Instant,
+) -> Result<(Vec<u8>, usize), HttpError> {
+    let mut buf = Vec::with_capacity(READ_CHUNK);
+    let mut scanned = 0;
+    loop {
+        if let Some(end) = scan_head(&buf, &mut scanned)? {
+            return Ok((buf, end));
+        }
+        let room = MAX_HEAD_BYTES
+            .checked_add(1)
+            .and_then(|cap| cap.checked_sub(buf.len()))
+            .ok_or(Malformed::HeadTooLarge)?;
+        read_some(stream, &mut buf, deadline, room)?;
+    }
+}
+
+/// The `length` body bytes: those already read in `rest`, then the rest from the stream. One
+/// message per connection, so bytes past the body are never parsed.
+fn read_body<S: TimedRead + ?Sized>(
+    stream: &mut S,
+    rest: &[u8],
+    length: usize,
+    deadline: Instant,
+) -> Result<Vec<u8>, HttpError> {
     let mut body = rest
         .get(..length.min(rest.len()))
         .unwrap_or_default()
         .to_vec();
     while body.len() < length {
         let room = length.checked_sub(body.len()).ok_or(HttpError::Io)?;
-        read_some(stream, &mut body, deadlines.body, room)?;
+        read_some(stream, &mut body, deadline, room)?;
     }
-    Ok(Request { head, body })
+    Ok(body)
 }
 
 /// Reads up to `room` bytes into `buf`, after setting the timeout to the time left until
@@ -347,6 +366,26 @@ fn has_bare_line_ending(bytes: &[u8]) -> bool {
 ///
 /// Returns the [`Malformed`] reason for a head to refuse with 400.
 pub fn parse_head(head: &[u8], endpoint: &str) -> Result<RequestHead, Malformed> {
+    let (method, headers) = head_lines(head, |line| parse_request_line(line, endpoint))?;
+    if !headers.contains("host") {
+        return Err(Malformed::MissingHost);
+    }
+    let content_length = content_length(&headers, MAX_BODY_BYTES)?;
+    Ok(RequestHead {
+        method,
+        headers,
+        content_length,
+    })
+}
+
+/// The first line of `head`, as `first_line` reads it, and its header fields, after the
+/// checks requests and responses share: size, line endings, visible ASCII, field syntax and
+/// count, repeated MCP headers, and no transfer or content coding. `head` ends with the
+/// empty line (CRLF CRLF). The first line is checked before any field.
+fn head_lines<T>(
+    head: &[u8],
+    first_line: impl FnOnce(&str) -> Result<T, Malformed>,
+) -> Result<(T, Headers), Malformed> {
     if head.len() > MAX_HEAD_BYTES {
         return Err(Malformed::HeadTooLarge);
     }
@@ -364,8 +403,7 @@ pub fn parse_head(head: &[u8], endpoint: &str) -> Result<RequestHead, Malformed>
     }
     let text = std::str::from_utf8(text).map_err(|_| Malformed::NonAscii)?;
     let mut lines = text.split("\r\n");
-    let request_line = lines.next().ok_or(Malformed::RequestLine)?;
-    let method = parse_request_line(request_line, endpoint)?;
+    let first = first_line(lines.next().ok_or(Malformed::RequestLine)?)?;
     let mut fields = Vec::new();
     for line in lines {
         if fields.len() >= MAX_FIELDS {
@@ -385,26 +423,24 @@ pub fn parse_head(head: &[u8], endpoint: &str) -> Result<RequestHead, Malformed>
     if headers.contains("content-encoding") {
         return Err(Malformed::ContentEncoding);
     }
-    if !headers.contains("host") {
-        return Err(Malformed::MissingHost);
+    Ok((first, headers))
+}
+
+/// The one `Content-Length`, if present: plain digits, at most `cap`.
+fn content_length(headers: &Headers, cap: usize) -> Result<Option<usize>, Malformed> {
+    let mut lengths = headers.all("content-length");
+    let first = lengths
+        .next()
+        .map(|value| parse_content_length(value, cap))
+        .transpose()?;
+    if lengths.next().is_some() {
+        return Err(Malformed::ContentLength);
     }
-    let content_length = {
-        let mut lengths = headers.all("content-length");
-        let first = lengths.next().map(parse_content_length).transpose()?;
-        if lengths.next().is_some() {
-            return Err(Malformed::ContentLength);
-        }
-        first
-    };
-    Ok(RequestHead {
-        method: method.to_owned(),
-        headers,
-        content_length,
-    })
+    Ok(first)
 }
 
 /// Checks `method SP target SP HTTP/1.1` and returns the method.
-fn parse_request_line<'a>(line: &'a str, endpoint: &str) -> Result<&'a str, Malformed> {
+fn parse_request_line(line: &str, endpoint: &str) -> Result<String, Malformed> {
     let mut parts = line.split(' ');
     let (Some(method), Some(target), Some(version), None) =
         (parts.next(), parts.next(), parts.next(), parts.next())
@@ -420,7 +456,7 @@ fn parse_request_line<'a>(line: &'a str, endpoint: &str) -> Result<&'a str, Malf
     if target != endpoint {
         return Err(Malformed::Target);
     }
-    Ok(method)
+    Ok(method.to_owned())
 }
 
 /// Parses `name ":" OWS value OWS`.
@@ -460,8 +496,8 @@ fn is_token(text: &str) -> bool {
         })
 }
 
-/// Parses a `Content-Length` of plain digits, at most [`MAX_BODY_BYTES`].
-fn parse_content_length(value: &str) -> Result<usize, Malformed> {
+/// Parses a `Content-Length` of plain digits, at most `cap`.
+fn parse_content_length(value: &str, cap: usize) -> Result<usize, Malformed> {
     if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
         return Err(Malformed::ContentLength);
     }
@@ -470,10 +506,62 @@ fn parse_content_length(value: &str) -> Result<usize, Malformed> {
         length = length
             .checked_mul(10)
             .and_then(|tens| tens.checked_add(usize::from(digit.wrapping_sub(b'0'))))
-            .filter(|length| *length <= MAX_BODY_BYTES)
+            .filter(|length| *length <= cap)
             .ok_or(Malformed::BodyTooLarge)?;
     }
     Ok(length)
+}
+
+/// A whole response, read by the PEP as a client of the broker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Response {
+    /// The status code.
+    pub status: u16,
+    /// The header fields.
+    pub headers: Headers,
+    /// The body: exactly `Content-Length` bytes.
+    pub body: Vec<u8>,
+}
+
+/// Reads one response from `stream` by `deadline`, with a body of at most `max_body` bytes.
+/// The subset is the request side's: `HTTP/1.1` only, an exact `Content-Length`, no transfer
+/// or content coding, and the same header rules.
+///
+/// # Errors
+///
+/// Returns [`HttpError::Malformed`] for a response outside the subset, and
+/// [`HttpError::Timeout`], [`HttpError::Closed`] or [`HttpError::Io`] when it did not arrive.
+pub fn read_response<S: TimedRead + ?Sized>(
+    stream: &mut S,
+    deadline: Instant,
+    max_body: usize,
+) -> Result<Response, HttpError> {
+    let (buf, head_end) = read_head(stream, deadline)?;
+    let (head, rest) = buf.split_at_checked(head_end).ok_or(HttpError::Io)?;
+    let (status, headers) = head_lines(head, parse_status_line)?;
+    let length = content_length(&headers, max_body)?.ok_or(Malformed::MissingContentLength)?;
+    let body = read_body(stream, rest, length, deadline)?;
+    Ok(Response {
+        status,
+        headers,
+        body,
+    })
+}
+
+/// Checks `HTTP/1.1 SP 3DIGIT SP reason` and returns the code.
+fn parse_status_line(line: &str) -> Result<u16, Malformed> {
+    let mut parts = line.splitn(3, ' ');
+    let (Some(version), Some(code), Some(_reason)) = (parts.next(), parts.next(), parts.next())
+    else {
+        return Err(Malformed::RequestLine);
+    };
+    if version != "HTTP/1.1" {
+        return Err(Malformed::Version);
+    }
+    if code.len() != 3 || !code.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(Malformed::RequestLine);
+    }
+    code.parse().map_err(|_| Malformed::RequestLine)
 }
 
 /// The statuses the PEP sends.

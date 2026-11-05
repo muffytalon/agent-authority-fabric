@@ -26,3 +26,5 @@ pub mod mcp;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod peercred;
 pub mod tokens;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub mod upstream;

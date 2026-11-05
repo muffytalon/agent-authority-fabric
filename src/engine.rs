@@ -4162,6 +4162,7 @@ mod tests {
         assert_eq!(decision.tool, "pay_invoice");
         let request = crate::forward::tools_call_request(
             UPSTREAM_ID,
+            "a",
             &decision.tool,
             &decision.arguments,
             "p",
@@ -6400,6 +6401,7 @@ mod tests {
         let decision = allow(&mut engine, &request_with_meta(424_242, &meta));
         let request = crate::forward::tools_call_request(
             UPSTREAM_ID,
+            "a",
             &decision.tool,
             &decision.arguments,
             "p",

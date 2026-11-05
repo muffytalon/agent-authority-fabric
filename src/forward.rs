@@ -27,10 +27,13 @@ pub const MAX_TOOL_NAME: usize = 128;
 /// broker strips any `dev.pep-sidecar/*` key a tool server sent, so a present key is its own.
 pub const OUTCOME_META_KEY: &str = "dev.pep-sidecar/outcome";
 
-/// One upstream request: the body, and the headers derived from it. The HTTP layer adds
-/// `Content-Length` and `Connection: close`.
+/// One upstream request: the server it is for, the body, and the headers derived from the
+/// body. The HTTP layer sends it to `/mcp/{server_id}` and adds `Content-Length` and
+/// `Connection: close`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpstreamRequest {
+    /// The pinned server the broker routes it to.
+    pub server_id: String,
     /// The JCS-canonical JSON-RPC request.
     pub body: Vec<u8>,
     /// Header names and values, in a fixed order.
@@ -48,6 +51,9 @@ pub enum ForwardError {
     /// The upstream id is not a canonical ULID.
     #[error("upstream id is not a ULID")]
     InvalidUpstreamId,
+    /// The server id is not a plain path segment.
+    #[error("server id is not a plain name")]
+    InvalidServerId,
     /// The arguments are not a JSON object.
     #[error("arguments are not an object")]
     ArgumentsNotObject,
@@ -139,16 +145,18 @@ pub fn read_upstream_reply(body: &[u8], upstream_id: &str) -> Result<UpstreamRep
 
 /// Builds the upstream `tools/call` for an allowed call.
 /// - `upstream_id` is the PEP-assigned ULID the engine saw as the call's id (M1).
+/// - `server_id` is the tool's pinned server.
 /// - `tool` and `arguments` are the engine's canonical name and arguments, the same pair that
 ///   `action_digest` hashes.
 /// - `call_proof` is the Call Proof for this call (T1).
 ///
 /// # Errors
 ///
-/// Returns a [`ForwardError`] for a tool name that is not header-safe, an upstream id that is
-/// not a canonical ULID, or arguments that are not an object.
+/// Returns a [`ForwardError`] for a tool name that is not header-safe, an id that is not a
+/// canonical ULID, a server id that is not a plain name, or arguments that are not an object.
 pub fn tools_call_request(
     upstream_id: &str,
+    server_id: &str,
     tool: &str,
     arguments: &JcsValue,
     call_proof: &str,
@@ -156,18 +164,59 @@ pub fn tools_call_request(
     if !is_header_safe_tool_name(tool) {
         return Err(ForwardError::ToolNameNotHeaderSafe);
     }
-    if decode_ulid(upstream_id).is_none_or(|id| encode_ulid(id) != upstream_id) {
-        return Err(ForwardError::InvalidUpstreamId);
-    }
     if arguments.as_object().is_none() {
         return Err(ForwardError::ArgumentsNotObject);
     }
+    let params = object(vec![
+        ("_meta", pep_meta(Some(call_proof))?),
+        ("arguments", arguments.clone()),
+        ("name", JcsValue::string(tool)),
+    ])?;
+    request(upstream_id, server_id, "tools/call", params, Some(tool))
+}
+
+/// Builds a proof-less `server/discover` for `server_id`, for the drift poll (L1). The broker
+/// forwards a proof-less request for this method and `tools/list` only.
+///
+/// # Errors
+///
+/// Returns a [`ForwardError`] for an id that is not a canonical ULID, or a server id that is
+/// not a plain name.
+pub fn discover_request(
+    upstream_id: &str,
+    server_id: &str,
+) -> Result<UpstreamRequest, ForwardError> {
+    let params = object(vec![("_meta", pep_meta(None)?)])?;
+    request(upstream_id, server_id, "server/discover", params, None)
+}
+
+/// Builds a proof-less `tools/list` for `server_id`, from `cursor` when it continues a
+/// previous page (L1).
+///
+/// # Errors
+///
+/// Returns a [`ForwardError`] for an id that is not a canonical ULID, or a server id that is
+/// not a plain name.
+pub fn tools_list_request(
+    upstream_id: &str,
+    server_id: &str,
+    cursor: Option<&str>,
+) -> Result<UpstreamRequest, ForwardError> {
+    let mut members = vec![("_meta", pep_meta(None)?)];
+    if let Some(cursor) = cursor {
+        members.push(("cursor", JcsValue::string(cursor)));
+    }
+    request(upstream_id, server_id, "tools/list", object(members)?, None)
+}
+
+/// The PEP's own `_meta`: the protocol version, empty client capabilities (M2), its client
+/// info, and the Call Proof when there is one. Nothing the agent sent.
+fn pep_meta(call_proof: Option<&str>) -> Result<JcsValue, ForwardError> {
     let client_info = object(vec![
         ("name", JcsValue::string(CLIENT_NAME)),
         ("version", JcsValue::string(CLIENT_VERSION)),
     ])?;
-    let meta = object(vec![
-        (CALL_PROOF_META_KEY, JcsValue::string(call_proof)),
+    let mut members = vec![
         (
             "io.modelcontextprotocol/clientCapabilities",
             JcsValue::Object(object(Vec::new())?),
@@ -180,27 +229,46 @@ pub fn tools_call_request(
             "io.modelcontextprotocol/protocolVersion",
             JcsValue::string(PROTOCOL_VERSION),
         ),
-    ])?;
-    let params = object(vec![
-        ("_meta", JcsValue::Object(meta)),
-        ("arguments", arguments.clone()),
-        ("name", JcsValue::string(tool)),
-    ])?;
+    ];
+    if let Some(proof) = call_proof {
+        members.push((CALL_PROOF_META_KEY, JcsValue::string(proof)));
+    }
+    Ok(JcsValue::Object(object(members)?))
+}
+
+/// The canonical request and the headers derived from it.
+fn request(
+    upstream_id: &str,
+    server_id: &str,
+    method: &str,
+    params: JcsObject,
+    name: Option<&str>,
+) -> Result<UpstreamRequest, ForwardError> {
+    if decode_ulid(upstream_id).is_none_or(|id| encode_ulid(id) != upstream_id) {
+        return Err(ForwardError::InvalidUpstreamId);
+    }
+    if !crate::config::is_plain_name(server_id, crate::lockfile::MAX_SERVER_ID) {
+        return Err(ForwardError::InvalidServerId);
+    }
     let request = object(vec![
         ("id", JcsValue::string(upstream_id)),
         ("jsonrpc", JcsValue::string("2.0")),
-        ("method", JcsValue::string("tools/call")),
+        ("method", JcsValue::string(method)),
         ("params", JcsValue::Object(params)),
     ])?;
+    let mut headers = vec![
+        ("Content-Type", "application/json".to_owned()),
+        ("Accept", "application/json, text/event-stream".to_owned()),
+        ("MCP-Protocol-Version", PROTOCOL_VERSION.to_owned()),
+        ("Mcp-Method", method.to_owned()),
+    ];
+    if let Some(name) = name {
+        headers.push(("Mcp-Name", name.to_owned()));
+    }
     Ok(UpstreamRequest {
+        server_id: server_id.to_owned(),
         body: JcsValue::Object(request).to_canonical_bytes(),
-        headers: vec![
-            ("Content-Type", "application/json".to_owned()),
-            ("Accept", "application/json, text/event-stream".to_owned()),
-            ("MCP-Protocol-Version", PROTOCOL_VERSION.to_owned()),
-            ("Mcp-Method", "tools/call".to_owned()),
-            ("Mcp-Name", tool.to_owned()),
-        ],
+        headers,
     })
 }
 
@@ -243,7 +311,8 @@ mod tests {
 
     #[test]
     fn body_is_canonical_and_built_by_the_pep() {
-        let request = tools_call_request(ID, "pay_invoice", &arguments(), "eyJ.proof").unwrap();
+        let request =
+            tools_call_request(ID, "a", "pay_invoice", &arguments(), "eyJ.proof").unwrap();
         let expected = format!(
             concat!(
                 r#"{{"id":"{id}","jsonrpc":"2.0","method":"tools/call","params":{{"_meta":{{"#,
@@ -263,7 +332,7 @@ mod tests {
 
     #[test]
     fn headers_follow_the_body() {
-        let request = tools_call_request(ID, "get_invoice", &arguments(), "p").unwrap();
+        let request = tools_call_request(ID, "a", "get_invoice", &arguments(), "p").unwrap();
         assert_eq!(
             request.headers,
             vec![
@@ -279,7 +348,7 @@ mod tests {
     #[test]
     fn the_broker_recomputes_the_same_action_digest() {
         // SPEC §2's vector, recomputed the way the broker does: from the forwarded body.
-        let request = tools_call_request(ID, "pay_invoice", &arguments(), "p").unwrap();
+        let request = tools_call_request(ID, "a", "pay_invoice", &arguments(), "p").unwrap();
         let body = jcs::parse(&request.body).unwrap();
         let params = body.get("params").unwrap();
         let digest = jcs::action_digest(
@@ -354,12 +423,12 @@ mod tests {
         let args = arguments();
         for tool in ["", "bad name", "pay\u{430}", "a/b", &"x".repeat(129)] {
             assert_eq!(
-                tools_call_request(ID, tool, &args, "p"),
+                tools_call_request(ID, "a", tool, &args, "p"),
                 Err(ForwardError::ToolNameNotHeaderSafe),
                 "{tool:?}"
             );
         }
-        assert!(tools_call_request(ID, &"x".repeat(128), &args, "p").is_ok());
+        assert!(tools_call_request(ID, "a", &"x".repeat(128), &args, "p").is_ok());
         for id in [
             "",
             "7",
@@ -367,13 +436,13 @@ mod tests {
             "81JBAE0Z1TFCQ9Y41W9NF6YYMB",
         ] {
             assert_eq!(
-                tools_call_request(id, "t", &args, "p"),
+                tools_call_request(id, "a", "t", &args, "p"),
                 Err(ForwardError::InvalidUpstreamId),
                 "{id:?}"
             );
         }
         assert_eq!(
-            tools_call_request(ID, "t", &JcsValue::Array(vec![]), "p"),
+            tools_call_request(ID, "a", "t", &JcsValue::Array(vec![]), "p"),
             Err(ForwardError::ArgumentsNotObject)
         );
     }

@@ -358,7 +358,7 @@ fn decode_header(value: &str) -> Option<String> {
 }
 
 /// `application/json`, optionally with `charset=utf-8`; case-insensitive.
-fn is_json_content_type(value: &str) -> bool {
+pub(crate) fn is_json_content_type(value: &str) -> bool {
     let mut parts = value.split(';').map(|part| part.trim_matches([' ', '\t']));
     parts
         .next()

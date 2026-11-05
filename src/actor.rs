@@ -554,7 +554,14 @@ impl Actor {
             payment,
         };
         let proof = issue_call_proof(&services.proof_key, &claims).ok()?;
-        forward::tools_call_request(&call.pep_id, &call.tool, &call.arguments, &proof).ok()
+        forward::tools_call_request(
+            &call.pep_id,
+            &tool.server_id,
+            &call.tool,
+            &call.arguments,
+            &proof,
+        )
+        .ok()
     }
 
     /// Ends a call before its point of forwarding: releases a payment's reservation (no
