@@ -11,10 +11,12 @@
 //! The architecture is specified in `SPEC.md`; the Week 1 design is in `WEEK1_PLAN.md`.
 #![forbid(unsafe_code)]
 
+pub mod config;
 pub mod engine;
 pub mod forward;
 pub mod http;
 pub mod jcs;
+pub mod lockfile;
 pub mod mcp;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod peercred;

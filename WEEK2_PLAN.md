@@ -990,6 +990,23 @@ The order follows RV2: p256, peer identity and the lock file come before the bin
 | `limits` | `connections`, `control_connections` (H1), `header_bytes`, `body_bytes`, `read_timeout_ms`, `upstream_timeout_ms` (10,000), `step_up_timeout_ms` (45,000; the two together ≤ 55,000, checked at load, P1), `episode_idle_ms`, `episodes`, `call_burst`, `call_rate_per_s`, `clock_skew_ms`, `replay_cache_entries`, `drift_poll_ms`, `drift_poll_deadline_ms` (L1) |
 | `pins` | The unsigned lockfile v1 payload (L1). Step 10 replaces it with the signed lockfile at `lockfile.path` |
 
+**Config and lockfile payload as built (step 7).** L1 fixed what the payload holds; this is its shape (`src/lockfile.rs`, `src/config.rs`).
+- **Payload:** `{lockfile_version: 1, release_epoch, instructions?, stores: {uri: {case_insensitive}}, servers: {server_id: {endpoint, identity, protocol_version, discover, tools: {name: {definition, policy}}}}}`.
+  - Servers and tools are keyed by id and name, so the JSON parser's duplicate-key refusal makes them unique, and load refuses a name on two servers.
+  - `policy` uses the engine's field names (L1's table), plus `reads_stores`.
+  - `lockfile_digest` is the digest of the whole payload, and each tool's `schema_digest` is the digest of its `definition`.
+  - `endpoint` is the reviewed value the broker's own route must match (RV4 #12).
+  - `instructions` is one top-level pinned text, which the PEP's `server/discover` serves (M1). Each server's `discover` result is pinned for drift only.
+- **Parsing:** the whole config is parsed once, under the definition profile. Every section but `pins` takes only safe non-negative integers. Unknown fields are refused at every depth, and every load error names the field's path, such as `pins.servers.b.tools.search_notes.policy`.
+- **Signer keys:** unpadded base64url of an uncompressed SEC1 point, or a JWK with exactly `kty`, `crv`, `x` and `y`. A key appears once, and every role with keys has a threshold between 1 and its key count.
+- **Intents:**
+  - An intent's `release_epoch` and `lockfile_digest` must equal the loaded pins'. A stale intent stops the load, rather than being denied at every call.
+  - `intent_digest` is the digest of the intent's config entry.
+  - `seq` is `"unconstrained"`, or `{"transitions": [[from or null, to], …]}` over pinned tools.
+  - Load runs the engine's checks: `validate_pins` on the pins alone, and `validate_config` per intent.
+- **Limits:** the P1 and L1 defaults apply when a field is absent. `header_bytes` and `body_bytes` may not exceed the HTTP subset's caps, and a drift poll's deadline must be below its interval.
+- **Step 10** still adds the strict argument schema and per-tool `step_up_over_minor`.
+
 **Control protocol** (H1, E1). The same HTTP subset carries one JSON request per connection, and the peer's uid and gid must be 20004.
 
 | Call | Parameters | Result |

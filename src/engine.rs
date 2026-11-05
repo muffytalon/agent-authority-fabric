@@ -2281,7 +2281,14 @@ fn restore_budget(
     Ok((budget, ledger.context_conf))
 }
 
-fn validate_config(intent: &PepIntent, pins: &ToolPins) -> Result<(), ConfigError> {
+/// The checks [`PepEngine::new`] runs on an intent and the pins, apart from the ledger. Config
+/// load runs them too, so a bad intent stops the PEP at start-up rather than at its first
+/// episode.
+///
+/// # Errors
+///
+/// Returns the first [`ConfigError`] found.
+pub fn validate_config(intent: &PepIntent, pins: &ToolPins) -> Result<(), ConfigError> {
     let limits = &intent.limits;
     if limits.per_call_max_minor == 0
         || limits.per_call_max_minor > limits.cumulative_max_minor
@@ -2292,6 +2299,16 @@ fn validate_config(intent: &PepIntent, pins: &ToolPins) -> Result<(), ConfigErro
     if limits.currency.len() != 3 || !limits.currency.bytes().all(|b| b.is_ascii_uppercase()) {
         return Err(ConfigError::InvalidCurrency);
     }
+    validate_pins(pins)
+}
+
+/// The checks on the pins alone: stores normalized and not overlapping, and every tool's name,
+/// server, location, trusted fields and binding.
+///
+/// # Errors
+///
+/// Returns the first [`ConfigError`] found.
+pub fn validate_pins(pins: &ToolPins) -> Result<(), ConfigError> {
     for (uri, policy) in &pins.stores {
         if normalize_store_uri(uri).as_deref() != Some(uri.as_str()) {
             return Err(ConfigError::UnknownStore);
