@@ -1070,8 +1070,9 @@ impl Actor {
 mod tests {
     use super::*;
     use crate::engine::{
-        Entities, EntityClaims, EntitySet, InMemoryLabelStore, Ledger, Limits, PepIntent,
-        SeqPolicy, ServerStates, Shared, UnresolvedEntities, encode_ulid,
+        Entities, EntityClaims, EntitySet, InMemoryLabelStore, Label, LabelEntry, LabelStore,
+        Ledger, Limits, PepIntent, SeqPolicy, ServerStates, Shared, StoreError, TaintIndex,
+        UnresolvedEntities, encode_ulid,
     };
     use crate::jcs::{self, ParseOptions};
     use crate::journal::{Journal, spawn_writer};
@@ -1225,6 +1226,24 @@ mod tests {
         wrap: Option<&dyn Fn(Arc<FakeBroker>) -> Arc<dyn Upstream>>,
         log: DecisionLog,
     ) -> Harness {
+        start_with_labels(
+            broker,
+            step_up_timeout,
+            upstream_timeout,
+            wrap,
+            log,
+            Arc::new(InMemoryLabelStore::with_capacity(1000)),
+        )
+    }
+
+    fn start_with_labels(
+        broker: FakeBroker,
+        step_up_timeout: Duration,
+        upstream_timeout: Duration,
+        wrap: Option<&dyn Fn(Arc<FakeBroker>) -> Arc<dyn Upstream>>,
+        log: DecisionLog,
+        labels: Arc<dyn LabelStore>,
+    ) -> Harness {
         let n = COUNTER.fetch_add(1, Ordering::SeqCst);
         let dir = std::env::temp_dir().join(format!("pep-actor-{}-{n}", std::process::id()));
         fs::create_dir(&dir).unwrap();
@@ -1238,7 +1257,7 @@ mod tests {
         let servers = Arc::new(ServerStates::empty());
         servers.set_serving("a").unwrap();
         let shared = Shared {
-            labels: Arc::new(InMemoryLabelStore::with_capacity(1000)),
+            labels,
             servers: servers.clone(),
             unresolved: Arc::new(UnresolvedEntities::empty()),
             claims: Arc::new(EntityClaims::empty()),
@@ -1877,6 +1896,80 @@ mod tests {
                 outcome(1, OutcomeKind::Unknown),
             ]
         );
+        harness.end();
+    }
+
+    /// Stops the actor inside its first lookup of each named key, until the test lets it go, so
+    /// a test can hold the actor at a message of its choosing. A wait that runs out lets it go
+    /// too, so a failed test cannot leave the actor stuck.
+    #[derive(Debug)]
+    struct Gate {
+        inner: InMemoryLabelStore,
+        keys: Mutex<Vec<&'static str>>,
+        reached: Sender<()>,
+        go: Mutex<Receiver<()>>,
+    }
+
+    impl LabelStore for Gate {
+        fn record_all(&self, indexes: &[TaintIndex], entry: LabelEntry) -> Result<(), StoreError> {
+            self.inner.record_all(indexes, entry)
+        }
+        fn lookup(&self, index: &TaintIndex) -> Result<Option<Label>, StoreError> {
+            let text = format!("{index:?}");
+            let held = {
+                let mut keys = self.keys.lock().map_err(|_| StoreError::Poisoned)?;
+                let found = keys.iter().position(|key| text.contains(key));
+                found.map(|at| keys.remove(at)).is_some()
+            };
+            if held {
+                let _ = self.reached.send(());
+                let go = self.go.lock().map_err(|_| StoreError::Poisoned)?;
+                let _ = go.recv_timeout(WAIT);
+            }
+            self.inner.lookup(index)
+        }
+    }
+
+    #[test]
+    fn a_stream_of_agent_messages_cannot_hold_a_deadline_back() {
+        const STEP_UP: Duration = Duration::from_millis(50);
+        let (reached, at_hold) = mpsc::channel();
+        let (go, gate_go) = mpsc::channel();
+        let gate = Gate {
+            inner: InMemoryLabelStore::with_capacity(1000),
+            keys: Mutex::new(vec!["hold-1", "hold-2"]),
+            reached,
+            go: Mutex::new(gate_go),
+        };
+        let mut harness = start_with_labels(
+            broker(60_000, Some("executed")),
+            STEP_UP,
+            Duration::from_secs(5),
+            None,
+            DecisionLog::disabled(),
+            Arc::new(gate),
+        );
+        harness.lookup();
+        // Sent back to back: the actor takes the payment, then stops at the first hold, and the
+        // second is queued behind it, so the actor never finds its queue empty.
+        let (_, paid) = harness.pay(60_000);
+        let (_, first) = harness.call("get_invoice", r#"{"invoice_id":"hold-1"}"#);
+        let (_, second) = harness.call("get_invoice", r#"{"invoice_id":"hold-2"}"#);
+        at_hold.recv_timeout(WAIT).unwrap();
+        // The step-up deadline passes while the actor is stopped.
+        thread::sleep(STEP_UP * 2);
+        go.send(()).unwrap();
+        at_hold.recv_timeout(WAIT).unwrap();
+        // The actor is stopped inside the second message, so only a pass between the two can
+        // have answered this: no wait, and so no timing, in the check.
+        assert_eq!(paid.try_recv(), Ok(CallReply::Denied));
+        go.send(()).unwrap();
+        for answer in [first, second] {
+            assert!(matches!(
+                answer.recv_timeout(WAIT).unwrap(),
+                CallReply::Result(_)
+            ));
+        }
         harness.end();
     }
 
