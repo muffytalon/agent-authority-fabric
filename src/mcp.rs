@@ -181,6 +181,13 @@ impl Reply {
         }
     }
 
+    fn unsupported_version(id: &JcsValue, requested: &str) -> Self {
+        Self {
+            status: Status::BadRequest,
+            body: Some(unsupported_version_body(id, requested)),
+        }
+    }
+
     /// The HTTP response bytes.
     #[must_use]
     pub fn to_http(&self) -> Vec<u8> {
@@ -279,7 +286,7 @@ pub fn check(head: &RequestHead, body: &[u8]) -> Result<Inbound, Reply> {
     }
     // 12: the version.
     if version != PROTOCOL_VERSION {
-        return Err(fail(Status::BadRequest, UNSUPPORTED_VERSION));
+        return Err(Reply::unsupported_version(id, version));
     }
     // 13: the router.
     let method = Method::parse(method).ok_or_else(|| fail(Status::NotFound, METHOD_NOT_FOUND))?;
@@ -401,6 +408,23 @@ pub fn error_body(id: Option<&JcsValue>, code: i64) -> Vec<u8> {
     out.extend_from_slice(&JcsValue::string(message(code)).to_canonical_bytes());
     out.extend_from_slice(br#"},"id":"#);
     out.extend_from_slice(&id.map_or_else(|| b"null".to_vec(), JcsValue::to_canonical_bytes));
+    out.extend_from_slice(br#","jsonrpc":"2.0"}"#);
+    out
+}
+
+/// -32022's body. The one error with `data`, because MCP requires it of an
+/// `UnsupportedProtocolVersionError`: the versions served, which `server/discover` publishes, and
+/// the agent's own string back. It runs before any token or guard, so it says nothing of policy.
+fn unsupported_version_body(id: &JcsValue, requested: &str) -> Vec<u8> {
+    let mut out =
+        format!(r#"{{"error":{{"code":{UNSUPPORTED_VERSION},"data":{{"requested":"#).into_bytes();
+    out.extend_from_slice(&JcsValue::string(requested).to_canonical_bytes());
+    out.extend_from_slice(br#","supported":["#);
+    out.extend_from_slice(&JcsValue::string(PROTOCOL_VERSION).to_canonical_bytes());
+    out.extend_from_slice(br#"]},"message":"#);
+    out.extend_from_slice(&JcsValue::string(message(UNSUPPORTED_VERSION)).to_canonical_bytes());
+    out.extend_from_slice(br#"},"id":"#);
+    out.extend_from_slice(&id.to_canonical_bytes());
     out.extend_from_slice(br#","jsonrpc":"2.0"}"#);
     out
 }
@@ -581,7 +605,11 @@ mod tests {
             error.get("message").unwrap().as_str(),
             Some(message(error.get("code").unwrap().as_i64().unwrap()))
         );
-        assert!(error.get("data").is_none());
+        // -32022 alone has `data`, which MCP requires of it; nothing else may say more.
+        assert_eq!(
+            error.get("data").is_some(),
+            error.get("code").unwrap().as_i64() == Some(UNSUPPORTED_VERSION)
+        );
         (
             reply.status.code(),
             error.get("code").unwrap().as_i64(),
@@ -886,6 +914,31 @@ mod tests {
         assert_eq!(
             refused(call(&old, &META.replace("2026-07-28", "2025-11-25"))),
             err(UNSUPPORTED_VERSION)
+        );
+        // Its `data` is what MCP requires, and the agent's string comes back escaped.
+        let odd = "1\"2\\";
+        let header = ok.replace("2026-07-28", odd);
+        let meta = META.replace(
+            "2026-07-28",
+            &odd.replace('\\', "\\\\").replace('"', "\\\""),
+        );
+        let Err(reply) = call(&header, &meta) else {
+            panic!("expected a reply");
+        };
+        let body = reply.body.unwrap();
+        assert_eq!(jcs::canonicalize(&body).unwrap(), body);
+        let value = jcs::parse(&body).unwrap();
+        assert_eq!(
+            value
+                .pointer("/error/data/requested")
+                .and_then(JcsValue::as_str),
+            Some(odd)
+        );
+        assert_eq!(
+            value
+                .pointer("/error/data/supported/0")
+                .and_then(JcsValue::as_str),
+            Some(PROTOCOL_VERSION)
         );
         // 13: an unknown method, `ping` included.
         for method in ["ping", "resources/list", "logging/setLevel"] {
