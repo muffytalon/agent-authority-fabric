@@ -1,9 +1,10 @@
 //! Test stand-ins for the components around the PEP (`WEEK2_PLAN` step 7): the broker, the
-//! tool servers and the scripted operator. They run under the same lints, but are never part
-//! of the PEP's own image; their binaries are `stub-broker`, `stub-tool` and
-//! `stub-operator`.
+//! tool servers and the scripted operator, and the Gate 1 oracle. They run under the same lints,
+//! but are never part of the PEP's own image; their binaries are `stub-broker`, `stub-tool`,
+//! `stub-operator` and `stub-oracle`.
 
 pub mod broker;
+pub mod oracle;
 pub mod tool;
 
 use std::io::Write;

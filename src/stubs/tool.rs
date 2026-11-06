@@ -20,6 +20,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::time::Instant;
 
 use sha2::{Digest as _, Sha256};
 
@@ -302,6 +303,7 @@ impl ToolServer {
         keys: PaymentKeys<'_>,
         now_ms: u64,
     ) -> Option<Vec<u8>> {
+        let started = Instant::now();
         let idempotency_key = keys.idempotency;
         let name = message.pointer("/params/name")?.as_str()?.to_owned();
         let empty = JcsValue::Object(jcs::JcsObject::from_entries(Vec::new()).ok()?);
@@ -375,8 +377,10 @@ impl ToolServer {
                 true,
             )
         };
+        // G4 gates on the agent-side latency minus this (O1). Saturating: only a measurement.
+        let tool_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
         let log = format!(
-            r#"{{"action_digest":{},"entity_key":{},"executed":{executed},"idempotency_key":{},"server_id":{},"tool":{},"ts_ms":{now_ms},"upstream_id":{},"v":1}}"#,
+            r#"{{"action_digest":{},"entity_key":{},"executed":{executed},"idempotency_key":{},"server_id":{},"tool":{},"tool_us":{tool_us},"ts_ms":{now_ms},"upstream_id":{},"v":1}}"#,
             JcsValue::string(digest.as_str()).to_canonical_string(),
             keys.entity.map_or_else(
                 || "null".to_owned(),

@@ -29,8 +29,8 @@ use std::io::{Read as _, Write};
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
@@ -42,10 +42,15 @@ use crate::forward::{CALL_PROOF_META_KEY, OUTCOME_META_KEY, PROTOCOL_VERSION};
 use crate::http::{Request, Status, response};
 use crate::jcs::{self, JcsObject, JcsString, JcsValue, ParseOptions};
 use crate::lockfile::{Lockfile, MAX_SERVER_ID, parse_payload};
+use crate::peercred::{bind_safe_listener, require_peer};
+use crate::serve::accept_loop_with;
 use crate::tokens::{
-    CallProofExpectations, Es256Verifier, ExpectedPayment, ReplayCache, verify_call_proof,
+    CallProofExpectations, Es256Verifier, ExpectedPayment, ReplayCache, TokenError, unix_now,
+    verify_call_proof,
 };
 use crate::upstream::{Endpoint, Post, post};
+
+use super::{answer, now_ms};
 
 /// The prefix of every reserved `_meta` member.
 const RESERVED: &str = "dev.pep-sidecar/";
@@ -257,6 +262,51 @@ impl Drop for RouteSlot<'_> {
     }
 }
 
+/// The deadline for one request.
+const READ_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Runs a broker from the config at `path` until its listener stops. `observe` sees every request
+/// from the PEP before the broker handles it, and `ready` runs once the socket is bound.
+///
+/// # Errors
+///
+/// Returns a description of a config it cannot load or a socket it cannot bind, or says that the
+/// listener stopped.
+pub fn serve(
+    path: &Path,
+    observe: impl Fn(&Request) + Send + Sync + 'static,
+    ready: impl FnOnce(),
+) -> Result<(), String> {
+    let bytes = std::fs::read(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    let config =
+        load(&bytes, &|path| std::fs::read(path).ok()).map_err(|error| error.to_string())?;
+    let boot_second = unix_now().map_err(|error| error.to_string())?;
+    let socket = config.socket.clone();
+    let connections = config.connections;
+    let pep = config.pep;
+    let broker = Arc::new(Broker::open(config, boot_second)?);
+    let bound = bind_safe_listener(&socket).map_err(|error| error.to_string())?;
+    ready();
+    accept_loop_with(
+        bound.listener(),
+        connections,
+        move |mut stream| {
+            // The PEP, and only the PEP (RV3 F7).
+            if require_peer(&stream, pep.0, pep.1).is_err() {
+                return;
+            }
+            let routes = |target: &str| broker.routes(target);
+            answer(&mut stream, &routes, READ_TIMEOUT, |request| {
+                observe(request);
+                let now = unix_now().unwrap_or(0);
+                broker.handle(request, now, now_ms())
+            });
+        },
+        refuse_overflow,
+    );
+    Err("stopped accepting".to_owned())
+}
+
 /// What a connection past the broker's limit gets, instead of a close the PEP could not tell
 /// from a broker that died mid-call: a status, which says nothing was forwarded (RV5 V4).
 pub fn refuse_overflow(mut stream: UnixStream) {
@@ -448,8 +498,13 @@ impl Broker {
                     currency,
                 }),
         };
-        let Ok(claims) = verify_call_proof(proof, &verifier, &expect, &self.cache, when.now) else {
-            return reject("call proof refused", payment, Some(digest));
+        let claims = match verify_call_proof(proof, &verifier, &expect, &self.cache, when.now) {
+            Ok(claims) => claims,
+            // Its own reason, so G3 can tell the replay cache refused it, not some other check.
+            Err(TokenError::Replayed) => {
+                return reject("call proof replayed", payment, Some(digest));
+            }
+            Err(_) => return reject("call proof refused", payment, Some(digest)),
         };
         let key = claims
             .payment

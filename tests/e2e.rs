@@ -20,6 +20,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use pep_sidecar::jcs::{self, JcsValue, ParseOptions};
+use pep_sidecar::stubs::oracle::{self, Expect, Finding, Layout};
 use pep_sidecar::stubs::tool::sha256_hex;
 
 static COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -59,6 +60,8 @@ struct World {
     pep: Option<Child>,
     step_up_ms: u64,
     broker_credential_b: String,
+    /// Whether the broker is G3's capturing one.
+    capture: bool,
 }
 
 impl Drop for World {
@@ -131,9 +134,22 @@ impl World {
             step_up_ms,
             broker_credential_b: credential_b
                 .map_or_else(|| "credential-b".to_owned(), str::to_owned),
+            capture: false,
         };
         world.write_files();
         world
+    }
+
+    /// Where the oracle finds this world's logs.
+    fn layout(&self) -> Layout {
+        Layout {
+            decisions: self.path("logs/decisions.jsonl"),
+            broker: self.path("logs/broker.jsonl"),
+            tools: vec![
+                self.path("logs/tool-a.jsonl"),
+                self.path("logs/tool-b.jsonl"),
+            ],
+        }
     }
 
     fn path(&self, name: &str) -> PathBuf {
@@ -247,7 +263,17 @@ impl World {
             wait_for_socket(&self.path(&format!("tool-{server}/tool.sock")), &mut child);
             self.children.push(child);
         }
-        let mut broker = Self::spawn(env!("CARGO_BIN_EXE_stub-broker"), &self.path("broker.json"));
+        let mut broker = if self.capture {
+            Command::new(env!("CARGO_BIN_EXE_stub-broker-capture"))
+                .arg(self.path("state/proofs.jsonl"))
+                .arg(self.path("broker.json"))
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap()
+        } else {
+            Self::spawn(env!("CARGO_BIN_EXE_stub-broker"), &self.path("broker.json"))
+        };
         wait_for_socket(&self.path("broker/broker.sock"), &mut broker);
         self.children.push(broker);
         // R1: the broker refuses proofs issued in its boot second; let it pass.
@@ -546,45 +572,14 @@ fn reads_payments_a_step_up_and_every_broker_outcome() {
     oracle_join(&world);
 }
 
-/// §2a's join: every execution in a tool log joins through the broker log (`upstream_id` to
-/// `jti`) to a PEP `allow` with the same `jti`, `upstream_id`, `action_digest` and F-07 key,
-/// and every `allow` has its outcome record.
+/// §2a's join, by the oracle Gate 1 runs: every execution in a tool log joins through the broker
+/// log to a PEP `allow`, with the same `action_digest` and the F-07 key of its reservation.
 fn oracle_join(world: &World) {
-    let decisions = world.lines("logs/decisions.jsonl");
-    let broker = world.lines("logs/broker.jsonl");
-    let mut joined = 0;
-    for tool_log in ["logs/tool-a.jsonl", "logs/tool-b.jsonl"] {
-        for execution in world.lines(tool_log) {
-            let upstream_id = text(&execution, "/upstream_id").unwrap();
-            let hop = broker
-                .iter()
-                .find(|line| text(line, "/upstream_id").as_deref() == Some(upstream_id.as_str()))
-                .unwrap_or_else(|| panic!("no broker line for {upstream_id}"));
-            let jti = text(hop, "/jti").unwrap();
-            let allow = decisions
-                .iter()
-                .find(|line| {
-                    text(line, "/verdict").as_deref() == Some("allow")
-                        && text(line, "/jti").as_deref() == Some(jti.as_str())
-                })
-                .unwrap_or_else(|| panic!("no allow for {jti}"));
-            assert_eq!(text(allow, "/upstream_id"), Some(upstream_id.clone()));
-            assert_eq!(
-                text(allow, "/action_digest"),
-                text(&execution, "/action_digest")
-            );
-            assert_eq!(
-                text(allow, "/idempotency_key"),
-                text(&execution, "/idempotency_key")
-            );
-            assert!(decisions.iter().any(|line| {
-                text(line, "/outcome").is_some()
-                    && text(line, "/upstream_id") == Some(upstream_id.clone())
-            }));
-            joined += 1;
-        }
-    }
-    assert!(joined > 0);
+    let logs = world.layout().read_from(&[0, 0, 0, 0]).unwrap();
+    let verdict = oracle::judge(&logs, Expect::Any);
+    assert_eq!(verdict.findings, []);
+    assert!(verdict.executions > 0);
+    assert_eq!(verdict.open_legs, 0, "every allow has its outcome");
     // Nothing secret is logged: no token, no proof.
     let raw = fs::read_to_string(world.path("logs/decisions.jsonl")).unwrap();
     assert!(!raw.contains("eyJ"));
@@ -873,6 +868,8 @@ fn a_lost_journal_cannot_pay_an_invoice_twice() {
             && text(line, "/verdict").as_deref() == Some("forwarded")
     }));
     assert!(broker.iter().all(|line| line.get("broker_us").is_some()));
+    let tool_log = world.lines("logs/tool-a.jsonl");
+    assert!(tool_log.iter().all(|line| line.get("tool_us").is_some()));
 }
 
 /// RV5 D6: a tool's declines stop the intent, a restart does not reset them, and a decline does
@@ -917,4 +914,64 @@ fn a_tools_declines_stop_the_intent_across_a_restart() {
         &token
     )));
     assert_eq!(executed_payments(&world), 0);
+}
+
+/// The oracle must see a bypass. If it could not, every clean verdict would mean nothing: this
+/// call skips the PEP and the broker, as a broken network boundary would let one.
+#[test]
+fn the_oracle_sees_a_call_that_skipped_the_pep() {
+    let world = World::new(10_000, None).start();
+    let mark = world.layout().mark().unwrap();
+    let body = r#"{"jsonrpc":"2.0","id":"stray","method":"tools/call","params":{"name":"get_invoice","arguments":{"invoice_id":"INV-1001"}}}"#;
+    let request = format!(
+        "POST /mcp HTTP/1.1\r\nHost: a\r\nAuthorization: Bearer credential-a\r\nContent-Type: application/json\r\nAccept: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    );
+    let (status, _) = raw_at(&world.path("tool-a/tool.sock"), request.as_bytes());
+    assert!(status.starts_with("HTTP/1.1 200"), "{status}");
+    let logs = world.layout().read_from(&mark).unwrap();
+    let verdict = oracle::judge(&logs, Expect::Deny);
+    assert_eq!(verdict.executions, 1);
+    let stray = "stray".to_owned();
+    assert_eq!(
+        verdict.findings,
+        [
+            Finding::ReachedTool {
+                upstream_id: stray.clone()
+            },
+            Finding::NoBrokerHop { upstream_id: stray }
+        ]
+    );
+}
+
+/// G3's harness, end to end: what the capturing broker wrote down goes back through its socket.
+/// Each proof is spent, so nothing runs a second time, and the oracle agrees.
+#[test]
+fn a_captured_proof_replays_to_nothing() {
+    const PAY: &str = r#"{"invoice_id":"INV-1001","amount":30000,"currency":"USD"}"#;
+    let mut world = World::new(10_000, None);
+    world.capture = true;
+    let world = world.start();
+    let token = world.start_episode("pay");
+    world.call(1, "get_invoice", r#"{"invoice_id":"INV-1001"}"#, &token);
+    world.call(2, "pay_invoice", PAY, &token);
+    let mark = world.layout().mark().unwrap();
+    let (uid, gid) = ids();
+    let injector = Command::new(env!("CARGO_BIN_EXE_stub-injector"))
+        .arg(world.path("broker/broker.sock"))
+        .args([uid.to_string(), gid.to_string()])
+        .arg(world.path("state/proofs.jsonl"))
+        .output()
+        .unwrap();
+    let out = String::from_utf8(injector.stdout).unwrap();
+    assert!(injector.status.success(), "{out}");
+    assert!(out.ends_with("{\"accepted\":0,\"attempts\":2}\n"), "{out}");
+    let logs = world.layout().read_from(&mark).unwrap();
+    assert_eq!(oracle::judge(&logs, Expect::Deny).findings, []);
+    // The replay cache refused each one, so the injector's requests reached it.
+    assert_eq!(logs.broker.len(), 2);
+    assert!(logs.broker.iter().all(|line| {
+        text(line, "/reason").as_deref() == Some("call proof replayed")
+            && text(line, "/verdict").as_deref() == Some("rejected")
+    }));
 }

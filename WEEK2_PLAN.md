@@ -1,6 +1,6 @@
 # WEEK2_PLAN.md: pep-sidecar Week 2 (Gate 1)
 
-Status: 2026-11-06. Steps 1–8 are done, and step 8's acceptance passed with the real credentials (§4, as built). RV4's and RV5's findings are folded in (Appendices C and D). All 18 decisions in §1 are CLOSED: D2 before step 2, the 13 others that block steps 3–7 in step 2, N1 and O1 on 2026-11-04, B1 on 2026-11-05 and S1 on 2026-11-06, each with its §6 SPEC wording applied. This plan supersedes two earlier drafts:
+Status: 2026-11-06. Steps 1–8 are done, and step 8's acceptance passed with the real credentials (§4, as built). Step 9's groundwork is built, and its first attacks hold (§4, Step 9 groundwork). RV4's and RV5's findings are folded in (Appendices C and D). All 18 decisions in §1 are CLOSED: D2 before step 2, the 13 others that block steps 3–7 in step 2, N1 and O1 on 2026-11-04, B1 on 2026-11-05 and S1 on 2026-11-06, each with its §6 SPEC wording applied. This plan supersedes two earlier drafts:
 - **AP:** the attached Week 2 plan, "pep-sidecar Week 2 Plan: Toolchain, MCP Transport and Gate 1 Readiness", in the parent folder;
 - **MG:** the 29 Oct merge notes.
 
@@ -743,8 +743,13 @@ The unsigned lockfile v1 payload is also the config's `pins` section from step 7
   - each payment needs its own fresh lookup;
   - one intent's budget is shared by its episodes (R1, E1).
 
-  So the 10,500 calls run over at least 42 episodes (10,500 / 256 = 41.02; RV4 #15), one live per intent, with budgets sized for the run, many entities, `per_entity_max_uses` raised for the test intents, and arrival rates under 5 per second per episode. The report states all of these.
+  So the 10,500 calls run over at least 42 episodes (10,500 / 256 = 41.02; RV4 #15), one live per intent, with budgets sized for the run, many entities, and arrival rates under 5 per second per episode. The report states all of these.
+  - An invoice pays once across the PEP (RV5 V1), and an invoice intent must set `per_entity_max_uses` to 1, so every payment in the load has an invoice of its own. Corrected 2026-11-06: this said to raise `per_entity_max_uses`, which `config.rs` refuses.
+  - The load has its own config, because `config/pep` serves `check.py`: `limits.episodes` of at least 42, and `limits.connections` of at least 42 times the concurrency one episode needs, because each episode's share of the pool is `connections / episodes` (RV5 D2). With today's 32 connections each would get one.
+  - `pep`'s `ulimits`, `mem_limit` and `pids_limit` rise with that config, as `compose/check.py`'s formulas say.
+  - The head-of-line case stops at about 63 results of 1 MiB, at `MAX_EPISODE_RESULT_BYTES` (RV5 V9), so it is sized below that.
 - **Head-of-line case (A1):** one episode recording 1 MiB results while others make small calls, reported separately.
+- **What the logs hold today (2026-11-06).** The tool log has `tool_us`, so the agent-side gate can subtract the tool's own time. `pep_us` runs from the decision to the end of the leg, and `broker_us` from arrival to the log line, so neither is yet the residence formula above, which subtracts the upstream leg. The latency harness adds that.
 - **Crypto cost:** on this machine (AMD Ryzen 3 5300U, release, Rust 1.97.1, 2026-11-03), ES256 takes about 0.57 ms to sign and 0.56 ms to verify (mean). So each payment spends about 1.1 ms on crypto across the PEP and the broker.
 - **Exclusions:** step-up calls are excluded, since they wait for a human. 1 MiB requests are measured separately, because hashing cost grows with bytes × depth.
 - **Method (AP):** 10,000 calls after 500 warm-up calls. Report p50, p99, p99.9 and max.
@@ -1185,13 +1190,14 @@ The order follows RV2: p256, peer identity and the lock file come before the bin
 | PEP decision (written before any upstream write) | `ts_ms`, `eid`, `seq`, `peer_uid`, `method`, `tool`, `action_digest`, `verdict` (`allow`, `deny`, `step_up`, `unavailable` or `protocol_error`), `reason` (the guard or error variant; host-side only, never sent to the agent), `rid`, `amount_minor`, `currency`, `entity`, `jti`, `idempotency_key`, `upstream_id` |
 | PEP outcome (after the upstream leg) | `ts_ms`, `boot_ms`, `eid`, `upstream_id`, `jti`, `outcome` (`executed`, `refused`, `declined`, `unknown`, `released`, `abandoned` or `not_forwarded`), `pep_us` |
 | Broker | `ts_ms`, `jti`, `server_id`, `method`, `upstream_id`, `action_digest` (recomputed), `idempotency_key`, `entity_key`, `verdict` (`forwarding`, written before the upstream write, then `forwarded` or `rejected`), `reason`, `outcome`, `broker_us` |
-| Tool server | `ts_ms`, `server_id`, `upstream_id`, `tool`, `action_digest` (recomputed with the shared `jcs`), `idempotency_key`, `entity_key`, `executed` (`false` for a dedupe hit) |
+| Tool server | `ts_ms`, `server_id`, `upstream_id`, `tool`, `action_digest` (recomputed with the shared `jcs`), `idempotency_key`, `entity_key`, `executed` (`false` for a dedupe hit), `tool_us` |
 
 No log ever holds raw tokens, proofs, keys, credentials, or argument values other than the bound entity, amount and currency.
 
 **Bypass oracle.**
 - **Expected verdicts.** Every attack test declares what it expects: `deny` (nothing may execute) or `allow` with an exact count of executions. The PEP's own log is never the ground truth: any execution of a call that was expected to be denied is a bypass, whatever the PEP logged (RV2).
 - **Windows.** Tests run one at a time. For each test, the oracle reads every log from the offset at the test's start up to `upstream_timeout_ms` after its last request, so every upstream leg has finished.
+- **The join runs inside the test's window,** so an old `allow` cannot excuse a new execution, and one `allow` funds one execution, so a replay that reuses an `upstream_id` is seen too.
 - **The join.** The tool server never sees `jti`, so the broker's log is the link:
   1. tool log (`server_id`, `upstream_id`, `idempotency_key`);
   2. broker log (`upstream_id` → `jti`, recomputed `action_digest`, F-07 key);
@@ -1472,7 +1478,7 @@ networks:
   - Docker's local driver unmounts a tmpfs volume when the last container using it stops. So the 3 Nov claim that it "survives a PEP container restart" was wrong: `docker kill` and `docker restart` of the PEP alone emptied it, and C-OUT's restart test then had no `allow` record for the oracle to join.
   - It survives because the long-lived `oracle` service, which starts first and stays up for the whole run, also mounts it. It does not survive a host reboot.
   - `pep-state` stays private to the PEP.
-- **The injector (RV3 D2).** The stub broker's test-only mode writes each Call Proof it receives to `broker-state`. The `injector` service, in the `gate1` profile, replays them through the broker socket as uid 20002. It and that mode exist only for G3.
+- **The injector (RV3 D2).** The test-only `stub-broker-capture` writes each `tools/call` it receives, Call Proof included, to `proofs.jsonl` on `broker-state`. The `injector` service, in the `gate1` profile, replays them through the broker socket as uid 20002. They are separate binaries, so no release image can hold them, and every lint still covers them.
 - **Images:**
   - a real `/run` owned by root and not a symlink, because `bind_safe_listener` checks every ancestor;
   - B1 decides between static musl and a glibc-matched base.
@@ -1482,7 +1488,7 @@ networks:
   - This machine's kernel has `CONFIG_IA32_EMULATION=y`, `CONFIG_X86_X32_ABI=y`, `CONFIG_VSOCKETS=y` and `CONFIG_HYPERV_VSOCKETS=y`, and `/dev/vsock` is mode 0666 (Appendix A). So the x32 ABI is a third route, which the empty `subArchitectures` also closes. C-NET sweeps all three. Confirmed 2026-11-06: step 9 runs them for real against the profile, from a test-only probe in a test image, never a release image. The text checks in `compose/check.py` stay alongside it.
 - **Agent limits.** `pids_limit`, `mem_limit` and a private, size-capped `/tmp` (RV2). The root filesystem stays read-only.
 - **Secrets:**
-  - Compose ignores `uid`, `gid` and `mode` on file secrets [80], so each tool server's credential (`broker-credential-a`, `broker-credential-b`) is a host file that is already 0400 and owned by 20003, bind-mounted read-only into the broker only (RV4 #7). The broker refuses to start unless the file holds only base64 characters, with no trailing newline;
+  - Compose ignores `uid`, `gid` and `mode` on file secrets [80], so each tool server's credential (`broker-credential-a`, `broker-credential-b`) is a host file that is already 0400 and owned by 20003, bind-mounted read-only into the broker only (RV4 #7). The broker refuses to start unless the file holds only visible ASCII, so no trailing newline, and sends its exact bytes;
   - each tool server gets only its own verifier (`broker-credential-a.sha256`, owned by 20005, or `broker-credential-b.sha256`, owned by 20008; 0400), bind-mounted read-only, and sits on its own network. A server sees only its own credential, on its own calls, so even after capturing it, it can present it only to itself;
   - the PEP's own keys are per-boot (R1), so they need no secret.
 - **Host user 20004.** The operator uid is new. SPEC §1 gains it in step 2.
@@ -1493,7 +1499,7 @@ networks:
   - **healthchecks** run each binary's `--check CONFIG`, which connects to the socket or port the config names. The PEP waits on `service_healthy` from the broker and both tool servers, so its first polls (RV4 #5) find them up, and it waits on `service_started` from the oracle, so pep-log is held before the first record. Probes run every second during a 60 s start period and every 60 s after. A probe connects as its container's own uid, which the peer checks drop without a log line, and a tool server's probe sends no request;
   - **the tool servers** read a config file (`config/tool-*`, bound at `/etc/tool`) and the shared lockfile, not `TOOL_SERVER_ID`. `make-config.py` writes every config from one source, so the PEP's `lockfile_digest` always matches the pins the broker and the tools read;
   - **the operator and the agent** sit in a `run` profile. `up` leaves them out, and each `docker compose run --rm -T` is one container: an episode's agent, or one operator request (E1, RV4 #3);
-  - **the oracle** is `stub-oracle`, which only parks and holds its mounts; step 9 gives it the join. `probe` and `injector` come with step 9;
+  - **the oracle** is `stub-oracle`, which parks and holds its mounts, and joins the logs when the kit asks. `probe` and `injector` are in `compose/gate1.yaml` (Step 9 groundwork, below);
   - `stub-operator` takes `-` for its request and reads it from stdin. That keeps a trusted input out of argv, and lets the posture check hold an operator container open.
 - **Images (B1):**
   - the build stage is `rust:1.97.1-bookworm` plus the musl target. `rust-toolchain.toml` stays out of the context, so rustup fetches neither the macOS target nor the lint components; the stage checks `rustc 1.97.1`;
@@ -1509,8 +1515,20 @@ networks:
   - every flow of `tests/e2e.rs` over the real sockets, with their journal, tool-log and decision-log effects: M1's router rows (raw HTTP from the glibc image's perl, as the agent's uid), a read, a payment, a step-up approved, declined and timed out, the refused and unknown outcomes, server b over its own network, a wrong credential (tool-b recreated with a verifier nothing matches, then restored, and the drift poll sets it serving again), a Call Proof the broker refuses (the PEP's published key overwritten, as its uid, with the P-256 generator), and a restart that replays spend and an unresolved invoice;
   - pep-log across a `docker restart` and a `docker kill` of the PEP, that the new boot's key replaces the stranger's, and the oracle's join.
 - **Result (2026-11-06, with the real credentials from the snippet above):** all 129 checks pass (138 since RV5, Appendix D), on the images built from the digests pinned here, and `check.py` exits 0. The step-up timeout answers after 47 s, and the join covers 16 executions. Run it with `PEP_SECRETS_DIR=~/.config/pep-gate1/secrets python3 compose/check.py`.
-- **CI:** the `compose` job builds every image and runs `check.py` on each push, on the runner's engine and kernel, with throwaway credentials that §4's snippet makes for that run. Step 9's "CI job that runs the checks" extends this job. `check.py` holds no attack from the kit yet; the `int 0x80` and x32 probes arrive with step 9.
+- **CI:** the `compose` job builds every image and runs `check.py` on each push, on the runner's engine and kernel, with throwaway credentials that §4's snippet makes for that run. Step 9's "CI job that runs the checks" extends this job. `check.py` holds no attack from the kit: the attacks are in `compose/kit.py`, which the same job runs after it.
 - **Image ownership in volumes (Appendix B), settled:** on Docker 29.9.2, a fresh on-disk volume takes the owner and mode of the image's directory (`pep-state` 20002:20002 0700, `broker-state` 20003:20007 2750, and the tool states). The tmpfs volumes, mounted with `nocopy` where the image has no directory, keep their `driver_opts`.
+
+**Step 9 groundwork (2026-11-06).** What every attack stands on, built and proven before the attacks themselves.
+- **The oracle** (`src/stubs/oracle.rs`, the `stub-oracle` binary). `mark` takes every log's offset, and `judge` joins the window against the test's expectation (`deny`, `allow:N`). It holds §2a's rules, and two beyond them: the join stays in the window, and one `allow` funds one execution. Under `deny`, a call that merely reached a tool counts, even one the tool declined. It reports legs still open, so the kit waits for those instead of a fixed `upstream_timeout_ms`, and a line it cannot read fails the test. `tests/e2e.rs` uses it too, so there is one join.
+- **Test images** (`compose/gate1.yaml`, applied over `compose.yaml`). `broker-capture`, `injector` and `probe`. The 3 Nov sketch put them in `compose.yaml` behind a profile; an override keeps every test-only line out of the file release runs use.
+- **`net-probe`** (`compose/probe/net-probe.c`). Tries every family and three types through `syscall`, `int 0x80`, `socketcall` and the x32 ABI, each in its own child, because the profile kills a foreign ABI. It is C, in a test image, because raw syscalls cannot be written under `unsafe_code = "forbid"`.
+- **The kit** (`compose/kit.py`, on `check.py`'s helpers, run by CI's `compose` job). Each test declares what it expects before it runs, and holds only if its attempt failed as it should and the oracle found nothing.
+- **Controls first.** A real read must join, so the oracle is reading the right files. The stolen token must work from the rightful uid and gid. The sweep must make sockets under Docker's default profile, and its judge must flag that run.
+- **Attacks so far:** C-UID's 4, each with a stolen live token and a check that it reached `accept()`; C-NET's socket sweep; G3's verbatim class, with `call proof replayed` as the broker's own reason, so the replay cache is known to be what refused it. That is 5 of §3's 60.
+- **Confirmed here:** under Docker's default profile, `int 0x80`, `socketcall` and x32 each create an `AF_INET` socket with `network_mode: none` (RV4 #6). Under `seccomp-unix-only.json` all three die with SIGSYS, in every family.
+- **Proven able to fail.** A copy of the tree with `require_peer` and the replay cache disabled failed C-UID's 4 and G3's class, and the oracle flagged each execution on its own. With only `require_peer` gone, the wrong-uid probes were still denied, by the token's `peer_uid`; only the wrong-gid probe executed.
+- **A stale binary found that way.** The Dockerfile keeps `target/` in a cache mount, and `COPY` preserves mtimes, so cargo took a real source older than the altered copy as already built, and shipped the altered PEP in images built from the real tree. `check.py` passed all 138 checks on it, and only the kit caught it. The build stage now touches the sources first. CI builds without that cache, so it was never exposed.
+- **Left for step 9:** the other 55 attacks; G3's other classes and its 1,000 attempts; the latency harness, its load config and O1's residence timers; the tool servers' misbehaviour modes, which C-RES and the broker-timeout row need; the MCP conformance suite, if it can run.
 
 ## 5. Forward constraints (decided now so Week 2 does not paint later weeks into a corner)
 - **Week 3:**

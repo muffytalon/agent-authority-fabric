@@ -5,7 +5,8 @@
 #   docker compose run --rm -T agent tools/call get_invoice '{"name":"get_invoice","arguments":{"invoice_id":"INV-1001"}}' <<< "$TOKEN"
 # Step 8's acceptance (volumes, C-POSTURE, the step 7 flows) runs as its own project:
 #   PEP_SECRETS_DIR=~/.config/pep-gate1/secrets python3 compose/check.py
-# The `probe` and `injector` services of §4 come with Gate 1 (step 9).
+# The test-only services and images are in compose/gate1.yaml; compose/kit.py applies it over
+# this file. Nothing here depends on them.
 name: pep-gate1
 
 # Healthchecks probe every second while a service starts (first polls wait on them), then

@@ -1,0 +1,37 @@
+# Test-only services and images for the Gate 1 kit (WEEK2_PLAN step 9, §4). Applied over
+# compose.yaml, never on its own:
+#   docker compose -f compose.yaml -f compose/gate1.yaml --profile gate1 ...
+# compose/kit.py does that. Nothing here is in a release image (RV3 D2, RV4 #20): the capturing
+# broker, the injector and the socket probe are separate binaries in images of their own.
+services:
+  broker:                      # writes each Call Proof it receives, for the injector (G3)
+    build: { context: ., target: broker-capture }
+    image: pep-gate1/broker-capture:dev
+    entrypoint: ["/usr/local/bin/stub-broker-capture", "/var/lib/broker/proofs.jsonl", "/etc/broker/config.json"]
+
+  probe:                       # C-UID and C-NET; `run --user` sets each uid:gid
+    profiles: [gate1]
+    build: { context: ., target: probe }
+    image: pep-gate1/probe:dev
+    user: "20009:20001"
+    group_add: ["20001"]       # so every probe passes the socket's 0660 mode and reaches accept()
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true", "seccomp=./seccomp-unix-only.json"]
+    network_mode: "none"
+    volumes:
+      - { type: volume, source: pep-sock, target: /run/pep, volume: { nocopy: true } }
+
+  injector:                    # G3: replays captured proofs through the broker socket
+    profiles: [gate1]
+    build: { context: ., target: injector }
+    image: pep-gate1/injector:dev
+    user: "20002:20002"        # the broker admits only the PEP's uid
+    group_add: ["20007"]       # broker-state grants the log group read
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true", "seccomp=./seccomp-unix-only.json"]
+    network_mode: "none"
+    volumes:
+      - { type: volume, source: broker-sock,  target: /run/broker,     volume: { nocopy: true } }
+      - { type: volume, source: broker-state, target: /var/lib/broker, read_only: true }

@@ -24,6 +24,7 @@ import base64, hashlib, io, json, os, re, stat, subprocess, sys, tarfile, tempfi
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PROJECT = "pep-check"
+COMPOSE_FILES = ["compose.yaml"]   # compose/kit.py adds compose/gate1.yaml
 PROFILE = os.path.join(ROOT, "seccomp-unix-only.json")
 PROBE_IMAGE = "pep-gate1/tool-a:dev"   # debian:bookworm-slim, whose perl-base is Essential
 HARDENED = {"pep", "oracle", "agent", "operator"}   # the AF_UNIX-only profile (§4)
@@ -50,7 +51,8 @@ def run(args, input=None, check=True, timeout=600):
 
 
 def dc(*args, **kwargs):
-    return run(["docker", "compose", "-p", PROJECT, *args], **kwargs)
+    files = [arg for name in COMPOSE_FILES for arg in ("-f", name)]
+    return run(["docker", "compose", "-p", PROJECT, *files, *args], **kwargs)
 
 
 def container(service):

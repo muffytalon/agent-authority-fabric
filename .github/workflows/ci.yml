@@ -6,7 +6,8 @@
 #   GitHub-hosted runners give through passwordless sudo.
 # - `attacks` runs the eighth, RV5's attack suite, in a job of its own because it takes
 #   minutes, then the fuzz suite for longer than the short run in `verify`.
-# - `compose` builds every image and runs compose/check.py, with throwaway credentials.
+# - `compose` builds every image and runs compose/check.py, then the Gate 1 kit in
+#   compose/kit.py, which adds the test images, with throwaway credentials.
 # - The weekly run catches new RustSec advisories against an unchanged Cargo.lock.
 #
 # Actions are pinned to full commit SHAs, with the release tag in the trailing comment.
@@ -201,3 +202,6 @@ jobs:
 
       - name: compose/check.py
         run: python3 compose/check.py
+
+      - name: compose/kit.py
+        run: python3 compose/kit.py
