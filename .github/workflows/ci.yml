@@ -1,6 +1,6 @@
 # The CLAUDE.md §2 verification loop, run on GitHub.
 #
-# - `verify` runs the six commands exactly as CLAUDE.md §2 writes them, with the same
+# - `verify` runs the seven commands exactly as CLAUDE.md §2 writes them, with the same
 #   RUSTFLAGS, on the toolchain rust-toolchain.toml pins.
 # - `ignored-tests` runs the three #[ignore] peercred tests. Two need root, which
 #   GitHub-hosted runners give through passwordless sudo.
@@ -80,7 +80,7 @@ jobs:
       - name: 6. cargo deny check
         run: cargo deny check
 
-      - name: "compose.yaml interpolates (WEEK2_PLAN §6, RV4 #16)"
+      - name: "7. docker compose config (WEEK2_PLAN §6, RV4 #16)"
         # `config` only interpolates; PEP_SECRETS_DIR is unset in CI, so a dummy value stands in.
         run: PEP_SECRETS_DIR=/nonexistent docker compose config --quiet
 

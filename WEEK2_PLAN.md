@@ -873,7 +873,7 @@ Step 2 (2026-11-03) confirmed every answer whose decision it closed, and settled
 | 14 | Does the control socket get its own capacity? Do actors serve the host channel first? | Yes; yes | H1 |
 
 ## 2. Build order
-Every step ends with the CLAUDE.md §2 six-command loop green. Each step's decision IDs must be CLOSED before the step starts.
+Every step ends with the CLAUDE.md §2 loop green: six commands through step 7, and seven since step 8 added `docker compose config`. Each step's decision IDs must be CLOSED before the step starts.
 
 The order follows RV2: p256, peer identity and the lock file come before the binary. `tokens.rs` moves with them, so the binary never ships placeholder token checks.
 
@@ -1566,7 +1566,7 @@ networks:
   - **Week 3:** "SQLite replaces the Week 2 journal; reconciliation replaces the Week 2 `NeedsReconcile` entity check". *Applied.*
 
 **CLAUDE.md:**
-- **§2 (once `compose.yaml` exists):** add `PEP_SECRETS_DIR=/nonexistent docker compose config --quiet` to the loop, and the same step to CI. `config` only interpolates, and fails when the variable is unset, as it is in CI, so a dummy value is enough (RV4 #16). The CI step was added in step 8 (2026-11-05); the line in CLAUDE.md's loop is yours to apply.
+- **§2 (once `compose.yaml` exists):** add `PEP_SECRETS_DIR=/nonexistent docker compose config --quiet` to the loop, and the same step to CI. `config` only interpolates, and fails when the variable is unset, as it is in CI, so a dummy value is enough (RV4 #16). *Applied 2026-11-06* at your request, in step 8: the CI step and the line in CLAUDE.md's loop, with "all six commands" now "all seven commands".
 - **§3, new rule "Binaries":** "Binaries log with `writeln!` to a locked `stderr` handle and return `std::process::ExitCode` from `main`. `print_stdout`, `print_stderr` and `exit` stay denied. Never log raw tokens, proofs or keys." *Applied*, headed `Binaries (print_stdout, print_stderr and exit = "deny")`, and with "keys or credentials": §2a's log rule also excludes credentials, and step 7 adds the broker's.
 - **Two-Phase Budget, append (R1 (a)); amended 2026-11-04 after RV4 #4, and the section is now headed F-10 (RV4 #21):** "Journal each payment reservation when it is made, and fsync its `forwarded` record and the call's F-08 taint and F-09 ratchet records before the call is forwarded. At boot, truncate a torn tail under the journal lock; reservations forwarded without a final outcome return as `NeedsReconcile`, keyed by their original (eid, rid), and count against their intent." *Applied*, with "reservations forwarded with no outcome, or with outcome unknown" in place of "without a final outcome", which could be read as excluding `unknown` (R1 restores both as `NeedsReconcile`).
 - **F-11/F-12, append:** "Before unlinking or binding, take an exclusive `File::try_lock` on `<socket>.lock`, opened with `O_NOFOLLOW | O_NONBLOCK` (from `nix::libc`, through `custom_flags`), created with `create_new` and set to exactly 0600, and checked by fstat (regular file, mode 0600, owner euid, `nlink` 1). Hold it for the listener's lifetime, and never remove the lock file." (Updated in step 5 with `O_NONBLOCK`, the exact mode and the never-remove rule.) *Applied* ("created if absent with create_new and then set to exactly 0600").
