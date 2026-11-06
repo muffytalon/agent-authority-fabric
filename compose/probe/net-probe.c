@@ -16,6 +16,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/mman.h>
+#include <sys/prctl.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -103,6 +104,9 @@ int main(void) {
         {"x32", try_x32},
     };
     static const int types[] = {SOCK_STREAM, SOCK_DGRAM, SOCK_RAW};
+    /* Children are killed by the thousand, by design. Where core_pattern is a pipe, as on CI's
+     * runners, a core dump for each takes the sweep past any deadline. */
+    prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
     low_args = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_32BIT, -1, 0);
     if (low_args == MAP_FAILED) {
         perror("mmap");
