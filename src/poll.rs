@@ -42,7 +42,7 @@ pub fn poll(
     };
     let fetch = |request: Option<UpstreamRequest>, id: &str| -> Option<JcsValue> {
         let left = until.checked_duration_since(Instant::now())?;
-        let body = broker.call(&request?, left)?;
+        let body = broker.call(&request?, left).ok()?;
         let reply = forward::read_upstream_reply(&body, id).ok()?;
         jcs::parse_with(&reply.result?, &ParseOptions::definition())
             .ok()
@@ -116,6 +116,7 @@ pub fn poll(
 )]
 mod tests {
     use super::*;
+    use crate::actor::UpstreamFailure;
     use crate::engine::encode_ulid;
     use std::fmt;
     use std::sync::Mutex;
@@ -137,25 +138,28 @@ mod tests {
     }
 
     impl Upstream for Script {
-        fn call(&self, request: &UpstreamRequest, _: Duration) -> Option<Vec<u8>> {
-            let body = jcs::parse(&request.body).ok()?;
-            let id = body.get("id")?.as_str()?.to_owned();
-            let method = body.get("method")?.as_str()?.to_owned();
-            self.seen.lock().ok()?.push(method.clone());
-            assert!(
-                body.pointer("/params/_meta/dev.pep-sidecar~1call-proof")
-                    .is_none(),
-                "polls carry no proof"
-            );
-            let result = match method.as_str() {
-                "server/discover" => self.discover.clone()?,
-                "tools/list" => {
-                    let cursor = body.pointer("/params/cursor").and_then(JcsValue::as_str);
-                    self.pages.iter().find(|(at, _)| *at == cursor)?.1.clone()
-                }
-                _ => return None,
+        fn call(&self, request: &UpstreamRequest, _: Duration) -> Result<Vec<u8>, UpstreamFailure> {
+            let answer = || {
+                let body = jcs::parse(&request.body).ok()?;
+                let id = body.get("id")?.as_str()?.to_owned();
+                let method = body.get("method")?.as_str()?.to_owned();
+                self.seen.lock().ok()?.push(method.clone());
+                assert!(
+                    body.pointer("/params/_meta/dev.pep-sidecar~1call-proof")
+                        .is_none(),
+                    "polls carry no proof"
+                );
+                let result = match method.as_str() {
+                    "server/discover" => self.discover.clone()?,
+                    "tools/list" => {
+                        let cursor = body.pointer("/params/cursor").and_then(JcsValue::as_str);
+                        self.pages.iter().find(|(at, _)| *at == cursor)?.1.clone()
+                    }
+                    _ => return None,
+                };
+                Some(format!(r#"{{"jsonrpc":"2.0","id":"{id}","result":{result}}}"#).into_bytes())
             };
-            Some(format!(r#"{{"jsonrpc":"2.0","id":"{id}","result":{result}}}"#).into_bytes())
+            answer().ok_or(UpstreamFailure::Lost)
         }
     }
 

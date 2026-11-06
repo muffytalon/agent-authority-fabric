@@ -24,8 +24,8 @@ use std::fs::{File, OpenOptions, Permissions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::Path;
+use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
-use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
 use crate::engine::{
@@ -90,8 +90,10 @@ pub enum JournalError {
 pub enum OutcomeKind {
     /// The broker reported it executed: committed.
     Executed,
-    /// The broker reported it not executed: released.
+    /// Not executed, and the tool never saw it, or the broker refused it: released.
     Refused,
+    /// The tool declined it: released, and counted against `limits.max_declines` (RV5 D6).
+    Declined,
     /// No explicit outcome: unresolved (`NeedsReconcile`).
     Unknown,
     /// Released before its point of forwarding: a decline, a step-up timeout, a disconnect, a
@@ -104,6 +106,7 @@ impl OutcomeKind {
         match self {
             Self::Executed => "executed",
             Self::Refused => "refused",
+            Self::Declined => "declined",
             Self::Unknown => "unknown",
             Self::Released => "released",
         }
@@ -113,6 +116,7 @@ impl OutcomeKind {
         match name {
             "executed" => Some(Self::Executed),
             "refused" => Some(Self::Refused),
+            "declined" => Some(Self::Declined),
             "unknown" => Some(Self::Unknown),
             "released" => Some(Self::Released),
             _ => None,
@@ -504,6 +508,7 @@ struct Payment {
 ///   its original (eid, rid), counted in reserved, calls and entity uses, and its entity is
 ///   blocked PEP-wide;
 /// - a reservation never forwarded, `refused` or `released` counts in calls only;
+/// - a `declined` one counts in calls and in the intent's declines;
 /// - an intent's ratchet is its highest level.
 ///
 /// # Errors
@@ -597,6 +602,10 @@ pub fn replay(records: &[Record]) -> Result<Replay, JournalError> {
                     .checked_add(payment.amount_minor)
                     .ok_or_else(overflow)?;
                 false
+            }
+            Some(OutcomeKind::Declined) => {
+                ledger.declined = ledger.declined.checked_add(1).ok_or_else(overflow)?;
+                continue;
             }
             Some(OutcomeKind::Unknown) => true,
             None if payment.forwarded => true,
@@ -709,6 +718,11 @@ fn open_journal_file(path: &Path, euid: u32) -> Result<File, JournalError> {
     let file = match options.clone().create_new(true).open(path) {
         Ok(file) => {
             file.set_permissions(Permissions::from_mode(JOURNAL_MODE))?;
+            // The file's fsyncs do not cover its name: without this, a crash could take the
+            // whole new journal, and with it every budget (R1).
+            if let Some(parent) = path.parent() {
+                File::open(parent)?.sync_all()?;
+            }
             file
         }
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
@@ -820,6 +834,13 @@ fn run_writer<S: Sink>(mut sink: S, appends: &Receiver<Append>) {
             let sync = batch.iter().any(|append| append.sync);
             sink.write_batch(&bytes, sync).map_err(JournalError::Io)
         };
+        if let (false, Err(error)) = (failed, &result) {
+            // Once: the PEP keeps running, refusing what needs the journal, so say why.
+            drop(writeln!(
+                io::stderr().lock(),
+                "pep-sidecar: the journal failed, refusing every later append: {error}"
+            ));
+        }
         failed |= result.is_err();
         for append in batch {
             let answer = match &result {
@@ -832,14 +853,15 @@ fn run_writer<S: Sink>(mut sink: S, appends: &Receiver<Append>) {
     }
 }
 
-/// The journal-backed [`LabelStore`] (R1): each call's entries go in one fsynced `taint`
-/// record before they are applied, and capacity is checked before the append, so a replay can
-/// never overflow the store.
+/// The journal-backed [`LabelStore`] (R1): each call's entries are applied, which checks the
+/// store's capacity, and then go in one fsynced `taint` record, which `record_all` waits for.
+/// So a replay can never overflow the store, concurrent writers share an fsync, and a failed
+/// fsync leaves only extra taint in memory, which fails closed; the journal then refuses
+/// everything else anyway.
 #[derive(Debug)]
 pub struct JournaledLabels {
     inner: InMemoryLabelStore,
     journal: JournalHandle,
-    order: Mutex<()>,
 }
 
 impl JournaledLabels {
@@ -863,11 +885,7 @@ impl JournaledLabels {
                 .collect();
             inner.record_all(&rebuilt, *entry)?;
         }
-        Ok(Arc::new(Self {
-            inner,
-            journal,
-            order: Mutex::new(()),
-        }))
+        Ok(Arc::new(Self { inner, journal }))
     }
 }
 
@@ -877,11 +895,7 @@ impl LabelStore for JournaledLabels {
             // Nothing to taint, so nothing to make durable: reads pay no fsync.
             return Ok(());
         }
-        // One call at a time, so the capacity checked is the capacity applied.
-        let _order = self.order.lock().map_err(|_| StoreError::Poisoned)?;
-        if !self.inner.fits(indexes)? {
-            return Err(StoreError::CapacityExceeded);
-        }
+        self.inner.record_all(indexes, entry)?;
         let record = Record::Taint {
             writer: entry.writer_episode,
             label: entry.label,
@@ -889,8 +903,7 @@ impl LabelStore for JournaledLabels {
         };
         self.journal
             .commit(&[record])
-            .map_err(|_| StoreError::Unavailable)?;
-        self.inner.record_all(indexes, entry)
+            .map_err(|_| StoreError::Unavailable)
     }
 
     fn lookup(&self, index: &TaintIndex) -> Result<Option<Label>, StoreError> {
@@ -910,6 +923,7 @@ mod tests {
     use super::*;
     use std::fs;
     use std::path::PathBuf;
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     static COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -1116,6 +1130,27 @@ mod tests {
 
     fn ledger_of<'a>(replay: &'a Replay, intent: &str) -> &'a Ledger {
         replay.ledgers.get(intent).unwrap()
+    }
+
+    #[test]
+    fn replay_counts_declines_but_not_refusals() {
+        let records = vec![
+            reserve(EID, 1, "pay", "INV-1", 100),
+            forwarded(EID, 1),
+            outcome(EID, 1, OutcomeKind::Declined),
+            reserve(EID, 2, "pay", "INV-1", 100),
+            forwarded(EID, 2),
+            outcome(EID, 2, OutcomeKind::Refused),
+        ];
+        let replay = replay(&records).unwrap();
+        let pay = ledger_of(&replay, "pay");
+        assert_eq!((pay.calls, pay.declined), (2, 1));
+        assert!(pay.entity_uses.is_empty(), "a decline gives its use back");
+        let line = outcome(EID, 1, OutcomeKind::Declined).to_line().unwrap();
+        assert_eq!(
+            Record::parse(line.trim_ascii_end()).unwrap(),
+            outcome(EID, 1, OutcomeKind::Declined)
+        );
     }
 
     #[test]
@@ -1497,7 +1532,9 @@ mod tests {
             store.record_all(&[location("k1")], entry),
             Err(StoreError::Unavailable)
         );
-        assert_eq!(store.lookup(&location("k1")).unwrap(), None);
+        // The entry was applied first, so writers can share an fsync. Extra taint fails closed,
+        // and the failed journal now refuses everything else.
+        assert_eq!(store.lookup(&location("k1")).unwrap(), Some(SECRET_WRITE));
         drop((store, handle));
         writer.join().unwrap();
     }

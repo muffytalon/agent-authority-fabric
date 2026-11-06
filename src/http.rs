@@ -13,7 +13,7 @@
 //! before each read the timeout is set to the time left, so a peer that trickles one byte per
 //! interval cannot hold a connection open past its deadline (RV3 F1).
 
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::time::{Duration, Instant};
 
 /// Longest request line plus header block, the final empty line included.
@@ -199,6 +199,24 @@ pub struct Deadlines {
     pub body: Instant,
 }
 
+/// A listener's own limits on one request (`limits.header_bytes`, `limits.body_bytes`), at most
+/// the subset's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Caps {
+    /// Longest request line plus header block.
+    pub head_bytes: usize,
+    /// Largest body.
+    pub body_bytes: usize,
+}
+
+impl Caps {
+    /// The subset's own limits.
+    pub const MAX: Self = Self {
+        head_bytes: MAX_HEAD_BYTES,
+        body_bytes: MAX_BODY_BYTES,
+    };
+}
+
 /// A byte stream whose read timeout can be set: a `UnixStream`, or a test double.
 pub trait TimedRead: Read {
     /// Sets the timeout for the next reads. `None` blocks.
@@ -222,6 +240,67 @@ impl TimedRead for std::net::TcpStream {
     }
 }
 
+/// A byte stream whose write timeout can be set: a `UnixStream` or a `TcpStream`.
+pub trait TimedWrite: Write {
+    /// Sets the timeout for the next writes. `None` blocks.
+    ///
+    /// # Errors
+    ///
+    /// Returns the stream's error.
+    fn set_write_timeout(&mut self, timeout: Option<Duration>) -> io::Result<()>;
+}
+
+#[cfg(unix)]
+impl TimedWrite for std::os::unix::net::UnixStream {
+    fn set_write_timeout(&mut self, timeout: Option<Duration>) -> io::Result<()> {
+        std::os::unix::net::UnixStream::set_write_timeout(self, timeout)
+    }
+}
+
+impl TimedWrite for std::net::TcpStream {
+    fn set_write_timeout(&mut self, timeout: Option<Duration>) -> io::Result<()> {
+        std::net::TcpStream::set_write_timeout(self, timeout)
+    }
+}
+
+/// The most one `write` takes. A socket's send timeout covers each wait for buffer space, not the
+/// call, so a peer that keeps taking a little could keep one large `write` going past any
+/// deadline (RV5 V7c).
+const WRITE_CHUNK: usize = 16 * 1024;
+
+/// The time until `deadline`; `None` once it has passed.
+#[must_use]
+pub fn time_left(deadline: Instant) -> Option<Duration> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|left| !left.is_zero())
+}
+
+/// Writes all of `bytes` by `deadline`, however slowly the peer takes them.
+///
+/// # Errors
+///
+/// Returns [`io::ErrorKind::TimedOut`] once `deadline` has passed, or the write's own error: a
+/// timeout, or the peer gone. Part of `bytes` may have been written.
+pub fn write_by<S: TimedWrite + ?Sized>(
+    stream: &mut S,
+    bytes: &[u8],
+    deadline: Instant,
+) -> io::Result<()> {
+    let mut rest = bytes;
+    while !rest.is_empty() {
+        let left = time_left(deadline).ok_or(io::ErrorKind::TimedOut)?;
+        stream.set_write_timeout(Some(left))?;
+        match stream.write(rest.get(..WRITE_CHUNK).unwrap_or(rest)) {
+            Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+            Ok(written) => rest = rest.get(written..).unwrap_or_default(),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
 /// Reads one request for `endpoint` from `stream`, within `deadlines`.
 ///
 /// # Errors
@@ -237,6 +316,21 @@ pub fn read_request<S: TimedRead + ?Sized>(
     read_request_matching(stream, &|target| target == endpoint, deadlines)
 }
 
+/// [`read_request`] under a listener's own [`Caps`].
+///
+/// # Errors
+///
+/// As [`read_request`], with [`Malformed::HeadTooLarge`] or [`Malformed::BodyTooLarge`] past
+/// `caps`.
+pub fn read_request_capped<S: TimedRead + ?Sized>(
+    stream: &mut S,
+    endpoint: &str,
+    deadlines: Deadlines,
+    caps: Caps,
+) -> Result<Request, HttpError> {
+    read_request_with(stream, &|target| target == endpoint, deadlines, caps)
+}
+
 /// [`read_request`] for a server with several targets, such as the broker's
 /// `/mcp/{server_id}`: any target `accept` admits.
 ///
@@ -248,8 +342,20 @@ pub fn read_request_matching<S: TimedRead + ?Sized>(
     accept: &dyn Fn(&str) -> bool,
     deadlines: Deadlines,
 ) -> Result<Request, HttpError> {
+    read_request_with(stream, accept, deadlines, Caps::MAX)
+}
+
+fn read_request_with<S: TimedRead + ?Sized>(
+    stream: &mut S,
+    accept: &dyn Fn(&str) -> bool,
+    deadlines: Deadlines,
+    caps: Caps,
+) -> Result<Request, HttpError> {
     let (buf, head_end) = read_head(stream, deadlines.head)?;
     let (head_bytes, rest) = buf.split_at_checked(head_end).ok_or(HttpError::Io)?;
+    if head_bytes.len() > caps.head_bytes {
+        return Err(Malformed::HeadTooLarge.into());
+    }
     let head = parse_head_matching(head_bytes, accept)?;
     if !head.is_post() {
         return Ok(Request {
@@ -258,6 +364,9 @@ pub fn read_request_matching<S: TimedRead + ?Sized>(
         });
     }
     let length = head.content_length.ok_or(Malformed::MissingContentLength)?;
+    if length > caps.body_bytes {
+        return Err(Malformed::BodyTooLarge.into());
+    }
     let body = read_body(stream, rest, length, deadlines.body)?;
     Ok(Request { head, body })
 }
@@ -764,6 +873,33 @@ mod tests {
 
     /// What the TypeScript SDK sent in the D2 spike, apart from the body.
     const UNDICI: &str = "host: pep.local\r\nconnection: keep-alive\r\naccept: application/json, text/event-stream\r\ncontent-type: application/json\r\nmcp-method: tools/list\r\nmcp-protocol-version: 2026-07-28\r\npep-episode: eyJ.spike.token\r\naccept-language: *\r\nuser-agent: undici\r\naccept-encoding: gzip, deflate\r\n";
+
+    #[test]
+    fn a_listeners_caps_are_enforced() {
+        let capped = |caps: Caps, raw: &[u8]| {
+            read_request_capped(&mut Script::new(&[raw]), ENDPOINT, deadlines(5), caps)
+        };
+        let raw = post("\r\n", &"x".repeat(1025)).clone();
+        let small_body = Caps {
+            head_bytes: MAX_HEAD_BYTES,
+            body_bytes: 1024,
+        };
+        assert!(matches!(
+            capped(small_body, &raw),
+            Err(HttpError::Malformed(Malformed::BodyTooLarge))
+        ));
+        assert!(capped(Caps::MAX, &raw).is_ok());
+        let fits = post("\r\n", &"x".repeat(1024));
+        assert!(capped(small_body, &fits).is_ok());
+        let small_head = Caps {
+            head_bytes: 32,
+            body_bytes: MAX_BODY_BYTES,
+        };
+        assert!(matches!(
+            capped(small_head, &fits),
+            Err(HttpError::Malformed(Malformed::HeadTooLarge))
+        ));
+    }
 
     #[test]
     fn an_sdk_request_parses() {

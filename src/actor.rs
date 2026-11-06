@@ -43,6 +43,14 @@ use crate::tokens::{
     new_jti,
 };
 
+/// How long past the upstream timeout the actor waits for a worker's report.
+const LEG_MARGIN: Duration = Duration::from_secs(1);
+/// The denials of one episode that reach the decision log; later ones go to the noise file.
+/// Allowed calls are bounded by `MAX_CALLS_PER_EPISODE`, and denials are the one record a token
+/// holder can make without limit, so this is what keeps one token from rotating decisions away
+/// (RV5 D3).
+const MAX_EPISODE_DENIAL_RECORDS: usize = 4096;
+
 /// What the actor answers a call. The connection thread puts the agent's own id on it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CallReply {
@@ -54,12 +62,31 @@ pub enum CallReply {
     Unavailable,
 }
 
+/// Why an exchange with the broker gave no usable reply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpstreamFailure {
+    /// The broker cannot have forwarded the request: the connection failed, the peer is not the
+    /// broker, the request was not fully written, or the broker said so (any status but 200:
+    /// it forwards a call only on its way to a 200). A payment is `DefinitelyNotExecuted`, so
+    /// it does not block its entity for good (RV5 V2, V3, V4).
+    NotSent,
+    /// It may have been forwarded: a timeout or a dropped connection after the whole request
+    /// was written, or a reply that cannot be read. A payment's outcome is unknown (P1).
+    Lost,
+}
+
 /// The PEP's client to the broker.
 pub trait Upstream: Send + Sync + fmt::Debug {
-    /// Sends `request` and returns the reply body, within `timeout`. `None` when there is no
-    /// usable reply: a timeout, a dropped connection, a peer that is not the broker, a status
-    /// other than 200, or a content type other than JSON.
-    fn call(&self, request: &UpstreamRequest, timeout: Duration) -> Option<Vec<u8>>;
+    /// Sends `request` and returns the reply body, within `timeout`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`UpstreamFailure`] when there is no usable reply.
+    fn call(
+        &self,
+        request: &UpstreamRequest,
+        timeout: Duration,
+    ) -> Result<Vec<u8>, UpstreamFailure>;
 }
 
 /// What every actor shares (A1). No connection thread holds it.
@@ -126,6 +153,8 @@ pub enum HostMessage {
     Approve {
         /// Matched against the reservation.
         approval: Approval,
+        /// Past this, whoever asked has given up, so it changes nothing.
+        until: Instant,
         /// Where to answer.
         reply: SyncSender<Result<(), ControlError>>,
     },
@@ -133,6 +162,8 @@ pub enum HostMessage {
     Decline {
         /// Matched against the reservation.
         approval: Approval,
+        /// Past this, whoever asked has given up, so it changes nothing.
+        until: Instant,
         /// Where to answer.
         reply: SyncSender<Result<(), ControlError>>,
     },
@@ -163,7 +194,7 @@ enum HostEvent {
     Control(HostMessage),
     Upstream {
         pep_id: String,
-        body: Option<Vec<u8>>,
+        body: Result<Vec<u8>, UpstreamFailure>,
     },
 }
 
@@ -251,6 +282,9 @@ struct Call {
     decided: Instant,
     /// Its Call Proof's `jti`, once built.
     jti: Option<String>,
+    /// While it is upstream: when the actor stops waiting for its worker, whatever the worker
+    /// is doing, so a leg always ends (P1).
+    leg_deadline: Option<Instant>,
 }
 
 struct Actor {
@@ -262,6 +296,8 @@ struct Actor {
     legs: BTreeMap<String, Call>,
     ended: bool,
     journaled_conf: Confidentiality,
+    /// Denials written to the decision log so far ([`MAX_EPISODE_DENIAL_RECORDS`]).
+    denials_logged: usize,
 }
 
 /// Starts the actor of the episode `engine` runs, an episode of the intent named `intent`.
@@ -296,6 +332,7 @@ pub fn spawn(
         legs: BTreeMap::new(),
         ended: false,
         journaled_conf,
+        denials_logged: 0,
     };
     let thread = thread::Builder::new()
         .name("episode".to_owned())
@@ -331,11 +368,18 @@ impl Actor {
             match agent_rx.try_recv() {
                 Ok(message) => {
                     self.on_agent(message);
+                    // A steady stream of agent messages must not hold a deadline back.
+                    self.expire(&host, Instant::now());
                     continue;
                 }
                 Err(TryRecvError::Empty | TryRecvError::Disconnected) => {}
             }
-            let deadline = self.waiting.values().map(|(_, deadline)| *deadline).min();
+            let deadline = self
+                .waiting
+                .values()
+                .map(|(_, deadline)| *deadline)
+                .chain(self.legs.values().filter_map(|call| call.leg_deadline))
+                .min();
             match deadline {
                 Some(deadline) => {
                     // A wake-up or the deadline: either way, look again.
@@ -348,7 +392,7 @@ impl Actor {
                     }
                 }
             }
-            self.expire(Instant::now());
+            self.expire(&host, Instant::now());
         }
     }
 
@@ -395,19 +439,21 @@ impl Actor {
                         .and_then(JcsValue::as_str)
                         .map(str::to_owned)
                 });
-                self.services.log.decision(
-                    verdict,
-                    &LogDecision {
-                        eid: Some(self.eid()),
-                        peer_uid: Some(peer_uid),
-                        method: "tools/call",
-                        tool: tool.as_deref(),
-                        reason: Some(format!("{error:?}")),
-                        upstream_id: Some(&pep_id),
-                        ..LogDecision::default()
-                    },
-                    unix_ms(),
-                );
+                let record = LogDecision {
+                    eid: Some(self.eid()),
+                    peer_uid: Some(peer_uid),
+                    method: "tools/call",
+                    tool: tool.as_deref(),
+                    reason: Some(format!("{error:?}")),
+                    upstream_id: Some(&pep_id),
+                    ..LogDecision::default()
+                };
+                if self.denials_logged < MAX_EPISODE_DENIAL_RECORDS {
+                    self.denials_logged = self.denials_logged.saturating_add(1);
+                    self.services.log.decision(verdict, &record, unix_ms());
+                } else {
+                    self.services.log.overflow(verdict, &record, unix_ms());
+                }
                 let refusal = self.ratchet(refusal);
                 answer(&reply, refusal);
             }
@@ -424,6 +470,7 @@ impl Actor {
                     peer_uid,
                     decided: Instant::now(),
                     jti: None,
+                    leg_deadline: None,
                 };
                 if self.journal_reserve(&call) {
                     self.forward(call);
@@ -442,6 +489,7 @@ impl Actor {
                     peer_uid,
                     decided: Instant::now(),
                     jti: None,
+                    leg_deadline: None,
                 };
                 if self.journal_reserve(&call) {
                     self.log_decision(Verdict::StepUp, &call, None);
@@ -488,18 +536,19 @@ impl Actor {
     }
 
     /// Steps 3 and 4: the re-check, the request, the point of forwarding and the worker.
-    fn forward(&mut self, call: Call) {
+    /// Whether the call went to its worker; if not, it has been ended and answered.
+    fn forward(&mut self, call: Call) -> bool {
         if self.ended {
             self.unforward(&call);
             answer(&call.reply, CallReply::Denied);
-            return;
+            return false;
         }
         if let Err(error) = self.engine.recheck_before_forward(&call.engine_id) {
             self.log_decision(Verdict::Deny, &call, Some(format!("recheck: {error:?}")));
             self.unforward(&call);
             let refusal = self.ratchet(CallReply::Denied);
             answer(&call.reply, refusal);
-            return;
+            return false;
         }
         let Some((request, jti)) = self.build_request(&call) else {
             self.log_decision(
@@ -509,7 +558,7 @@ impl Actor {
             );
             self.unforward(&call);
             answer(&call.reply, CallReply::Unavailable);
-            return;
+            return false;
         };
         let mut call = call;
         call.jti = Some(jti);
@@ -533,7 +582,15 @@ impl Actor {
         if worker.is_err() {
             self.unforward(&call);
             answer(&call.reply, CallReply::Unavailable);
-            return;
+            return false;
+        }
+        // RV3 A6: the allow record is flushed before the upstream write. Before the point of
+        // forwarding too, so a log that cannot take it stops the call: an execution with no
+        // `allow` reads as a bypass (§2a).
+        if !self.log_decision(Verdict::Allow, &call, None) {
+            self.unforward(&call);
+            answer(&call.reply, CallReply::Unavailable);
+            return false;
         }
         if let Some(rid) = call.rid {
             // P1: a payment's point of forwarding is the fsync of its forwarded record.
@@ -546,26 +603,30 @@ impl Actor {
             {
                 self.unforward(&call);
                 answer(&call.reply, CallReply::Unavailable);
-                return;
+                return false;
             }
             if self.engine.mark_forwarded(rid).is_err() {
                 // Unreachable after the re-check; the journal says forwarded, so the
                 // reservation stays counted, and replay restores it as unresolved.
                 answer(&call.reply, CallReply::Unavailable);
-                return;
+                return false;
             }
         }
-        // RV3 A6: the allow record is flushed before the upstream write.
-        self.log_decision(Verdict::Allow, &call, None);
         let pep_id = call.pep_id.clone();
+        // A deadline beyond the clock's range is no watchdog; the worker's own still applies.
+        call.leg_deadline = Instant::now()
+            .checked_add(self.services.upstream_timeout)
+            .and_then(|deadline| deadline.checked_add(LEG_MARGIN));
         self.legs.insert(pep_id.clone(), call);
         if go.send(request).is_err() {
-            // The worker is gone: the leg ends as a failure, settled on the host path.
-            // The actor holds its own sender, so this cannot fail.
-            let _ = self
-                .events
-                .event(HostEvent::Upstream { pep_id, body: None });
+            // The worker is gone before it got the request: the leg ends as a failure, settled
+            // on the host path. The actor holds its own sender, so this cannot fail.
+            let _ = self.events.event(HostEvent::Upstream {
+                pep_id,
+                body: Err(UpstreamFailure::NotSent),
+            });
         }
+        true
     }
 
     /// The Call Proof and the upstream request, built while a payment is still `Held`.
@@ -605,19 +666,22 @@ impl Actor {
             payment,
         };
         let proof = issue_call_proof(&services.proof_key, &claims).ok()?;
-        forward::tools_call_request(
+        let request = forward::tools_call_request(
             &call.pep_id,
             &tool.server_id,
             &call.tool,
             &call.arguments,
             &proof,
         )
-        .ok()
-        .map(|request| (request, jti))
+        .ok()?;
+        // RV5 V2: the PEP's own `_meta` is larger than the agent's, so the engine can accept a
+        // request the broker would refuse. Find out here, before the point of forwarding.
+        forward::within_request_profile(&request.body).then_some((request, jti))
     }
 
-    /// Writes a decision record for `call`, with its payment's fields when it has one.
-    fn log_decision(&self, verdict: Verdict, call: &Call, reason: Option<String>) {
+    /// Writes a decision record for `call`, with its payment's fields when it has one. `false` if
+    /// the log could not take it.
+    fn log_decision(&self, verdict: Verdict, call: &Call, reason: Option<String>) -> bool {
         let eid = self.eid();
         let state = self.engine.state();
         let reservation = call.rid.and_then(|rid| state.budget.reservations.get(&rid));
@@ -641,7 +705,7 @@ impl Actor {
                 upstream_id: Some(&call.pep_id),
             },
             unix_ms(),
-        );
+        )
     }
 
     /// Writes the outcome record of `call`.
@@ -711,7 +775,10 @@ impl Actor {
         true
     }
 
-    fn expire(&mut self, now: Instant) {
+    /// Ends every step-up wait past its deadline, and every upstream leg whose worker has not
+    /// reported by its own. A worker's deadline should end the leg first; this one is what
+    /// holds if it does not, so an episode can always finish. A late report finds no leg.
+    fn expire(&mut self, host: &HostAuthority, now: Instant) {
         let expired: Vec<String> = self
             .waiting
             .iter()
@@ -724,19 +791,46 @@ impl Actor {
                 answer(&call.reply, CallReply::Denied);
             }
         }
+        let overdue: Vec<String> = self
+            .legs
+            .iter()
+            .filter(|(_, call)| call.leg_deadline.is_some_and(|deadline| deadline <= now))
+            .map(|(pep_id, _)| pep_id.clone())
+            .collect();
+        for pep_id in overdue {
+            self.on_upstream(host, &pep_id, Err(UpstreamFailure::Lost));
+        }
     }
 
     /// The host path: the only handler that takes `&HostAuthority`.
     fn on_host(&mut self, host: &HostAuthority, event: HostEvent) {
         match event {
             HostEvent::Upstream { pep_id, body } => {
-                self.on_upstream(host, &pep_id, body.as_deref());
+                self.on_upstream(host, &pep_id, body.as_deref().map_err(|failure| *failure));
             }
-            HostEvent::Control(HostMessage::Approve { approval, reply }) => {
-                drop(reply.try_send(self.approve(host, &approval)));
+            HostEvent::Control(HostMessage::Approve {
+                approval,
+                until,
+                reply,
+            }) => {
+                let result = if Instant::now() < until {
+                    self.approve(host, &approval)
+                } else {
+                    Err(ControlError::Unavailable)
+                };
+                drop(reply.try_send(result));
             }
-            HostEvent::Control(HostMessage::Decline { approval, reply }) => {
-                drop(reply.try_send(self.decline(&approval)));
+            HostEvent::Control(HostMessage::Decline {
+                approval,
+                until,
+                reply,
+            }) => {
+                let result = if Instant::now() < until {
+                    self.decline(&approval)
+                } else {
+                    Err(ControlError::Unavailable)
+                };
+                drop(reply.try_send(result));
             }
             HostEvent::Control(HostMessage::TrustedInput {
                 input_id,
@@ -809,8 +903,12 @@ impl Actor {
             .waiting
             .remove(&pep_id)
             .ok_or(ControlError::NotAwaiting)?;
-        self.forward(call);
-        Ok(())
+        // Approved, but the re-check can still stop it: the operator must not read that as paid.
+        if self.forward(call) {
+            Ok(())
+        } else {
+            Err(ControlError::Refused)
+        }
     }
 
     fn decline(&mut self, approval: &Approval) -> Result<(), ControlError> {
@@ -826,29 +924,46 @@ impl Actor {
 
     fn pending(&self) -> Vec<PendingPayment> {
         let eid = self.eid();
-        let reservations = &self.engine.state().budget.reservations;
+        let state = self.engine.state();
+        let reservations = &state.budget.reservations;
+        let currency = &state.intent.limits.currency;
         self.waiting
             .values()
             .filter_map(|(call, _)| {
                 let rid = call.rid?;
+                let reservation = reservations.get(&rid)?;
                 Some(PendingPayment {
                     eid,
                     rid,
                     tool: call.tool.clone(),
-                    arguments: call.arguments.clone(),
+                    entity: reservation.entity.clone(),
                     action_digest: call.action_digest.clone(),
-                    amount_minor: reservations.get(&rid)?.amount_minor,
+                    amount_minor: reservation.amount_minor,
+                    currency: currency.clone(),
                 })
             })
             .collect()
     }
 
     /// Step 5: the broker's reply. A payment ends only through its explicit outcome (P1).
-    fn on_upstream(&mut self, host: &HostAuthority, pep_id: &str, body: Option<&[u8]>) {
+    fn on_upstream(
+        &mut self,
+        host: &HostAuthority,
+        pep_id: &str,
+        body: Result<&[u8], UpstreamFailure>,
+    ) {
         let Some(call) = self.legs.remove(pep_id) else {
             return;
         };
-        let reply = body.and_then(|body| forward::read_upstream_reply(body, pep_id).ok());
+        let reply = match body {
+            Ok(body) => forward::read_upstream_reply(body, pep_id).ok(),
+            // Nothing was forwarded: the same as the broker's explicit refusal with no result.
+            Err(UpstreamFailure::NotSent) => Some(UpstreamReply {
+                outcome: Some(BrokerOutcome::Refused),
+                result: None,
+            }),
+            Err(UpstreamFailure::Lost) => None,
+        };
         let (outcome, ending) = match call.rid {
             Some(rid) => self.settle_payment(host, &call, rid, reply),
             None => {
@@ -893,11 +1008,11 @@ impl Actor {
             (BrokerOutcome::Refused, Some(result)) => {
                 // P1: record first, because the release drops the call from `in_flight`.
                 let recorded = self.record(&call.engine_id, &result);
-                let refused = Settlement::Aborted(AbortOutcome::DefinitelyNotExecuted);
-                // A leg's reservation is Forwarded, so settle cannot refuse it.
-                let _ = self.engine.settle(host, rid, refused);
-                self.journal_outcome(rid, OutcomeKind::Refused);
-                (recorded, Ending::Refused)
+                // A result with a refusal is the tool's own word, so it counts (RV5 D6). A leg's
+                // reservation is Forwarded, so settle cannot refuse it.
+                let _ = self.engine.settle(host, rid, Settlement::Declined);
+                self.journal_outcome(rid, OutcomeKind::Declined);
+                (recorded, Ending::Declined)
             }
             (BrokerOutcome::Refused, None) => {
                 let refused = Settlement::Aborted(AbortOutcome::DefinitelyNotExecuted);
@@ -955,8 +1070,8 @@ impl Actor {
 mod tests {
     use super::*;
     use crate::engine::{
-        Entities, EntitySet, InMemoryLabelStore, Ledger, Limits, PepIntent, SeqPolicy,
-        ServerStates, Shared, UnresolvedEntities, encode_ulid,
+        Entities, EntityClaims, EntitySet, InMemoryLabelStore, Ledger, Limits, PepIntent,
+        SeqPolicy, ServerStates, Shared, UnresolvedEntities, encode_ulid,
     };
     use crate::jcs::{self, ParseOptions};
     use crate::journal::{Journal, spawn_writer};
@@ -979,7 +1094,7 @@ mod tests {
             "result_amount_pointer":"/structuredContent/amount_due_minor","result_currency_pointer":"/structuredContent/currency"},
           "max_result_bytes":65536,"max_result_nodes":1024}},
         "get_secret":{"definition":{"name":"get_secret"},"policy":{"effect":"read","args":[{"pointer":"/id","role":"data"}],
-          "sink_clearance":"secret","output_label":{"conf":"secret","integ":"untrusted_external"},"max_result_bytes":65536,"max_result_nodes":1024}}}}}}"#;
+          "sink_clearance":"confidential","output_label":{"conf":"secret","integ":"untrusted_external"},"max_result_bytes":65536,"max_result_nodes":1024}}}}}}"#;
 
     static COUNTER: AtomicUsize = AtomicUsize::new(0);
 
@@ -991,6 +1106,36 @@ mod tests {
         requests: Mutex<Vec<JcsValue>>,
     }
 
+    /// Answers `failure` to a payment, and otherwise as `inner` does; or, with no failure, never
+    /// answers a payment at all, like a worker stuck in a system call.
+    #[derive(Debug)]
+    struct Failing {
+        inner: Arc<FakeBroker>,
+        failure: Option<UpstreamFailure>,
+    }
+
+    impl Upstream for Failing {
+        fn call(
+            &self,
+            request: &UpstreamRequest,
+            timeout: Duration,
+        ) -> Result<Vec<u8>, UpstreamFailure> {
+            if request
+                .headers
+                .iter()
+                .any(|(_, value)| value == "pay_invoice")
+            {
+                match self.failure {
+                    Some(failure) => return Err(failure),
+                    None => loop {
+                        thread::park();
+                    },
+                }
+            }
+            self.inner.call(request, timeout)
+        }
+    }
+
     impl fmt::Debug for FakeBroker {
         fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
             formatter.write_str("FakeBroker")
@@ -998,12 +1143,19 @@ mod tests {
     }
 
     impl Upstream for FakeBroker {
-        fn call(&self, request: &UpstreamRequest, _timeout: Duration) -> Option<Vec<u8>> {
-            let body = jcs::parse(&request.body).ok()?;
-            let id = body.get("id")?.as_str()?.to_owned();
-            let tool = body.pointer("/params/name")?.as_str()?.to_owned();
-            self.requests.lock().unwrap().push(body);
-            (self.script)(&tool, &id).map(String::into_bytes)
+        fn call(
+            &self,
+            request: &UpstreamRequest,
+            _timeout: Duration,
+        ) -> Result<Vec<u8>, UpstreamFailure> {
+            let answer = || {
+                let body = jcs::parse(&request.body).ok()?;
+                let id = body.get("id")?.as_str()?.to_owned();
+                let tool = body.pointer("/params/name")?.as_str()?.to_owned();
+                self.requests.lock().unwrap().push(body);
+                (self.script)(&tool, &id).map(String::into_bytes)
+            };
+            answer().ok_or(UpstreamFailure::Lost)
         }
     }
 
@@ -1056,6 +1208,23 @@ mod tests {
     }
 
     fn start(broker: FakeBroker, step_up_timeout: Duration) -> Harness {
+        start_on(
+            broker,
+            step_up_timeout,
+            Duration::from_secs(5),
+            None,
+            DecisionLog::disabled(),
+        )
+    }
+
+    /// `wrap`, if given, turns the broker into the actor's upstream.
+    fn start_on(
+        broker: FakeBroker,
+        step_up_timeout: Duration,
+        upstream_timeout: Duration,
+        wrap: Option<&dyn Fn(Arc<FakeBroker>) -> Arc<dyn Upstream>>,
+        log: DecisionLog,
+    ) -> Harness {
         let n = COUNTER.fetch_add(1, Ordering::SeqCst);
         let dir = std::env::temp_dir().join(format!("pep-actor-{}-{n}", std::process::id()));
         fs::create_dir(&dir).unwrap();
@@ -1072,6 +1241,7 @@ mod tests {
             labels: Arc::new(InMemoryLabelStore::with_capacity(1000)),
             servers: servers.clone(),
             unresolved: Arc::new(UnresolvedEntities::empty()),
+            claims: Arc::new(EntityClaims::empty()),
         };
         let intent = PepIntent {
             episode_id: EID,
@@ -1084,6 +1254,7 @@ mod tests {
                 cumulative_max_minor: 500_000,
                 max_calls: 5,
                 step_up_over_minor: 50_000,
+                max_declines: 3,
             },
             entities: Entities {
                 ids: EntitySet::InvoiceIds(["INV-1001".to_owned()].into()),
@@ -1106,12 +1277,15 @@ mod tests {
             journal: handle,
             proof_key: Es256Signer::from_secret_bytes(&[7; 32]).unwrap(),
             entropy: Mutex::new(Box::new(io::repeat(0x5a))),
-            upstream: broker.clone(),
+            upstream: wrap.map_or_else(
+                || -> Arc<dyn Upstream> { broker.clone() },
+                |wrap| wrap(broker.clone()),
+            ),
             pins: lockfile.pins,
             step_up_timeout,
-            upstream_timeout: Duration::from_secs(5),
+            upstream_timeout,
             now: || Ok(1_800_000_000),
-            log: Arc::new(DecisionLog::disabled()),
+            log: Arc::new(log),
         });
         let exited = Arc::new(Mutex::new(None));
         let slot = exited.clone();
@@ -1369,7 +1543,7 @@ mod tests {
     #[test]
     fn broker_outcomes_settle_the_payment() {
         for (outcome_text, expected, reply_is_result) in [
-            (Some("refused"), OutcomeKind::Refused, true),
+            (Some("refused"), OutcomeKind::Declined, true),
             (Some("pending"), OutcomeKind::Unknown, false),
             (None, OutcomeKind::Unknown, false),
         ] {
@@ -1422,6 +1596,7 @@ mod tests {
         assert_eq!(
             harness.host(|reply| HostMessage::Approve {
                 approval: wrong_amount,
+                until: Instant::now() + WAIT,
                 reply
             }),
             Err(ControlError::Mismatch)
@@ -1431,6 +1606,7 @@ mod tests {
         assert_eq!(
             harness.host(|reply| HostMessage::Approve {
                 approval: wrong_digest,
+                until: Instant::now() + WAIT,
                 reply
             }),
             Err(ControlError::Mismatch)
@@ -1440,6 +1616,7 @@ mod tests {
         assert_eq!(
             harness.host(|reply| HostMessage::Approve {
                 approval: wrong_episode,
+                until: Instant::now() + WAIT,
                 reply
             }),
             Err(ControlError::UnknownEpisode)
@@ -1451,13 +1628,18 @@ mod tests {
         assert_eq!(
             harness.host(|reply| HostMessage::Approve {
                 approval: other_rid,
+                until: Instant::now() + WAIT,
                 reply
             }),
             Err(ControlError::NotAwaiting)
         );
         let approval = harness.approval(1, 60_000);
         assert_eq!(
-            harness.host(|reply| HostMessage::Approve { approval, reply }),
+            harness.host(|reply| HostMessage::Approve {
+                approval,
+                until: Instant::now() + WAIT,
+                reply,
+            }),
             Ok(())
         );
         assert!(matches!(
@@ -1486,6 +1668,7 @@ mod tests {
         assert_eq!(
             harness.host(|reply| HostMessage::Decline {
                 approval: approval.clone(),
+                until: Instant::now() + WAIT,
                 reply
             }),
             Ok(())
@@ -1494,7 +1677,11 @@ mod tests {
         assert_eq!(strip_digests(harness.payments()), released);
         // A late approval finds nothing waiting (C-CTL).
         assert_eq!(
-            harness.host(|reply| HostMessage::Approve { approval, reply }),
+            harness.host(|reply| HostMessage::Approve {
+                approval,
+                until: Instant::now() + WAIT,
+                reply,
+            }),
             Err(ControlError::NotAwaiting)
         );
         harness.end();
@@ -1525,7 +1712,11 @@ mod tests {
             thread::sleep(Duration::from_millis(5));
         }
         assert_eq!(
-            harness.host(|reply| HostMessage::Approve { approval, reply }),
+            harness.host(|reply| HostMessage::Approve {
+                approval,
+                until: Instant::now() + WAIT,
+                reply,
+            }),
             Err(ControlError::NotAwaiting)
         );
         assert_eq!(strip_digests(harness.payments()), released);
@@ -1545,9 +1736,14 @@ mod tests {
         let (_, answer) = harness.pay(60_000);
         let approval = harness.approval(1, 60_000);
         harness.servers.quarantine("a").unwrap();
+        // The operator hears that it did not go, not a bare `Ok`.
         assert_eq!(
-            harness.host(|reply| HostMessage::Approve { approval, reply }),
-            Ok(())
+            harness.host(|reply| HostMessage::Approve {
+                approval,
+                until: Instant::now() + WAIT,
+                reply,
+            }),
+            Err(ControlError::Refused)
         );
         assert_eq!(answer.recv_timeout(WAIT).unwrap(), CallReply::Denied);
         assert_eq!(
@@ -1604,6 +1800,198 @@ mod tests {
         assert_eq!(denied.recv_timeout(WAIT).unwrap(), CallReply::Denied);
         assert_eq!(harness.records().len(), 1);
         harness.end();
+    }
+
+    // ---- Not sent, or lost (RV5 V2, V3, V4, V12, V13) ----
+
+    /// A harness whose payments fail upstream with `failure`, or hang when it is `None`.
+    fn failing(failure: Option<UpstreamFailure>, upstream_timeout: Duration) -> Harness {
+        start_on(
+            broker(30_000, Some("executed")),
+            WAIT,
+            upstream_timeout,
+            Some(&move |inner| -> Arc<dyn Upstream> { Arc::new(Failing { inner, failure }) }),
+            DecisionLog::disabled(),
+        )
+    }
+
+    #[test]
+    fn a_payment_that_was_not_sent_is_refused_and_the_invoice_stays_payable() {
+        let mut harness = failing(Some(UpstreamFailure::NotSent), WAIT);
+        harness.lookup();
+        for _ in 0..2 {
+            let (_, answer) = harness.pay(30_000);
+            assert_eq!(answer.recv_timeout(WAIT).unwrap(), CallReply::Unavailable);
+            harness.lookup();
+        }
+        assert_eq!(
+            strip_digests(harness.payments()),
+            vec![
+                reserve(1, 30_000),
+                Record::Forwarded { eid: EID, rid: 1 },
+                outcome(1, OutcomeKind::Refused),
+                reserve(2, 30_000),
+                Record::Forwarded { eid: EID, rid: 2 },
+                outcome(2, OutcomeKind::Refused),
+            ]
+        );
+        harness.end();
+    }
+
+    #[test]
+    fn a_payment_whose_reply_was_lost_stays_unresolved() {
+        let mut harness = failing(Some(UpstreamFailure::Lost), WAIT);
+        harness.lookup();
+        let (_, answer) = harness.pay(30_000);
+        assert_eq!(answer.recv_timeout(WAIT).unwrap(), CallReply::Unavailable);
+        harness.lookup();
+        let (_, answer) = harness.pay(30_000);
+        assert_eq!(answer.recv_timeout(WAIT).unwrap(), CallReply::Denied);
+        assert_eq!(
+            strip_digests(harness.payments()),
+            vec![
+                reserve(1, 30_000),
+                Record::Forwarded { eid: EID, rid: 1 },
+                outcome(1, OutcomeKind::Unknown),
+            ]
+        );
+        harness.end();
+    }
+
+    #[test]
+    fn a_worker_that_never_returns_cannot_hold_an_episode_open() {
+        let mut harness = failing(None, Duration::from_millis(10));
+        harness.lookup();
+        let started = Instant::now();
+        let (_, answer) = harness.pay(30_000);
+        assert_eq!(answer.recv_timeout(WAIT).unwrap(), CallReply::Unavailable);
+        assert!(
+            started.elapsed() >= LEG_MARGIN,
+            "the worker's own deadline comes first"
+        );
+        assert_eq!(
+            strip_digests(harness.payments()),
+            vec![
+                reserve(1, 30_000),
+                Record::Forwarded { eid: EID, rid: 1 },
+                outcome(1, OutcomeKind::Unknown),
+            ]
+        );
+        harness.end();
+    }
+
+    #[test]
+    fn an_approval_past_its_deadline_changes_nothing() {
+        // `ask` told the operator it failed, so it must not land later.
+        let mut harness = start(broker(60_000, Some("executed")), WAIT);
+        harness.lookup();
+        let (_, answer) = harness.pay(60_000);
+        let late = harness.approval(1, 60_000);
+        assert_eq!(
+            harness.host(|reply| HostMessage::Approve {
+                approval: late,
+                until: Instant::now(),
+                reply,
+            }),
+            Err(ControlError::Unavailable)
+        );
+        let late = harness.approval(1, 60_000);
+        assert_eq!(
+            harness.host(|reply| HostMessage::Decline {
+                approval: late,
+                until: Instant::now(),
+                reply,
+            }),
+            Err(ControlError::Unavailable)
+        );
+        assert!(answer.try_recv().is_err(), "still waiting");
+        let approval = harness.approval(1, 60_000);
+        assert_eq!(
+            harness.host(|reply| HostMessage::Approve {
+                approval,
+                until: Instant::now() + WAIT,
+                reply,
+            }),
+            Ok(())
+        );
+        assert!(matches!(
+            answer.recv_timeout(WAIT).unwrap(),
+            CallReply::Result(_)
+        ));
+        harness.end();
+    }
+
+    #[test]
+    fn pending_shows_only_what_the_engine_bound() {
+        let mut harness = start(broker(60_000, Some("executed")), WAIT);
+        harness.lookup();
+        let (_, answer) = harness.call(
+            "pay_invoice",
+            r#"{"amount":60000,"currency":"USD","invoice_id":"INV-1001"}"#,
+        );
+        let pending = harness.wait_pending(1);
+        assert_eq!(
+            (
+                pending.entity.as_str(),
+                pending.amount_minor,
+                pending.currency.as_str()
+            ),
+            ("INV-1001", 60_000, "USD")
+        );
+        drop(answer);
+        harness.end();
+    }
+
+    #[test]
+    fn past_its_quota_an_episodes_denials_leave_the_decision_log() {
+        let dir = std::env::temp_dir().join(format!("pep-actor-quota-{}", std::process::id()));
+        drop(fs::remove_dir_all(&dir));
+        fs::create_dir(&dir).unwrap();
+        let path = dir.join("decisions.jsonl");
+        let mut harness = start_on(
+            broker(30_000, Some("executed")),
+            WAIT,
+            Duration::from_secs(5),
+            None,
+            DecisionLog::open(&path, 64 << 20).unwrap(),
+        );
+        for _ in 0..MAX_EPISODE_DENIAL_RECORDS + 5 {
+            let (_, answer) = harness.call("no_such_tool", "{}");
+            assert_eq!(answer.recv_timeout(WAIT).unwrap(), CallReply::Denied);
+        }
+        harness.end();
+        let count = |path: &std::path::Path| {
+            fs::read_to_string(path)
+                .unwrap()
+                .lines()
+                .filter(|line| line.contains(r#""verdict":"deny""#))
+                .count()
+        };
+        assert_eq!(count(&path), MAX_EPISODE_DENIAL_RECORDS);
+        assert_eq!(count(&dir.join("decisions.jsonl.protocol")), 5);
+        drop(fs::remove_dir_all(dir));
+    }
+
+    #[test]
+    fn a_call_the_log_cannot_record_is_not_forwarded() {
+        let dir = std::env::temp_dir().join(format!("pep-actor-log-{}", std::process::id()));
+        drop(fs::remove_dir_all(&dir));
+        fs::create_dir(&dir).unwrap();
+        let path = dir.join("decisions.jsonl");
+        std::os::unix::fs::symlink("/dev/full", &path).unwrap();
+        let mut harness = start_on(
+            broker(30_000, Some("executed")),
+            WAIT,
+            Duration::from_secs(5),
+            None,
+            DecisionLog::open(&path, 1 << 20).unwrap(),
+        );
+        assert_eq!(harness.lookup(), CallReply::Unavailable);
+        let (_, answer) = harness.pay(30_000);
+        assert_eq!(answer.recv_timeout(WAIT).unwrap(), CallReply::Denied);
+        assert!(harness.broker.requests.lock().unwrap().is_empty());
+        harness.end();
+        drop(fs::remove_dir_all(dir));
     }
 
     #[test]

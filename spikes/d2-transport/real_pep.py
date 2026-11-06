@@ -35,7 +35,7 @@ DISCOVER = {"cacheScope": "public", "capabilities": {"tools": {}}, "resultType":
 DEFINITION = {"name": "get_invoice", "description": "Look up an invoice.",
               "inputSchema": {"type": "object", "properties": {"invoice_id": {"type": "string"}}, "required": ["invoice_id"]}}
 pins = {"lockfile_version": 1, "release_epoch": 7, "stores": {"billing://invoices": {"case_insensitive": True}},
-        "servers": {"a": {"endpoint": "unix:a", "identity": "spiffe://tools/a", "protocol_version": "2026-07-28",
+        "servers": {"a": {"endpoint": "unix:" + p("tool-a/tool.sock"), "identity": "spiffe://tools/a", "protocol_version": "2026-07-28",
             "discover": DISCOVER, "tools": {"get_invoice": {"definition": DEFINITION, "policy": {
                 "effect": "read", "args": [{"pointer": "/invoice_id", "role": "store_key"}], "store_uri": "billing://invoices",
                 "sink_clearance": "secret", "output_label": {"conf": "internal", "integ": "trusted"},
@@ -71,7 +71,7 @@ json.dump({
                "read_timeout_ms": 5000, "episode_idle_ms": 600000, "episodes": 4, "call_burst": 50, "call_rate_per_s": 50,
                "clock_skew_ms": 2000, "replay_cache_entries": 1000},
     "intents": {"spike": {"release_epoch": 7, "lockfile_digest": digest,
-        "limits": {"currency": "USD", "per_call_max_minor": 1000, "cumulative_max_minor": 1000, "max_calls": 1, "step_up_over_minor": 1000},
+        "limits": {"currency": "USD", "per_call_max_minor": 1000, "cumulative_max_minor": 1000, "max_calls": 1, "step_up_over_minor": 1000, "max_declines": 1},
         "entities": {"kind": "recipient", "ids": ["rcpt_A"], "per_entity_max_uses": 1}, "seq": "unconstrained"}},
     "pins": pins}, open(p("pep.json"), "w"))
 

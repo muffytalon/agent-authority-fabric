@@ -628,6 +628,31 @@ fn limits_section(mut fields: Fields<'_>) -> Result<RuntimeLimits, LoadError> {
     Ok(limits)
 }
 
+/// Refuses invoice ids that differ only by case, in one intent or across intents. Invoice claims
+/// compare ids exactly (RV5 V1), so two spellings of one invoice in a case-insensitive store
+/// would count as two invoices. Only the operator's config can do this, so it is a load error.
+fn check_invoice_spellings(
+    intents: &BTreeMap<String, IntentConfig>,
+    path: &str,
+) -> Result<(), LoadError> {
+    let mut seen: BTreeMap<String, &str> = BTreeMap::new();
+    for intent in intents.values() {
+        let EntitySet::InvoiceIds(ids) = &intent.intent.entities.ids else {
+            continue;
+        };
+        for id in ids {
+            let spelling = seen.entry(id.to_lowercase()).or_insert(id.as_str());
+            if *spelling != id.as_str() {
+                return Err(LoadError::at(
+                    path,
+                    Problem::Invalid("two invoice ids differ only by case"),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn intents_section(
     value: &JcsValue,
     path: &str,
@@ -645,6 +670,7 @@ fn intents_section(
         intents.insert(name.to_owned(), intent(entry, &entry_path, pins)?);
     }
     fields.done()?;
+    check_invoice_spellings(&intents, path)?;
     if intents.is_empty() {
         return Err(LoadError::at(
             path,
@@ -671,6 +697,7 @@ fn intent(value: &JcsValue, path: &str, pins: &Lockfile) -> Result<IntentConfig,
         cumulative_max_minor: limit_fields.u64("cumulative_max_minor")?,
         max_calls: limit_fields.u32("max_calls")?,
         step_up_over_minor: limit_fields.u64("step_up_over_minor")?,
+        max_declines: limit_fields.u32("max_declines")?,
     };
     limit_fields.done()?;
     let entities = entities(fields.object("entities")?)?;
@@ -853,11 +880,11 @@ mod tests {
         "episode_idle_ms": 600000, "episodes": 8, "call_burst": 10, "call_rate_per_s": 5, "clock_skew_ms": 2000, "replay_cache_entries": 100000},
       "intents": {
         "pay-invoices": {"release_epoch": 7, "lockfile_digest": "@DIGEST@",
-          "limits": {"currency": "USD", "per_call_max_minor": 100000, "cumulative_max_minor": 500000, "max_calls": 5, "step_up_over_minor": 50000},
+          "limits": {"currency": "USD", "per_call_max_minor": 100000, "cumulative_max_minor": 500000, "max_calls": 5, "step_up_over_minor": 50000, "max_declines": 3},
           "entities": {"kind": "invoice", "ids": ["INV-1001", "INV-1002"], "per_entity_max_uses": 1},
           "seq": {"transitions": [[null, "get_invoice"], ["get_invoice", "pay_invoice"]]}},
         "notes": {"release_epoch": 7, "lockfile_digest": "@DIGEST@",
-          "limits": {"currency": "EUR", "per_call_max_minor": 1000, "cumulative_max_minor": 1000, "max_calls": 1, "step_up_over_minor": 1000},
+          "limits": {"currency": "EUR", "per_call_max_minor": 1000, "cumulative_max_minor": 1000, "max_calls": 1, "step_up_over_minor": 1000, "max_declines": 1},
           "entities": {"kind": "recipient", "ids": ["rcpt_A"], "per_entity_max_uses": 2},
           "seq": "unconstrained"}},
       "pins": @PINS@
@@ -1571,13 +1598,96 @@ mod tests {
         assert_eq!(
             error(
                 true,
-                r#""effect": "read", "args": [{"pointer": "/query""#,
-                r#""effect": "external_sink", "args": [{"pointer": "/query""#
+                r#""effect": "read", "args": [{"pointer": "/query", "role": "data"}], "sink_clearance": "secret""#,
+                r#""effect": "external_sink", "args": [{"pointer": "/query", "role": "data"}], "sink_clearance": "internal""#
             ),
             invalid(
                 "pins.servers.b.tools.search_notes.policy",
                 "only a read tool declares reads_stores"
             )
+        );
+    }
+
+    #[test]
+    fn a_decline_limit_is_between_one_and_max_calls() {
+        let limits = r#""max_calls": 5, "step_up_over_minor": 50000, "max_declines": 3"#;
+        let with = |declines: u32| {
+            error(
+                false,
+                limits,
+                &limits.replace(
+                    "\"max_declines\": 3",
+                    &format!("\"max_declines\": {declines}"),
+                ),
+            )
+        };
+        for declines in [0, 6] {
+            let (path, _) = with(declines);
+            assert_eq!(path, "intents.pay-invoices");
+        }
+    }
+
+    #[test]
+    fn two_spellings_of_one_invoice_are_refused() {
+        let (_, problem) = error(
+            false,
+            r#""ids": ["INV-1001", "INV-1002"]"#,
+            r#""ids": ["INV-1001", "inv-1001"]"#,
+        );
+        assert_eq!(
+            problem,
+            Problem::Invalid("two invoice ids differ only by case")
+        );
+    }
+
+    #[test]
+    fn secret_clearance_is_only_for_tools_that_stay_with_the_data() {
+        let clearance = "pins.servers.b.tools.fetch.policy.sink_clearance";
+        // A read tool that reads a pinned store may keep it: its server holds that store.
+        assert!(load_str(&config_with(PINS)).is_ok());
+        // One that does not, may not: its `data` arguments would go out unchecked.
+        assert_eq!(
+            error(
+                true,
+                r#""args": [{"pointer": "/url", "role": "sink_destination"}], "sink_clearance": "public""#,
+                r#""args": [{"pointer": "/url", "role": "data"}], "sink_clearance": "secret""#
+            ),
+            invalid(
+                clearance,
+                "a read tool with data arguments must read a pinned store to be cleared for secret"
+            )
+        );
+        // No sink, and no payment, whose memo would be one.
+        assert_eq!(
+            error(
+                true,
+                r#""effect": "read", "args": [{"pointer": "/url", "role": "sink_destination"}], "sink_clearance": "public""#,
+                r#""effect": "external_sink", "args": [{"pointer": "/url", "role": "sink_destination"}], "sink_clearance": "secret""#
+            ),
+            invalid(
+                clearance,
+                "a sink or a payment cannot be cleared for secret"
+            )
+        );
+        assert_eq!(
+            error(
+                true,
+                r#""sink_clearance": "internal", "output_label": {"conf": "internal", "integ": "untrusted_external"},"#,
+                r#""sink_clearance": "secret", "output_label": {"conf": "internal", "integ": "untrusted_external"},"#
+            ),
+            invalid(
+                "pins.servers.a.tools.pay_invoice.policy.sink_clearance",
+                "a sink or a payment cannot be cleared for secret"
+            )
+        );
+        // And no destination.
+        assert_eq!(
+            error(
+                true,
+                r#""https://partner.example": "confidential""#,
+                r#""https://partner.example": "secret""#
+            ),
+            invalid(clearance, "a destination cannot be cleared for secret")
         );
     }
 

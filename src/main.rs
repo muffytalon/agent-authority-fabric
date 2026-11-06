@@ -19,7 +19,7 @@ use std::io::{self, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::ExitCode;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::Duration;
 
@@ -29,15 +29,19 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use pep_sidecar::actor::Services;
 use pep_sidecar::config::{self, Config};
 use pep_sidecar::decision_log::DecisionLog;
-use pep_sidecar::engine::{HostAuthority, ServerStates, Shared, UnresolvedEntities, encode_ulid};
+use pep_sidecar::engine::{
+    EntityClaims, EntityKind, HostAuthority, MAX_IN_FLIGHT, ServerStates, Shared,
+    UnresolvedEntities, encode_ulid,
+};
+use pep_sidecar::http::Caps;
 use pep_sidecar::jcs;
 use pep_sidecar::journal::{Journal, JournaledLabels, Record, replay, spawn_writer};
 use pep_sidecar::peercred::bind_safe_listener;
 use pep_sidecar::poll::{PollOutcome, poll};
-use pep_sidecar::registry::{Registry, RegistryConfig, new_ulid};
-use pep_sidecar::serve::{AgentContext, ControlContext, accept_loop, serve_agent, serve_control};
+use pep_sidecar::registry::{Registry, RegistryConfig, connection_share, new_ulid};
+use pep_sidecar::serve::{AgentContext, ControlContext, accept_agents, accept_loop, serve_control};
 use pep_sidecar::tokens::{Es256Signer, os_entropy, unix_now};
-use pep_sidecar::upstream::BrokerClient;
+use pep_sidecar::upstream::{BrokerClient, MAX_PENDING_CONNECTS};
 
 /// Largest config file read.
 const MAX_CONFIG_BYTES: u64 = 16 * 1024 * 1024;
@@ -92,6 +96,11 @@ fn millis(duration_ms: u64) -> Duration {
 fn run(path: &Path) -> Result<(), String> {
     // 1. The config, and the host's authority.
     let config = load_config(path)?;
+    check_fd_budget(&config)?;
+    if config.agent.uid == config.operator.uid {
+        // Tests run this way. In production it makes the control socket's peer check empty.
+        log("pep-sidecar: warning: the agent and the operator share a uid");
+    }
     let host = Arc::new(
         HostAuthority::claim()
             .ok_or_else(|| "the host authority was already claimed".to_owned())?,
@@ -131,10 +140,27 @@ fn run(path: &Path) -> Result<(), String> {
             .insert(entity)
             .map_err(|error| format!("unresolved set: {error}"))?;
     }
+    // The invoices earlier boots paid or left unresolved (RV5 V1). An intent the config no longer
+    // names may have been an invoice intent, so it counts (fail closed).
+    let claims = Arc::new(EntityClaims::empty());
+    for (intent, ledger) in &replayed.ledgers {
+        let recipients = config
+            .intents
+            .get(intent)
+            .is_some_and(|known| known.intent.entities.ids.kind() == EntityKind::Recipient);
+        if !recipients {
+            for (entity, uses) in &ledger.entity_uses {
+                claims
+                    .restore(entity, *uses)
+                    .map_err(|error| format!("invoice claims: {error}"))?;
+            }
+        }
+    }
     let shared = Shared {
         labels,
         servers: servers.clone(),
         unresolved,
+        claims,
     };
 
     // 4. This boot's keys.
@@ -178,6 +204,7 @@ fn run(path: &Path) -> Result<(), String> {
             pins: config.pins.pins.clone(),
             agent_uid: config.agent.uid,
             episodes: limits.episodes,
+            connection_share: connection_share(limits.connections, limits.episodes),
             call_burst: limits.call_burst,
             call_rate_per_s: limits.call_rate_per_s,
             idle_secs: limits.episode_idle_ms.checked_div(1000).unwrap_or(0),
@@ -197,15 +224,20 @@ fn run(path: &Path) -> Result<(), String> {
         host: host.clone(),
         peer: config.operator.clone(),
         read_timeout,
+        log: decisions.clone(),
     };
     let control_limit = limits.control_connections;
+    // Neither listener outlives the other: a PEP with no control socket has lost its kill
+    // switch, so the whole process stops (fail closed) (RV5 V11).
+    let (stopped, stop) = mpsc::channel::<&'static str>();
+    let control_stopped = stopped.clone();
     thread::Builder::new()
         .name("control".to_owned())
         .spawn(move || {
             accept_loop(control.listener(), control_limit, move |stream| {
                 serve_control(stream, &control_context);
             });
-            log("pep-sidecar: the control socket stopped accepting");
+            let _ = control_stopped.send("the control socket stopped accepting");
         })
         .map_err(|error| format!("control thread: {error}"))?;
 
@@ -240,15 +272,67 @@ fn run(path: &Path) -> Result<(), String> {
         servers,
         peer: config.agent.clone(),
         read_timeout,
+        caps: Caps {
+            head_bytes: limits.header_bytes,
+            body_bytes: limits.body_bytes,
+        },
         call_timeout,
         now: unix_now,
         log: decisions,
     };
     log("pep-sidecar: serving");
-    accept_loop(agent.listener(), limits.connections, move |stream| {
-        serve_agent(stream, &agent_context);
-    });
-    Err("the agent socket stopped accepting".to_owned())
+    let connections = limits.connections;
+    thread::Builder::new()
+        .name("agent".to_owned())
+        .spawn(move || {
+            accept_agents(agent.listener(), connections, agent_context);
+            let _ = stopped.send("the agent socket stopped accepting");
+        })
+        .map_err(|error| format!("agent thread: {error}"))?;
+    Err(stop
+        .recv()
+        .unwrap_or("both sockets stopped accepting")
+        .to_owned())
+}
+
+/// File descriptors the PEP needs beyond its connections: its listeners, locks, journal, logs,
+/// and those of a request being checked.
+const FD_MARGIN: u64 = 64;
+
+/// Refuses to start with a `limits` section the process's `RLIMIT_NOFILE` cannot hold: four per
+/// agent connection (twice `limits.connections` can be open while ended handlers exit, each with
+/// its socket and one clone, the pool's or the disconnect watcher's), two per control connection,
+/// one per upstream leg, and the connects that may still be blocked after their legs ended. Past
+/// that the PEP keeps running, but a call that cannot open its upstream connection fails. Where
+/// `/proc` has no limits file, there is nothing to check.
+fn check_fd_budget(config: &Config) -> Result<(), String> {
+    let Ok(limits) = fs::read_to_string("/proc/self/limits") else {
+        return Ok(());
+    };
+    let soft = limits
+        .lines()
+        .find_map(|line| line.strip_prefix("Max open files"))
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|soft| soft.parse::<u64>().ok());
+    let Some(soft) = soft else {
+        // "unlimited", or no such line.
+        return Ok(());
+    };
+    let as_u64 = |value: usize| u64::try_from(value).unwrap_or(u64::MAX);
+    let limit = &config.limits;
+    let legs = as_u64(limit.episodes).saturating_mul(as_u64(MAX_IN_FLIGHT));
+    let needed = as_u64(limit.connections)
+        .saturating_mul(4)
+        .saturating_add(as_u64(limit.control_connections).saturating_mul(2))
+        .saturating_add(legs)
+        .saturating_add(as_u64(MAX_PENDING_CONNECTS))
+        .saturating_add(FD_MARGIN);
+    if soft < needed {
+        return Err(format!(
+            "RLIMIT_NOFILE is {soft}, and these limits need {needed}: raise it (Compose `ulimits`), or lower limits.connections or limits.episodes"
+        ));
+    }
+    Ok(())
 }
 
 fn load_config(path: &Path) -> Result<Config, String> {

@@ -5,12 +5,13 @@
 //! stops. An intent has at most one live episode, an ended one whose upstream legs are still
 //! running included, and at most `limits.episodes` are live in all (E1).
 //!
-//! Connection threads use only [`Registry::admit`], which verifies an Episode Token and gives
-//! back the episode's [`AgentSender`]. Starting, ending, approving and the rest take
-//! `&HostAuthority` or the episode's [`HostSender`], which only the control thread holds.
+//! Connection threads use only [`Registry::admit`], which admits an Episode Token and gives back
+//! the episode's [`AgentSender`]. Starting, ending, approving and the rest take `&HostAuthority`,
+//! which only the control thread and the actors hold, so F-13's boundary is the compiler's.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Read};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, mpsc};
 use std::time::{Duration, Instant};
 
@@ -18,9 +19,10 @@ use crate::actor::{self, AgentSender, HostMessage, HostSender, Services};
 use crate::config::IntentConfig;
 use crate::control::{ControlError, PendingPayment};
 use crate::engine::{HostAuthority, Ledger, PepEngine, Shared, ToolPins, encode_ulid};
+use crate::jcs;
 use crate::tokens::{
-    EPISODE_MAX_LIFETIME_SECS, EpisodeClaims, EpisodeStates, Es256Signer, Es256Verifier,
-    mint_episode_token, verify_episode_token_with,
+    EPISODE_MAX_LIFETIME_SECS, EpisodeClaims, EpisodeStates, Es256Signer, MAX_TOKEN_BYTES,
+    admit_minted_episode, mint_episode_token,
 };
 
 /// The Week 2 `client_id` claim (E1); Week 5's RAR replaces it.
@@ -41,6 +43,8 @@ pub struct RegistryConfig {
     pub agent_uid: u32,
     /// Live episodes at once (E1).
     pub episodes: usize,
+    /// Admitted connections one episode may hold at once (RV5 D2), [`connection_share`].
+    pub connection_share: usize,
     /// Calls an episode may make at once (T1).
     pub call_burst: u32,
     /// Calls per second an episode may sustain (T1).
@@ -49,6 +53,35 @@ pub struct RegistryConfig {
     pub idle_secs: u64,
     /// Clock skew allowed on token times.
     pub skew_secs: u64,
+}
+
+/// An episode's share of the agent socket's pool. An admitted connection is never evicted, so
+/// without a share one token's slow calls could hold every slot (RV5 D2).
+#[must_use]
+pub fn connection_share(connections: usize, episodes: usize) -> usize {
+    connections.checked_div(episodes).unwrap_or(0).max(1)
+}
+
+/// A connection's admission: the episode's sender, and its hold on one of the episode's
+/// connections, given back on drop.
+#[derive(Debug)]
+pub struct Admitted {
+    agent: AgentSender,
+    held: Arc<AtomicUsize>,
+}
+
+impl Admitted {
+    /// The episode's sender.
+    #[must_use]
+    pub const fn agent(&self) -> &AgentSender {
+        &self.agent
+    }
+}
+
+impl Drop for Admitted {
+    fn drop(&mut self) {
+        self.held.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 /// A started episode, as `start_episode` returns it.
@@ -69,6 +102,8 @@ pub enum Admission {
     Denied,
     /// The episode's rate limit, or a PEP fault: `PEP_UNAVAILABLE` (U1 step 15).
     Unavailable,
+    /// The episode already holds its share of connections: `PEP_UNAVAILABLE` (RV5 D2).
+    OverShare,
 }
 
 /// A token bucket, in thousandths of a call, so whole-number arithmetic suffices.
@@ -79,10 +114,12 @@ struct Bucket {
 }
 
 struct Live {
-    intent_digest: String,
+    claims: EpisodeClaims,
+    token_digest: String,
     agent: AgentSender,
     host: HostSender,
     bucket: Bucket,
+    admitted: Arc<AtomicUsize>,
     ending: bool,
 }
 
@@ -90,13 +127,17 @@ struct Inner {
     ledgers: BTreeMap<String, Ledger>,
     live: BTreeMap<u128, Live>,
     busy: BTreeSet<String>,
+    /// The digest of each live episode's token, to its eid. The PEP is the only issuer and the
+    /// only verifier, and a token has one encoding, so a token whose exact bytes this boot did
+    /// not mint is refused with no signature check, and with no crypto under this lock (T1,
+    /// RV5 V6). State stays keyed by eid.
+    by_token: BTreeMap<String, u128>,
 }
 
 /// The PEP's episodes.
 pub struct Registry {
     config: RegistryConfig,
     episode_key: Es256Signer,
-    verifier: Es256Verifier,
     states: EpisodeStates,
     shared: Shared,
     services: Arc<Services>,
@@ -127,7 +168,6 @@ impl Registry {
         let states =
             EpisodeStates::new(MAX_REMEMBERED_EPISODES, config.idle_secs, config.skew_secs);
         Arc::new(Self {
-            verifier: episode_key.verifier(),
             config,
             episode_key,
             states,
@@ -138,6 +178,7 @@ impl Registry {
                 ledgers,
                 live: BTreeMap::new(),
                 busy: BTreeSet::new(),
+                by_token: BTreeMap::new(),
             }),
         })
     }
@@ -219,10 +260,13 @@ impl Registry {
         )
         .map_err(|_| ControlError::Unavailable)?;
         inner.busy.insert(intent_name.to_owned());
+        let token_digest = jcs::sha256_b64url(token.as_bytes());
+        inner.by_token.insert(token_digest.clone(), eid);
         inner.live.insert(
             eid,
             Live {
-                intent_digest: intent.intent_digest,
+                claims,
+                token_digest,
                 agent,
                 host: host_sender,
                 bucket: Bucket {
@@ -232,6 +276,7 @@ impl Registry {
                         .unwrap_or(0),
                     last_ms: self.now_ms(),
                 },
+                admitted: Arc::new(AtomicUsize::new(0)),
                 ending: false,
             },
         );
@@ -245,7 +290,9 @@ impl Registry {
         if let Ok(mut inner) = self.inner.lock() {
             inner.ledgers.insert(intent.to_owned(), ledger);
             inner.busy.remove(intent);
-            inner.live.remove(&eid);
+            if let Some(live) = inner.live.remove(&eid) {
+                inner.by_token.remove(&live.token_digest);
+            }
         }
     }
 
@@ -297,7 +344,7 @@ impl Registry {
     /// # Errors
     ///
     /// Returns [`ControlError::UnknownEpisode`] if the episode is not live.
-    pub fn host(&self, eid: u128) -> Result<HostSender, ControlError> {
+    pub fn host(&self, _host: &HostAuthority, eid: u128) -> Result<HostSender, ControlError> {
         self.lock()?
             .live
             .get(&eid)
@@ -308,7 +355,7 @@ impl Registry {
 
     /// Every payment awaiting approval, in every live episode.
     #[must_use]
-    pub fn pending(&self) -> Vec<PendingPayment> {
+    pub fn pending(&self, _host: &HostAuthority) -> Vec<PendingPayment> {
         let senders: Vec<HostSender> = match self.inner.lock() {
             Ok(inner) => inner.live.values().map(|live| live.host.clone()).collect(),
             Err(_) => Vec::new(),
@@ -331,31 +378,35 @@ impl Registry {
         self.inner.lock().ok()?.ledgers.get(intent).cloned()
     }
 
-    /// Admits one use of `token` on a connection from `peer_uid` (U1 steps 14 and 15): the
-    /// token must verify, name a live episode with its own intent's digest, and find a call in
-    /// the episode's rate bucket.
+    /// Admits one use of `token` on a connection from `peer_uid` (U1 steps 14 and 15): its
+    /// exact bytes must be those of a live episode's token, and it must find a call in the
+    /// episode's rate bucket and a connection in its share.
     ///
     /// # Errors
     ///
-    /// Returns [`Admission::Denied`] for the token, or [`Admission::Unavailable`] for the rate
-    /// limit or a PEP fault.
-    pub fn admit(&self, token: &str, peer_uid: u32, now: u64) -> Result<AgentSender, Admission> {
+    /// Returns [`Admission::Denied`] for the token, [`Admission::Unavailable`] for the rate limit
+    /// or a PEP fault, or [`Admission::OverShare`] past the episode's share of connections.
+    pub fn admit(&self, token: &str, peer_uid: u32, now: u64) -> Result<Admitted, Admission> {
+        if token.len() > MAX_TOKEN_BYTES {
+            return Err(Admission::Denied);
+        }
+        // Outside the lock: every episode and the control socket need it.
+        let digest = jcs::sha256_b64url(token.as_bytes());
+        let now_ms = self.now_ms();
         let mut inner = self.inner.lock().map_err(|_| Admission::Unavailable)?;
-        let claims = verify_episode_token_with(
-            token,
-            &self.verifier,
+        let eid = *inner.by_token.get(&digest).ok_or(Admission::Denied)?;
+        let config = &self.config;
+        let live = inner.live.get_mut(&eid).ok_or(Admission::Denied)?;
+        // An ended episode's tokens are refused by the token table (T1), which `end` updates
+        // before the actor hears of it.
+        admit_minted_episode(
+            &live.claims,
             peer_uid,
-            self.config.pins.release_epoch,
-            // An ended episode's tokens are refused by the token table (T1), which `end`
-            // updates before the actor hears of it.
-            |eid| inner.live.get(&eid).map(|live| live.intent_digest.clone()),
+            config.pins.release_epoch,
             &self.states,
             now,
         )
         .map_err(|_| Admission::Denied)?;
-        let now_ms = self.now_ms();
-        let config = &self.config;
-        let live = inner.live.get_mut(&claims.eid).ok_or(Admission::Denied)?;
         if !take(
             &mut live.bucket,
             now_ms,
@@ -364,7 +415,16 @@ impl Registry {
         ) {
             return Err(Admission::Unavailable);
         }
-        Ok(live.agent.clone())
+        let share = config.connection_share;
+        let held = Arc::clone(&live.admitted);
+        held.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
+            (count < share).then(|| count.saturating_add(1))
+        })
+        .map_err(|_| Admission::OverShare)?;
+        Ok(Admitted {
+            agent: live.agent.clone(),
+            held,
+        })
     }
 
     /// A fresh PEP-assigned id for one agent call (M1): a ULID, unique across boots.
@@ -444,10 +504,10 @@ pub fn new_ulid(entropy: &mut dyn Read, now_ms: u64) -> io::Result<u128> {
 )]
 mod tests {
     use super::*;
-    use crate::actor::Upstream;
+    use crate::actor::{Upstream, UpstreamFailure};
     use crate::engine::{
-        Confidentiality, Entities, EntitySet, InMemoryLabelStore, Limits, PepIntent, SeqPolicy,
-        ServerStates, UnresolvedEntities,
+        Confidentiality, Entities, EntityClaims, EntitySet, InMemoryLabelStore, Limits, PepIntent,
+        SeqPolicy, ServerStates, UnresolvedEntities,
     };
     use crate::forward::UpstreamRequest;
     use crate::jcs::{self, ParseOptions};
@@ -460,7 +520,7 @@ mod tests {
     const PINS: &str = r#"{"lockfile_version":1,"release_epoch":7,"stores":{},
       "servers":{"a":{"endpoint":"http://a/mcp","identity":"spiffe://a","protocol_version":"2026-07-28","discover":{},"tools":{
         "get_ticket":{"definition":{"name":"get_ticket"},"policy":{"effect":"read","args":[{"pointer":"/id","role":"data"}],
-          "sink_clearance":"secret","output_label":{"conf":"internal","integ":"untrusted_external"},"max_result_bytes":65536,"max_result_nodes":1024}}}}}}"#;
+          "sink_clearance":"confidential","output_label":{"conf":"internal","integ":"untrusted_external"},"max_result_bytes":65536,"max_result_nodes":1024}}}}}}"#;
     const AGENT: u32 = 20_001;
 
     static COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -469,8 +529,8 @@ mod tests {
     struct Silent;
 
     impl Upstream for Silent {
-        fn call(&self, _: &UpstreamRequest, _: Duration) -> Option<Vec<u8>> {
-            None
+        fn call(&self, _: &UpstreamRequest, _: Duration) -> Result<Vec<u8>, UpstreamFailure> {
+            Err(UpstreamFailure::Lost)
         }
     }
 
@@ -490,9 +550,9 @@ mod tests {
     struct Slow(Duration);
 
     impl Upstream for Slow {
-        fn call(&self, _: &UpstreamRequest, _: Duration) -> Option<Vec<u8>> {
+        fn call(&self, _: &UpstreamRequest, _: Duration) -> Result<Vec<u8>, UpstreamFailure> {
             thread::sleep(self.0);
-            None
+            Err(UpstreamFailure::Lost)
         }
     }
 
@@ -528,6 +588,7 @@ mod tests {
                     cumulative_max_minor: 100,
                     max_calls: 1,
                     step_up_over_minor: 100,
+                    max_declines: 1,
                 },
                 entities: Entities {
                     ids: EntitySet::RecipientIds(["rcpt_A".to_owned()].into()),
@@ -542,6 +603,7 @@ mod tests {
             labels: Arc::new(InMemoryLabelStore::with_capacity(100)),
             servers,
             unresolved: Arc::new(UnresolvedEntities::empty()),
+            claims: Arc::new(EntityClaims::empty()),
         };
         let services = Arc::new(Services {
             host: Arc::new(HostAuthority::for_tests()),
@@ -563,6 +625,7 @@ mod tests {
             pins: lockfile.pins,
             agent_uid: AGENT,
             episodes,
+            connection_share: 2,
             call_burst,
             call_rate_per_s: 1,
             idle_secs,
@@ -660,10 +723,11 @@ mod tests {
         let fixture = fixture_with(Arc::new(Slow(Duration::from_millis(400))), 1, 10, 1800);
         let registry = &fixture.registry;
         let started = registry.start(&host(), "a").unwrap();
-        let agent = registry.admit(&started.token, AGENT, now()).unwrap();
+        let admitted = registry.admit(&started.token, AGENT, now()).unwrap();
         let pep_id = encode_ulid(42);
         let (reply, answer) = mpsc::sync_channel(1);
-        agent
+        admitted
+            .agent()
             .send(actor::AgentMessage::Call {
                 pep_id: pep_id.clone(),
                 request: format!(
@@ -698,7 +762,7 @@ mod tests {
         let first = registry.start(&host(), "a").unwrap();
         let (reply, answer) = mpsc::sync_channel(1);
         registry
-            .host(first.eid)
+            .host(&host(), first.eid)
             .unwrap()
             .send(HostMessage::TrustedInput {
                 input_id: "u1".to_owned(),
@@ -710,7 +774,7 @@ mod tests {
         assert_eq!(answer.recv_timeout(Duration::from_secs(5)).unwrap(), Ok(()));
         registry.end(&host(), first.eid).unwrap();
         assert_eq!(
-            registry.host(first.eid).err(),
+            registry.host(&host(), first.eid).err(),
             Some(ControlError::UnknownEpisode)
         );
         // The next episode of the intent starts from the first one's ledger (R1).
@@ -721,6 +785,28 @@ mod tests {
             Confidentiality::Confidential
         );
         registry.end(&host(), second.eid).unwrap();
+    }
+
+    #[test]
+    fn an_episode_holds_at_most_its_share_of_connections() {
+        assert_eq!(connection_share(32, 4), 8);
+        assert_eq!(connection_share(4, 8), 1, "never none");
+        assert_eq!(connection_share(4, 0), 1);
+        let fixture = fixture(2, 50, 1800);
+        let registry = &fixture.registry;
+        let first = registry.start(&host(), "a").unwrap();
+        let second = registry.start(&host(), "b").unwrap();
+        let held: Vec<_> = (0..2)
+            .map(|_| registry.admit(&first.token, AGENT, now()).unwrap())
+            .collect();
+        assert_eq!(
+            registry.admit(&first.token, AGENT, now()).err(),
+            Some(Admission::OverShare)
+        );
+        // Another episode's share is its own.
+        assert!(registry.admit(&second.token, AGENT, now()).is_ok());
+        drop(held);
+        assert!(registry.admit(&first.token, AGENT, now()).is_ok());
     }
 
     #[test]

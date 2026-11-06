@@ -11,12 +11,18 @@
 //!
 //! [`accept_loop`] runs a listener with its own connection limit: past it, a connection is
 //! closed at once with no reply (U1 step 0b), and the control socket's limit is its own (H1).
+//! [`accept_agents`] runs the agent socket the same way, except that a full pool first ends the
+//! connection that has been sending its request the longest, so connections that send nothing
+//! cannot lock out an agent that does (RV5 V7). A failed `accept` is not fatal unless the
+//! listener itself is broken: running out of file descriptors must not stop the PEP (RV5 V10,
+//! V11).
 
-use std::io::{Read, Write};
+use std::collections::VecDeque;
+use std::io::{self, Read};
 use std::net::Shutdown;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -25,7 +31,7 @@ use crate::config::Peer;
 use crate::control::{self, ControlError, ControlRequest};
 use crate::decision_log::{Decision, DecisionLog, Verdict, unix_ms};
 use crate::engine::{HostAuthority, ServerState, ServerStates};
-use crate::http::{self, Deadlines, HttpError, Status};
+use crate::http::{self, Caps, Deadlines, HttpError, Status, time_left, write_by};
 use crate::lockfile::Lockfile;
 use crate::mcp::{self, AgentRequest, Inbound, Method, Reply};
 use crate::peercred::require_peer;
@@ -50,6 +56,8 @@ pub struct AgentContext {
     pub peer: Peer,
     /// The deadline for a whole request.
     pub read_timeout: Duration,
+    /// The limits on a request (`limits.header_bytes`, `limits.body_bytes`).
+    pub caps: Caps,
     /// The longest the actor may take to answer a call: the step-up wait plus the upstream
     /// leg, plus a margin.
     pub call_timeout: Duration,
@@ -70,6 +78,8 @@ pub struct ControlContext {
     pub peer: Peer,
     /// The deadline for a whole request.
     pub read_timeout: Duration,
+    /// The decision log, for refused peers.
+    pub log: Arc<DecisionLog>,
 }
 
 /// Accepts connections on `listener` and serves each on its own thread with `serve`, at most
@@ -78,18 +88,32 @@ pub fn accept_loop<F>(listener: &UnixListener, limit: usize, serve: F)
 where
     F: Fn(UnixStream) + Send + Sync + 'static,
 {
+    // U1 step 0b: closed at once, with no reply.
+    accept_loop_with(listener, limit, serve, drop);
+}
+
+/// [`accept_loop`], with `overflow` given each connection past the limit, on the accept thread.
+pub fn accept_loop_with<F, O>(listener: &UnixListener, limit: usize, serve: F, overflow: O)
+where
+    F: Fn(UnixStream) + Send + Sync + 'static,
+    O: Fn(UnixStream),
+{
     let serve = Arc::new(serve);
     let active = Arc::new(AtomicUsize::new(0));
     for stream in listener.incoming() {
-        let Ok(stream) = stream else {
-            return;
+        let stream = match stream {
+            Ok(stream) => stream,
+            Err(error) if listener_is_broken(&error) => return,
+            Err(_) => {
+                thread::sleep(ACCEPT_BACKOFF);
+                continue;
+            }
         };
         let taken = active.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
             (count < limit).then(|| count.saturating_add(1))
         });
         if taken.is_err() {
-            // U1 step 0b: closed at once, with no reply.
-            drop(stream);
+            overflow(stream);
             continue;
         }
         let serve = Arc::clone(&serve);
@@ -106,6 +130,207 @@ where
     }
 }
 
+/// How long the accept thread waits after a failed `accept`, so running out of file descriptors
+/// is no busy loop: the connection stays in the backlog until one is free.
+const ACCEPT_BACKOFF: Duration = Duration::from_millis(50);
+/// How long a connection has to send its request, or be answered, before a full pool may end it.
+/// Long enough for a handler to get the CPU on a loaded machine; a client that sends at once
+/// needs a fraction of it.
+const EVICT_GRACE: Duration = Duration::from_millis(5);
+/// How often the accept thread looks again while it waits for a slot.
+const EXIT_WAIT: Duration = Duration::from_micros(200);
+/// The longest it waits for one.
+const EXIT_WAIT_MAX: Duration = Duration::from_secs(1);
+
+/// Whether a failed `accept` means the listener itself is broken. Anything else (`EMFILE`,
+/// `ENFILE`, `ENOMEM`, `ENOBUFS`, `ECONNABORTED`, `EINTR`) passes.
+fn listener_is_broken(error: &io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(nix::libc::EBADF | nix::libc::EINVAL | nix::libc::ENOTSOCK | nix::libc::EOPNOTSUPP)
+    )
+}
+
+/// How far a connection has got, for the pool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Progress {
+    /// Its token was admitted, so what it asked for is about to run.
+    Admitted,
+    /// It has its answer, and only the close is left.
+    Answered,
+}
+
+/// One connection that may still be ended.
+#[derive(Debug)]
+struct Evictable {
+    ticket: usize,
+    stream: UnixStream,
+    accepted: Instant,
+    answered: bool,
+}
+
+/// What a full pool could do for a new connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Eviction {
+    /// It ended a connection.
+    Ended,
+    /// Every connection it may end is younger than [`EVICT_GRACE`]: look again soon.
+    TooYoung,
+    /// There is none to end.
+    Nothing,
+}
+
+/// The connections a full pool may end, oldest first, each by a clone that can end it.
+#[derive(Debug, Default)]
+struct Readers {
+    next: AtomicUsize,
+    open: Mutex<VecDeque<Evictable>>,
+}
+
+impl Readers {
+    /// Tracks `stream`, and returns its ticket. A connection that cannot be tracked (no file
+    /// descriptor for the clone) cannot be evicted, so it holds its slot until its deadline, and
+    /// [`Readers::progress`] refuses it admission (fail closed).
+    fn add(&self, stream: &UnixStream) -> usize {
+        let ticket = self.next.fetch_add(1, Ordering::Relaxed);
+        if let (Ok(clone), Ok(mut open)) = (stream.try_clone(), self.open.lock()) {
+            open.push_back(Evictable {
+                ticket,
+                stream: clone,
+                accepted: Instant::now(),
+                answered: false,
+            });
+        }
+        ticket
+    }
+
+    /// The connection `ticket` has got as far as `progress`. `false` if it has been ended, or
+    /// could not be tracked.
+    fn progress(&self, ticket: usize, progress: Progress) -> bool {
+        let Ok(mut open) = self.open.lock() else {
+            return false;
+        };
+        let Some(index) = open.iter().position(|entry| entry.ticket == ticket) else {
+            return false;
+        };
+        match progress {
+            Progress::Admitted => drop(open.remove(index)),
+            Progress::Answered => {
+                if let Some(entry) = open.get_mut(index) {
+                    entry.answered = true;
+                }
+            }
+        }
+        true
+    }
+
+    /// The connection `ticket` is gone, or may no longer be ended.
+    fn done(&self, ticket: usize) {
+        if let Ok(mut open) = self.open.lock() {
+            open.retain(|entry| entry.ticket != ticket);
+        }
+    }
+
+    /// Ends one connection: one that has its answer if there is any, else the oldest, once it
+    /// has had [`EVICT_GRACE`] to send its request.
+    fn evict(&self) -> Eviction {
+        let Ok(mut open) = self.open.lock() else {
+            return Eviction::Nothing;
+        };
+        let answered = open.iter().position(|entry| entry.answered);
+        let index = answered.or_else(|| {
+            open.front()
+                .filter(|oldest| oldest.accepted.elapsed() >= EVICT_GRACE)
+                .map(|_| 0)
+        });
+        match index.and_then(|index| open.remove(index)) {
+            Some(entry) => {
+                // Its handler's read now returns 0, and it closes with no reply.
+                drop(entry.stream.shutdown(Shutdown::Both));
+                Eviction::Ended
+            }
+            None if open.is_empty() => Eviction::Nothing,
+            None => Eviction::TooYoung,
+        }
+    }
+}
+
+/// Accepts agent connections and serves each on its own thread, at most `limit` at once, as U1
+/// says, with one difference: a full pool first ends a connection that has its answer, then the
+/// oldest whose token has not been admitted, once it has had [`EVICT_GRACE`]. So holding a slot
+/// takes a live token: one that has been admitted (a call in progress, a step-up wait included)
+/// is never ended, because ending it would release an honest payment, and with nothing to end, a
+/// new connection is closed unread (U1 step 0b). While a pool of young connections gets through
+/// its work the loop waits, so a flood slows to the rate handlers finish, in the backlog with
+/// everyone else, instead of an honest connection being ended for it. Ended handlers take a
+/// moment to exit, so the count may pass `limit` for that moment, by at most `limit` again.
+/// Returns only when the listener is broken.
+pub fn accept_agents(listener: &UnixListener, limit: usize, context: AgentContext) {
+    let context = Arc::new(context);
+    let readers = Arc::new(Readers::default());
+    let active = Arc::new(AtomicUsize::new(0));
+    for stream in listener.incoming() {
+        let stream = match stream {
+            Ok(stream) => stream,
+            Err(error) if listener_is_broken(&error) => return,
+            Err(_) => {
+                thread::sleep(ACCEPT_BACKOFF);
+                continue;
+            }
+        };
+        if !wait_for_slot(&active, &readers, limit) {
+            drop(stream);
+            continue;
+        }
+        active.fetch_add(1, Ordering::SeqCst);
+        let ticket = readers.add(&stream);
+        let context = Arc::clone(&context);
+        let tracked = Arc::clone(&readers);
+        let release = Arc::clone(&active);
+        let spawned = thread::Builder::new()
+            .name("connection".to_owned())
+            .spawn(move || {
+                serve_agent_tracked(stream, &context, &|progress| {
+                    tracked.progress(ticket, progress)
+                });
+                tracked.done(ticket);
+                release.fetch_sub(1, Ordering::SeqCst);
+            });
+        if spawned.is_err() {
+            readers.done(ticket);
+            active.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+}
+
+/// Whether a new connection can have a slot, once this returns. `false` if nothing can be ended,
+/// or ended handlers took longer than [`EXIT_WAIT_MAX`] to exit.
+fn wait_for_slot(active: &AtomicUsize, readers: &Readers, limit: usize) -> bool {
+    let hard_limit = limit.saturating_mul(2);
+    let started = Instant::now();
+    let mut slot_made = false;
+    loop {
+        let count = active.load(Ordering::SeqCst);
+        if count < limit || (slot_made && count < hard_limit) {
+            return true;
+        }
+        if !slot_made && count < hard_limit {
+            match readers.evict() {
+                Eviction::Ended => {
+                    slot_made = true;
+                    continue;
+                }
+                Eviction::Nothing => return false,
+                Eviction::TooYoung => {}
+            }
+        }
+        if started.elapsed() >= EXIT_WAIT_MAX {
+            return false;
+        }
+        thread::sleep(EXIT_WAIT);
+    }
+}
+
 fn deadlines(timeout: Duration) -> Deadlines {
     // A timeout beyond the clock's range is no deadline at all: refuse at once.
     let at = Instant::now()
@@ -114,21 +339,32 @@ fn deadlines(timeout: Duration) -> Deadlines {
     Deadlines { head: at, body: at }
 }
 
-/// How long, and how much, `finish` drains of what the client sent after its reply.
+/// How long in total, and how much, `finish` drains of what the client sent after its reply.
 const DRAIN_TIME: Duration = Duration::from_millis(50);
 const DRAIN_BYTES: usize = 64 * 1024;
 
 /// Writes `bytes`, half-closes, and drains what the client still sent (an unread body, say)
 /// before closing: closing a Unix socket with unread data resets the peer, which could then
-/// lose the reply. The close also ends a disconnect watcher.
+/// lose the reply. The close also ends a disconnect watcher. A connection here cannot be
+/// evicted, so both steps have a deadline in total, not per read or write: a client that takes
+/// or sends one byte at a time cannot keep its slot (RV5 V7c).
 fn finish(stream: &mut UnixStream, bytes: &[u8], timeout: Duration) {
-    drop(stream.set_write_timeout(Some(timeout)));
-    drop(stream.write_all(bytes));
+    finish_then(stream, bytes, timeout, &|| {});
+}
+
+/// [`finish`], calling `written` once the reply has gone.
+fn finish_then(stream: &mut UnixStream, bytes: &[u8], timeout: Duration, written: &dyn Fn()) {
+    drop(write_by(stream, bytes, deadlines(timeout).head));
+    written();
     drop(stream.shutdown(Shutdown::Write));
-    drop(stream.set_read_timeout(Some(DRAIN_TIME)));
+    let deadline = deadlines(DRAIN_TIME).head;
     let mut drained = 0usize;
     let mut buffer = [0u8; 4096];
     while drained < DRAIN_BYTES {
+        let Some(left) = time_left(deadline) else {
+            break;
+        };
+        drop(stream.set_read_timeout(Some(left)));
         match stream.read(&mut buffer) {
             Ok(0) | Err(_) => break,
             Ok(read) => drained = drained.saturating_add(read),
@@ -138,26 +374,48 @@ fn finish(stream: &mut UnixStream, bytes: &[u8], timeout: Duration) {
 }
 
 /// Serves one agent connection.
-pub fn serve_agent(mut stream: UnixStream, context: &AgentContext) {
+pub fn serve_agent(stream: UnixStream, context: &AgentContext) {
+    serve_agent_tracked(stream, context, &|_| true);
+}
+
+/// [`serve_agent`], telling `track` how far the connection gets.
+fn serve_agent_tracked(
+    mut stream: UnixStream,
+    context: &AgentContext,
+    track: &dyn Fn(Progress) -> bool,
+) {
     // 0a: the peer, before any byte is read.
-    let Ok(peer) = require_peer(&stream, context.peer.uid, context.peer.gid) else {
-        return;
+    let peer = match require_peer(&stream, context.peer.uid, context.peer.gid) {
+        Ok(peer) => peer,
+        Err(error) => {
+            // No reply, but a wrong peer at the door is what the log is for.
+            refused_at_door(&context.log, &error.to_string());
+            return;
+        }
     };
     // 1: framing.
-    let request =
-        match http::read_request(&mut stream, AGENT_ENDPOINT, deadlines(context.read_timeout)) {
-            Ok(request) => request,
-            Err(error) => {
-                if let Some(status) = error.reply() {
-                    finish(
-                        &mut stream,
-                        &http::response(status, None),
-                        context.read_timeout,
-                    );
-                }
-                return;
+    let request = match http::read_request_capped(
+        &mut stream,
+        AGENT_ENDPOINT,
+        deadlines(context.read_timeout),
+        context.caps,
+    ) {
+        Ok(request) => request,
+        Err(error) => {
+            if let Some(status) = error.reply() {
+                refused_at_door(&context.log, &error.to_string());
+                finish_then(
+                    &mut stream,
+                    &http::response(status, None),
+                    context.read_timeout,
+                    &|| {
+                        let _ = track(Progress::Answered);
+                    },
+                );
             }
-        };
+            return;
+        }
+    };
     // 2 to 13.
     let reply = match mcp::check(&request.head, &request.body) {
         Err(reply) => {
@@ -175,10 +433,25 @@ pub fn serve_agent(mut stream: UnixStream, context: &AgentContext) {
         }
         Ok(Inbound::Ignored) => mcp::accepted().to_http(),
         Ok(Inbound::Request(agent_request)) => {
-            route(&mut stream, peer.uid, &agent_request, context)
+            route(&mut stream, peer.uid, &agent_request, context, track)
         }
     };
-    finish(&mut stream, &reply, context.read_timeout);
+    finish_then(&mut stream, &reply, context.read_timeout, &|| {
+        let _ = track(Progress::Answered);
+    });
+}
+
+/// A connection refused before it named a method: its peer or its framing.
+fn refused_at_door(log: &DecisionLog, reason: &str) {
+    log.decision(
+        Verdict::ProtocolError,
+        &Decision {
+            method: "-",
+            reason: Some(reason.to_owned()),
+            ..Decision::default()
+        },
+        unix_ms(),
+    );
 }
 
 fn route(
@@ -186,6 +459,7 @@ fn route(
     peer_uid: u32,
     request: &AgentRequest,
     context: &AgentContext,
+    track: &dyn Fn(Progress) -> bool,
 ) -> Vec<u8> {
     let id = &request.id;
     match request.method {
@@ -221,8 +495,8 @@ fn route(
                 refuse(Verdict::Deny, "no episode token");
                 return mcp::denied(id).to_http();
             };
-            let agent = match context.registry.admit(token, peer_uid, now) {
-                Ok(agent) => agent,
+            let admitted = match context.registry.admit(token, peer_uid, now) {
+                Ok(admitted) => admitted,
                 Err(Admission::Denied) => {
                     refuse(Verdict::Deny, "episode token refused");
                     return mcp::denied(id).to_http();
@@ -231,14 +505,22 @@ fn route(
                     refuse(Verdict::Unavailable, "rate limit");
                     return mcp::unavailable(id).to_http();
                 }
+                Err(Admission::OverShare) => {
+                    refuse(Verdict::Unavailable, "connection share");
+                    return mcp::unavailable(id).to_http();
+                }
             };
+            // A connection the pool has ended starts nothing: there is no one to answer.
+            if !track(Progress::Admitted) {
+                return mcp::unavailable(id).to_http();
+            }
             if request.method == Method::ToolsList {
                 let tools = context
                     .lockfile
                     .tools_list(|server| context.servers.state(server) == ServerState::Serving);
                 return mcp::result_reply(id, &mcp::tools_list_result(&tools)).to_http();
             }
-            call(stream, peer_uid, request, &agent, context).to_http()
+            call(stream, peer_uid, request, admitted.agent(), context).to_http()
         }
     }
 }
@@ -309,7 +591,8 @@ fn watch(
 
 /// Serves one control connection.
 pub fn serve_control(mut stream: UnixStream, context: &ControlContext) {
-    if require_peer(&stream, context.peer.uid, context.peer.gid).is_err() {
+    if let Err(error) = require_peer(&stream, context.peer.uid, context.peer.gid) {
+        refused_at_door(&context.log, &error.to_string());
         return;
     }
     let request = match http::read_request(
@@ -344,35 +627,54 @@ fn answer_control(body: &[u8], context: &ControlContext) -> control::ControlRepl
             .start(host, &intent)
             .and_then(|started| control::started(started.eid, &started.token, started.exp)),
         ControlRequest::EndEpisode { eid } => registry.end(host, eid).map(|()| control::done()),
-        ControlRequest::Pending => control::pending(&registry.pending()),
+        ControlRequest::Pending => control::pending(&registry.pending(host)),
         ControlRequest::TrustedInput {
             eid,
             input_id,
             value,
             conf,
-        } => ask(registry, eid, |reply| HostMessage::TrustedInput {
+        } => ask(registry, host, eid, |reply| HostMessage::TrustedInput {
             input_id,
             value,
             conf,
             reply,
         }),
-        ControlRequest::Approve(approval) => ask(registry, approval.eid, |reply| {
-            HostMessage::Approve { approval, reply }
-        }),
-        ControlRequest::Decline(approval) => ask(registry, approval.eid, |reply| {
-            HostMessage::Decline { approval, reply }
-        }),
+        ControlRequest::Approve(approval) => {
+            ask(registry, host, approval.eid, |reply| HostMessage::Approve {
+                approval,
+                until: answer_by(),
+                reply,
+            })
+        }
+        ControlRequest::Decline(approval) => {
+            ask(registry, host, approval.eid, |reply| HostMessage::Decline {
+                approval,
+                until: answer_by(),
+                reply,
+            })
+        }
     });
     outcome.unwrap_or_else(|error| control::error(&error))
+}
+
+/// When an approval or a decline stops counting: before [`ask`] gives up on it, so one the
+/// operator was told failed does not land later. A time past the clock's range is now (fail
+/// closed).
+fn answer_by() -> Instant {
+    let margin = Duration::from_millis(100);
+    Instant::now()
+        .checked_add(HOST_TIMEOUT.saturating_sub(margin))
+        .unwrap_or_else(Instant::now)
 }
 
 /// Sends a host message to the episode's actor and waits for its answer.
 fn ask(
     registry: &Registry,
+    host: &HostAuthority,
     eid: u128,
     message: impl FnOnce(mpsc::SyncSender<Result<(), ControlError>>) -> HostMessage,
 ) -> Result<control::ControlReply, ControlError> {
-    let sender = registry.host(eid)?;
+    let sender = registry.host(host, eid)?;
     let (reply, answer) = mpsc::sync_channel(1);
     sender
         .send(message(reply))
@@ -396,6 +698,7 @@ mod tests {
     use crate::jcs::{self, JcsValue};
     use crate::testkit::{Echo, Kit, kit};
     use crate::tokens::unix_now;
+    use std::io::Write as _;
     use std::path::PathBuf;
 
     fn me() -> Peer {
@@ -413,6 +716,7 @@ mod tests {
             servers: kit.servers.clone(),
             peer,
             read_timeout: Duration::from_secs(2),
+            caps: Caps::MAX,
             call_timeout: Duration::from_secs(5),
             now: unix_now,
             log: Arc::new(DecisionLog::disabled()),
@@ -425,6 +729,7 @@ mod tests {
             host: kit.host.clone(),
             peer,
             read_timeout: Duration::from_secs(2),
+            log: Arc::new(DecisionLog::disabled()),
         }
     }
 
@@ -436,13 +741,13 @@ mod tests {
         if let Err(error) = client.write_all(raw) {
             assert!(matches!(
                 error.kind(),
-                std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+                io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset
             ));
         }
         let mut out = Vec::new();
         // A connection closed unread (U1 step 0a) may reset rather than end.
         if let Err(error) = client.read_to_end(&mut out) {
-            assert_eq!(error.kind(), std::io::ErrorKind::ConnectionReset);
+            assert_eq!(error.kind(), io::ErrorKind::ConnectionReset);
         }
         thread.join().unwrap();
         out
@@ -617,6 +922,24 @@ mod tests {
     }
 
     #[test]
+    fn a_connection_the_pool_has_ended_starts_nothing() {
+        let echo = Arc::new(Echo::default());
+        let kit = kit(echo.clone(), me().uid);
+        let context = agent_context(&kit, me());
+        let (token, _) = start(&kit);
+        let body = call_body(1, "get_ticket", r#"{"id":"T-1"}"#, &token);
+        let raw = mcp_request("tools/call", Some("get_ticket"), "", &body);
+        let reply = json(&exchange(&raw, move |stream| {
+            serve_agent_tracked(stream, &context, &|_| false);
+        }));
+        assert_eq!(
+            reply.pointer("/error/message").unwrap().as_str(),
+            Some("PEP_UNAVAILABLE")
+        );
+        assert!(echo.requests.lock().unwrap().is_empty());
+    }
+
+    #[test]
     fn the_peer_and_the_framing_come_first() {
         let kit = kit(Arc::new(Echo::default()), me().uid);
         let stranger = Peer {
@@ -737,7 +1060,7 @@ mod tests {
         client
             .write_all(&mcp_request("tools/call", Some("pay_invoice"), "", &pay))
             .unwrap();
-        let pending = || kit.registry.pending();
+        let pending = || kit.registry.pending(&kit.host);
         let deadline = Instant::now() + Duration::from_secs(2);
         while pending().is_empty() {
             assert!(
@@ -758,13 +1081,206 @@ mod tests {
     }
 
     #[test]
+    fn a_reply_has_a_deadline_in_total() {
+        // Nobody reads, and the reply is larger than the socket buffer.
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let reply = vec![b'x'; 8 << 20];
+        let started = Instant::now();
+        let error = write_by(
+            &mut server,
+            &reply,
+            deadlines(Duration::from_millis(50)).head,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error.kind(),
+            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+        ));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        drop(client);
+        // A reader that keeps taking a little cannot stretch it either: at this rate the whole
+        // reply takes over half a second, and each write makes progress within its own timer.
+        let (mut client, mut server) = UnixStream::pair().unwrap();
+        let reader = thread::spawn(move || {
+            let mut buffer = vec![0u8; 64 * 1024];
+            while matches!(client.read(&mut buffer), Ok(read) if read > 0) {
+                thread::sleep(Duration::from_millis(5));
+            }
+        });
+        let started = Instant::now();
+        assert!(
+            write_by(
+                &mut server,
+                &reply,
+                deadlines(Duration::from_millis(50)).head
+            )
+            .is_err()
+        );
+        assert!(started.elapsed() < Duration::from_secs(2));
+        drop(server);
+        reader.join().unwrap();
+        // One that reads gets it all.
+        let (mut client, mut server) = UnixStream::pair().unwrap();
+        let reader = thread::spawn(move || {
+            let mut out = Vec::new();
+            client.read_to_end(&mut out).unwrap();
+            out.len()
+        });
+        write_by(&mut server, &reply, deadlines(Duration::from_secs(10)).head).unwrap();
+        drop(server);
+        assert_eq!(reader.join().unwrap(), reply.len());
+    }
+
+    #[test]
+    fn a_trickling_client_cannot_stretch_the_drain() {
+        let (mut client, mut server) = UnixStream::pair().unwrap();
+        let writer = thread::spawn(move || {
+            while client.write_all(b" ").is_ok() {
+                thread::sleep(Duration::from_millis(5));
+            }
+        });
+        let started = Instant::now();
+        finish(&mut server, b"reply", Duration::from_secs(1));
+        assert!(
+            started.elapsed() < DRAIN_TIME * 4,
+            "held for {:?}",
+            started.elapsed()
+        );
+        writer.join().unwrap();
+    }
+
+    #[test]
+    fn only_a_broken_listener_ends_an_accept_loop() {
+        use nix::libc;
+        for code in [
+            libc::EMFILE,
+            libc::ENFILE,
+            libc::ENOMEM,
+            libc::ENOBUFS,
+            libc::ECONNABORTED,
+            libc::EINTR,
+        ] {
+            assert!(!listener_is_broken(&io::Error::from_raw_os_error(code)));
+        }
+        for code in [libc::EBADF, libc::EINVAL, libc::ENOTSOCK, libc::EOPNOTSUPP] {
+            assert!(listener_is_broken(&io::Error::from_raw_os_error(code)));
+        }
+    }
+
+    #[test]
+    fn eviction_prefers_the_answered_then_the_oldest_and_spares_the_admitted() {
+        let readers = Readers::default();
+        assert_eq!(readers.evict(), Eviction::Nothing);
+        let pairs: Vec<(UnixStream, UnixStream)> =
+            (0..4).map(|_| UnixStream::pair().unwrap()).collect();
+        let tickets: Vec<usize> = pairs
+            .iter()
+            .map(|(_, server)| readers.add(server))
+            .collect();
+        let ended = |index: usize| {
+            let (client, _) = &pairs[index];
+            client
+                .set_read_timeout(Some(Duration::from_millis(20)))
+                .unwrap();
+            let mut client = client;
+            matches!(client.read(&mut [0u8; 1]), Ok(0))
+        };
+        // The first is admitted: safe, however old. The third has its answer.
+        assert!(readers.progress(tickets[0], Progress::Admitted));
+        assert!(readers.progress(tickets[2], Progress::Answered));
+        assert_eq!(readers.evict(), Eviction::Ended);
+        assert!(ended(2), "the one with its answer goes first");
+        assert!(!ended(0) && !ended(1) && !ended(3));
+        thread::sleep(EVICT_GRACE);
+        assert_eq!(readers.evict(), Eviction::Ended);
+        assert!(ended(1), "then the oldest not yet admitted");
+        assert!(!ended(0) && !ended(3));
+        assert!(
+            !readers.progress(tickets[1], Progress::Admitted),
+            "an ended connection starts nothing"
+        );
+        assert_eq!(readers.evict(), Eviction::Ended);
+        assert!(ended(3));
+        assert_eq!(
+            readers.evict(),
+            Eviction::Nothing,
+            "the admitted one is never ended"
+        );
+        assert!(!ended(0));
+    }
+
+    #[test]
+    fn a_new_connection_gets_its_grace_unless_it_has_its_answer() {
+        let readers = Readers::default();
+        let (_young_client, young) = UnixStream::pair().unwrap();
+        readers.add(&young);
+        assert_eq!(readers.evict(), Eviction::TooYoung);
+        let (_answered_client, answered) = UnixStream::pair().unwrap();
+        let ticket = readers.add(&answered);
+        assert!(readers.progress(ticket, Progress::Answered));
+        assert_eq!(readers.evict(), Eviction::Ended);
+        assert_eq!(readers.evict(), Eviction::TooYoung);
+        thread::sleep(EVICT_GRACE);
+        assert_eq!(readers.evict(), Eviction::Ended);
+    }
+
+    #[test]
+    fn a_slot_is_waited_for_until_nothing_can_be_ended() {
+        let readers = Readers::default();
+        let active = AtomicUsize::new(0);
+        assert!(wait_for_slot(&active, &readers, 1), "room to spare");
+        active.store(1, Ordering::SeqCst);
+        assert!(!wait_for_slot(&active, &readers, 1), "nothing to end");
+        // One that has just arrived gets its grace, then goes.
+        let (_client, server) = UnixStream::pair().unwrap();
+        readers.add(&server);
+        let started = Instant::now();
+        assert!(wait_for_slot(&active, &readers, 1));
+        assert!(started.elapsed() >= EVICT_GRACE);
+    }
+
+    #[test]
+    fn a_full_pool_ends_the_oldest_sender_for_a_new_connection() {
+        let kit = kit(Arc::new(Echo::default()), me().uid);
+        let dir = std::env::temp_dir().join(format!("pep-evict-{}", std::process::id()));
+        drop(std::fs::remove_dir_all(&dir));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("agent.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let context = agent_context(&kit, me());
+        thread::spawn(move || accept_agents(&listener, 2, context));
+        // Two connections that never finish their requests hold the pool.
+        let mut held: Vec<UnixStream> = (0..2)
+            .map(|_| {
+                let mut stream = UnixStream::connect(&path).unwrap();
+                stream.write_all(b"POST /mcp HTTP/1.1\r\n").unwrap();
+                thread::sleep(Duration::from_millis(50));
+                stream
+            })
+            .collect();
+        // The new one is served, and the oldest gets its close.
+        let mut honest = UnixStream::connect(&path).unwrap();
+        let raw = b"GET /mcp HTTP/1.1\r\nHost: pep.local\r\n\r\n";
+        honest.write_all(raw).unwrap();
+        let mut reply = Vec::new();
+        honest.read_to_end(&mut reply).unwrap();
+        assert!(String::from_utf8_lossy(&reply).starts_with("HTTP/1.1 "));
+        held[0]
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        assert_eq!(held[0].read(&mut [0u8; 1]).unwrap(), 0);
+        held.clear();
+        drop(std::fs::remove_dir_all(dir));
+    }
+
+    #[test]
     fn a_full_pool_closes_new_connections_at_once() {
         let n = std::process::id();
         let path = std::env::temp_dir().join(format!("pep-serve-pool-{n}.sock"));
         drop(std::fs::remove_file(&path));
         let listener = UnixListener::bind(&path).unwrap();
         let (release, held) = mpsc::channel::<()>();
-        let held = Arc::new(std::sync::Mutex::new(held));
+        let held = Arc::new(Mutex::new(held));
         thread::spawn(move || {
             accept_loop(&listener, 1, move |mut stream| {
                 let _ = held.lock().unwrap().recv_timeout(Duration::from_secs(5));

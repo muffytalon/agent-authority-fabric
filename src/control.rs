@@ -195,12 +195,15 @@ pub struct PendingPayment {
     pub rid: u64,
     /// The payment tool.
     pub tool: String,
-    /// Its canonical arguments.
-    pub arguments: JcsValue,
-    /// Its `action_digest`.
+    /// The entity it pays. Only bound fields are shown: the rest of the arguments are the
+    /// agent's text, which must not reach an approver (RV5).
+    pub entity: String,
+    /// Its `action_digest`, which binds every argument.
     pub action_digest: String,
     /// The amount in minor units.
     pub amount_minor: u64,
+    /// The intent's currency.
+    pub currency: String,
 }
 
 /// A reply: its HTTP status, and its JSON body.
@@ -292,10 +295,12 @@ pub fn pending(payments: &[PendingPayment]) -> Result<ControlReply, ControlError
         result.extend(JcsValue::string(payment.action_digest.as_str()).to_canonical_bytes());
         result.extend_from_slice(br#","amount_minor":"#);
         result.extend(int(payment.amount_minor)?.to_canonical_bytes());
-        result.extend_from_slice(br#","arguments":"#);
-        result.extend(payment.arguments.to_canonical_bytes());
+        result.extend_from_slice(br#","currency":"#);
+        result.extend(JcsValue::string(payment.currency.as_str()).to_canonical_bytes());
         result.extend_from_slice(br#","eid":"#);
         result.extend(JcsValue::string(encode_ulid(payment.eid)).to_canonical_bytes());
+        result.extend_from_slice(br#","entity":"#);
+        result.extend(JcsValue::string(payment.entity.as_str()).to_canonical_bytes());
         result.extend_from_slice(br#","rid":"#);
         result.extend(int(payment.rid)?.to_canonical_bytes());
         result.extend_from_slice(br#","tool":"#);
@@ -430,9 +435,10 @@ mod tests {
             eid: EID,
             rid: 2,
             tool: "pay_invoice".to_owned(),
-            arguments: jcs::parse(br#"{"amount":60000,"invoice_id":"INV-1"}"#).unwrap(),
+            entity: "INV-1".to_owned(),
             action_digest: "sha-256:d".to_owned(),
             amount_minor: 60_000,
+            currency: "USD".to_owned(),
         }])
         .unwrap();
         let empty = super::pending(&[]).unwrap();

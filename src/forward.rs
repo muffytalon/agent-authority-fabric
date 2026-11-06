@@ -143,6 +143,20 @@ pub fn read_upstream_reply(body: &[u8], upstream_id: &str) -> Result<UpstreamRep
     }
 }
 
+/// Whether a request body fits what the broker parses it with: the HTTP subset's body cap and
+/// the request profile. The engine's own parse counts the agent's `_meta`; the forwarded body
+/// carries the PEP's, which is larger, so a request the engine accepts can still fail here
+/// (RV5 V2). The caller checks before the point of forwarding, so such a call is simply
+/// released.
+#[must_use]
+pub fn within_request_profile(body: &[u8]) -> bool {
+    // A body this small cannot hold more values than the profile allows ("0," per value), so
+    // the usual call pays for no second parse.
+    let below_any_count_limit = jcs::MAX_REQUEST_NODES.saturating_mul(2);
+    body.len() <= crate::http::MAX_BODY_BYTES
+        && (body.len() < below_any_count_limit || jcs::parse(body).is_ok())
+}
+
 /// Builds the upstream `tools/call` for an allowed call.
 /// - `upstream_id` is the PEP-assigned ULID the engine saw as the call's id (M1).
 /// - `server_id` is the tool's pinned server.
@@ -328,6 +342,27 @@ mod tests {
         );
         assert_eq!(String::from_utf8(request.body.clone()).unwrap(), expected);
         assert_eq!(jcs::canonicalize(&request.body).unwrap(), request.body);
+    }
+
+    #[test]
+    fn the_request_profile_is_checked_before_a_payment_is_forwarded() {
+        // Small: no parse needed, and it is well formed anyway.
+        assert!(within_request_profile(b"{}"));
+        // Too long for the broker's reader.
+        assert!(!within_request_profile(&vec![
+            b'x';
+            crate::http::MAX_BODY_BYTES
+                + 1
+        ]));
+        // Long, and just inside the value count.
+        let array = |count: usize| {
+            let mut body = b"[".to_vec();
+            body.extend_from_slice(&vec![b"0,".as_slice(); count - 1].concat());
+            body.extend_from_slice(b"0]");
+            body
+        };
+        assert!(within_request_profile(&array(jcs::MAX_REQUEST_NODES - 1)));
+        assert!(!within_request_profile(&array(jcs::MAX_REQUEST_NODES)));
     }
 
     #[test]

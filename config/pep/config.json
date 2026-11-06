@@ -22,6 +22,7 @@
         "cumulative_max_minor": 500000,
         "currency": "USD",
         "max_calls": 5,
+        "max_declines": 3,
         "per_call_max_minor": 100000,
         "step_up_over_minor": 50000
       },
@@ -45,6 +46,7 @@
         "cumulative_max_minor": 500000,
         "currency": "USD",
         "max_calls": 8,
+        "max_declines": 3,
         "per_call_max_minor": 100000,
         "step_up_over_minor": 50000
       },

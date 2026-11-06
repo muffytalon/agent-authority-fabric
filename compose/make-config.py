@@ -72,7 +72,7 @@ pins = {"lockfile_version": 1, "release_epoch": 1,
 def intent(kind, ids, uses, max_calls):
     return {"release_epoch": 1, "lockfile_digest": digest(pins),
             "limits": {"currency": "USD", "per_call_max_minor": 100000, "cumulative_max_minor": 500000,
-                       "max_calls": max_calls, "step_up_over_minor": 50000},
+                       "max_calls": max_calls, "step_up_over_minor": 50000, "max_declines": 3},
             "entities": {"kind": kind, "ids": ids, "per_entity_max_uses": uses}, "seq": "unconstrained"}
 
 pep = {

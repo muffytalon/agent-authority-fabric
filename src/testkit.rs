@@ -8,11 +8,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use crate::actor::{Services, Upstream};
+use crate::actor::{Services, Upstream, UpstreamFailure};
 use crate::config::IntentConfig;
 use crate::engine::{
-    Entities, EntitySet, HostAuthority, InMemoryLabelStore, Limits, PepIntent, SeqPolicy,
-    ServerStates, Shared, UnresolvedEntities,
+    Entities, EntityClaims, EntitySet, HostAuthority, InMemoryLabelStore, Limits, PepIntent,
+    SeqPolicy, ServerStates, Shared, UnresolvedEntities,
 };
 use crate::forward::UpstreamRequest;
 use crate::jcs::{self, JcsValue, ParseOptions};
@@ -27,7 +27,7 @@ pub(crate) const PINS: &str = r#"{"lockfile_version":1,"release_epoch":7,
   "stores":{"billing://invoices":{"case_insensitive":true}},
   "servers":{"a":{"endpoint":"http://a/mcp","identity":"spiffe://a","protocol_version":"2026-07-28","discover":{},"tools":{
     "get_ticket":{"definition":{"name":"get_ticket","inputSchema":{"type":"object"}},"policy":{"effect":"read","args":[{"pointer":"/id","role":"data"}],
-      "sink_clearance":"secret","output_label":{"conf":"internal","integ":"untrusted_external"},"max_result_bytes":65536,"max_result_nodes":1024}},
+      "sink_clearance":"confidential","output_label":{"conf":"internal","integ":"untrusted_external"},"max_result_bytes":65536,"max_result_nodes":1024}},
     "get_invoice":{"definition":{"name":"get_invoice"},"policy":{"effect":"read","args":[{"pointer":"/invoice_id","role":"store_key"}],
       "store_uri":"billing://invoices","sink_clearance":"secret","output_label":{"conf":"internal","integ":"trusted"},
       "trusted_fields":["/structuredContent/amount_due_minor","/structuredContent/currency"],"max_result_bytes":65536,"max_result_nodes":1024}},
@@ -54,21 +54,24 @@ impl fmt::Debug for Echo {
 }
 
 impl Upstream for Echo {
-    fn call(&self, request: &UpstreamRequest, _: Duration) -> Option<Vec<u8>> {
-        let body = jcs::parse(&request.body).ok()?;
-        let id = body.get("id")?.as_str()?.to_owned();
-        let tool = body.pointer("/params/name")?.as_str()?.to_owned();
-        self.requests.lock().ok()?.push(body);
-        let result = match tool.as_str() {
-            "get_invoice" => {
-                r#"{"resultType":"complete","content":[],"structuredContent":{"amount_due_minor":60000,"currency":"USD","invoice_id":"INV-1001"}}"#
-            }
-            "pay_invoice" => {
-                r#"{"resultType":"complete","content":[],"_meta":{"dev.pep-sidecar/outcome":"executed"}}"#
-            }
-            _ => r#"{"resultType":"complete","content":[{"type":"text","text":"ticket"}]}"#,
+    fn call(&self, request: &UpstreamRequest, _: Duration) -> Result<Vec<u8>, UpstreamFailure> {
+        let answer = || {
+            let body = jcs::parse(&request.body).ok()?;
+            let id = body.get("id")?.as_str()?.to_owned();
+            let tool = body.pointer("/params/name")?.as_str()?.to_owned();
+            self.requests.lock().ok()?.push(body);
+            let result = match tool.as_str() {
+                "get_invoice" => {
+                    r#"{"resultType":"complete","content":[],"structuredContent":{"amount_due_minor":60000,"currency":"USD","invoice_id":"INV-1001"}}"#
+                }
+                "pay_invoice" => {
+                    r#"{"resultType":"complete","content":[],"_meta":{"dev.pep-sidecar/outcome":"executed"}}"#
+                }
+                _ => r#"{"resultType":"complete","content":[{"type":"text","text":"ticket"}]}"#,
+            };
+            Some(format!(r#"{{"jsonrpc":"2.0","id":"{id}","result":{result}}}"#).into_bytes())
         };
-        Some(format!(r#"{{"jsonrpc":"2.0","id":"{id}","result":{result}}}"#).into_bytes())
+        answer().ok_or(UpstreamFailure::Lost)
     }
 }
 
@@ -106,6 +109,7 @@ pub(crate) fn kit(upstream: Arc<dyn Upstream>, agent_uid: u32) -> Kit {
         labels: Arc::new(InMemoryLabelStore::with_capacity(100)),
         servers: servers.clone(),
         unresolved: Arc::new(UnresolvedEntities::empty()),
+        claims: Arc::new(EntityClaims::empty()),
     };
     let host = Arc::new(HostAuthority::for_tests());
     let services = Arc::new(Services {
@@ -132,6 +136,7 @@ pub(crate) fn kit(upstream: Arc<dyn Upstream>, agent_uid: u32) -> Kit {
                 cumulative_max_minor: limit,
                 max_calls: 5,
                 step_up_over_minor: 50_000,
+                max_declines: 3,
             },
             entities: Entities {
                 ids,
@@ -163,6 +168,7 @@ pub(crate) fn kit(upstream: Arc<dyn Upstream>, agent_uid: u32) -> Kit {
         pins: lockfile.pins.clone(),
         agent_uid,
         episodes: 2,
+        connection_share: 8,
         call_burst: 10,
         call_rate_per_s: 10,
         idle_secs: 1800,

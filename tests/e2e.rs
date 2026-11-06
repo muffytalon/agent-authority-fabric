@@ -53,6 +53,7 @@ const PINS: &str = r#"{"lockfile_version":1,"release_epoch":7,
 /// One world: its directory, its processes, and how to reach them.
 struct World {
     base: PathBuf,
+    pins_text: String,
     pins: JcsValue,
     children: Vec<Child>,
     pep: Option<Child>,
@@ -68,6 +69,13 @@ impl Drop for World {
         }
         drop(fs::remove_dir_all(&self.base));
     }
+}
+
+/// The pins, with each server's real endpoint: the broker refuses a route that differs.
+fn pins_for(base: &Path) -> String {
+    let base = base.display();
+    PINS.replace("unix:a", &format!("unix:{base}/tool-a/tool.sock"))
+        .replace("unix:b", &format!("unix:{base}/tool-b/tool.sock"))
 }
 
 fn ids() -> (u32, u32) {
@@ -110,11 +118,13 @@ impl World {
         let base = std::env::temp_dir().join(format!("pep-e2e-{}-{n}", std::process::id()));
         fs::create_dir(&base).unwrap();
         fs::set_permissions(&base, fs::Permissions::from_mode(0o700)).unwrap();
-        let pins = jcs::parse_with(PINS.as_bytes(), &ParseOptions::definition())
+        let pins_text = pins_for(&base);
+        let pins = jcs::parse_with(pins_text.as_bytes(), &ParseOptions::definition())
             .unwrap()
             .value;
         let world = Self {
             base,
+            pins_text,
             pins,
             children: Vec::new(),
             pep: None,
@@ -138,7 +148,7 @@ impl World {
         for name in ["pub", "state", "logs", "secrets"] {
             dir(&self.base, name, 0o700);
         }
-        fs::write(self.path("pins.json"), PINS).unwrap();
+        fs::write(self.path("pins.json"), &self.pins_text).unwrap();
         for (server, credential) in [("a", "credential-a"), ("b", "credential-b")] {
             fs::write(
                 self.path(&format!("secrets/verifier-{server}")),
@@ -187,7 +197,7 @@ impl World {
         let digest = jcs::digest_value(&self.pins);
         let intent = |kind: &str, ids: &str| {
             format!(
-                r#"{{"release_epoch":7,"lockfile_digest":"{digest}","limits":{{"currency":"USD","per_call_max_minor":100000,"cumulative_max_minor":500000,"max_calls":5,"step_up_over_minor":50000}},
+                r#"{{"release_epoch":7,"lockfile_digest":"{digest}","limits":{{"currency":"USD","per_call_max_minor":100000,"cumulative_max_minor":500000,"max_calls":5,"step_up_over_minor":50000,"max_declines":3}},
                 "entities":{{"kind":"{kind}","ids":{ids},"per_entity_max_uses":1}},"seq":"unconstrained"}}"#
             )
         };
@@ -201,7 +211,7 @@ impl World {
                 "limits":{{"connections":16,"control_connections":4,"header_bytes":16384,"body_bytes":1048576,"read_timeout_ms":5000,
                   "upstream_timeout_ms":5000,"step_up_timeout_ms":{},"episode_idle_ms":600000,"episodes":4,"call_burst":50,"call_rate_per_s":50,
                   "clock_skew_ms":2000,"replay_cache_entries":1000}},
-                "intents":{{"pay":{},"notes":{}}},"pins":{PINS}}}"#,
+                "intents":{{"pay":{},"notes":{}}},"pins":{}}}"#,
                 p("pep/agent.sock"),
                 p("ctl/ctl.sock"),
                 p("broker/broker.sock"),
@@ -212,6 +222,7 @@ impl World {
                 self.step_up_ms,
                 intent("invoice", r#"["INV-1001","INV-2002","INV-3003","INV-4004"]"#),
                 intent("recipient", r#"["rcpt_A"]"#),
+                self.pins_text,
             ),
         )
         .unwrap();
@@ -457,7 +468,10 @@ fn reads_payments_a_step_up_and_every_broker_outcome() {
     let broker = world.lines("logs/broker.jsonl");
     let forwarded = broker
         .iter()
-        .find(|line| text(line, "/idempotency_key").as_deref() == Some(key.as_str()))
+        .find(|line| {
+            text(line, "/idempotency_key").as_deref() == Some(key.as_str())
+                && text(line, "/verdict").as_deref() == Some("forwarded")
+        })
         .unwrap();
     assert_eq!(text(forwarded, "/outcome").as_deref(), Some("executed"));
     assert!(text(forwarded, "/jti").is_some());
@@ -528,7 +542,7 @@ fn reads_payments_a_step_up_and_every_broker_outcome() {
         .iter()
         .filter_map(|line| text(line, "/result"))
         .collect();
-    assert_eq!(outcomes, ["executed", "executed", "refused", "unknown"]);
+    assert_eq!(outcomes, ["executed", "executed", "declined", "unknown"]);
     oracle_join(&world);
 }
 
@@ -801,4 +815,106 @@ fn a_refused_call_proof_executes_nothing() {
         text(journal.last().unwrap(), "/result").as_deref(),
         Some("refused")
     );
+}
+
+fn executed_payments(world: &World) -> usize {
+    world
+        .lines("logs/tool-a.jsonl")
+        .iter()
+        .filter(|line| {
+            text(line, "/tool").as_deref() == Some("pay_invoice")
+                && line.get("executed").and_then(JcsValue::as_bool) == Some(true)
+        })
+        .count()
+}
+
+/// RV5 D5: F-07's key differs per reservation, so only the second key can stop this.
+#[test]
+fn a_lost_journal_cannot_pay_an_invoice_twice() {
+    const PAY: &str = r#"{"invoice_id":"INV-1001","amount":30000,"currency":"USD"}"#;
+    let mut world = World::new(10_000, None).start();
+    let token = world.start_episode("pay");
+    world.call(1, "get_invoice", r#"{"invoice_id":"INV-1001"}"#, &token);
+    world.call(2, "pay_invoice", PAY, &token);
+    assert_eq!(executed_payments(&world), 1);
+    // Every budget and invoice claim goes with the journal, so the PEP will pay it again.
+    fs::remove_file(world.path("state/journal.jsonl")).unwrap();
+    world.start_pep();
+    let token = world.start_episode("pay");
+    world.call(3, "get_invoice", r#"{"invoice_id":"INV-1001"}"#, &token);
+    let replayed = world.call(4, "pay_invoice", PAY, &token);
+    assert_eq!(
+        text(&replayed, "/result/structuredContent/status").as_deref(),
+        Some("executed"),
+        "{replayed:?}"
+    );
+    assert_eq!(
+        executed_payments(&world),
+        1,
+        "the provider executed it twice"
+    );
+    let keys: Vec<(String, String)> = world
+        .lines("logs/tool-a.jsonl")
+        .iter()
+        .filter(|line| text(line, "/tool").as_deref() == Some("pay_invoice"))
+        .map(|line| {
+            (
+                text(line, "/idempotency_key").unwrap(),
+                text(line, "/entity_key").unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(keys.len(), 2);
+    assert_ne!(keys[0].0, keys[1].0, "F-07's key differs per reservation");
+    assert_eq!(keys[0].1, keys[1].1, "the invoice's does not");
+    let broker = world.lines("logs/broker.jsonl");
+    assert!(broker.iter().any(|line| {
+        text(line, "/entity_key").as_deref() == Some(keys[0].1.as_str())
+            && text(line, "/verdict").as_deref() == Some("forwarded")
+    }));
+    assert!(broker.iter().all(|line| line.get("broker_us").is_some()));
+}
+
+/// RV5 D6: a tool's declines stop the intent, a restart does not reset them, and a decline does
+/// not use the invoice up.
+#[test]
+fn a_tools_declines_stop_the_intent_across_a_restart() {
+    const PAY: &str = r#"{"invoice_id":"INV-3003","amount":30000,"currency":"USD"}"#;
+    let mut world = World::new(10_000, None).start();
+    let token = world.start_episode("pay");
+    world.call(1, "get_invoice", r#"{"invoice_id":"INV-3003"}"#, &token);
+    for id in 2..5 {
+        let reply = world.call(id, "pay_invoice", PAY, &token);
+        assert_eq!(
+            text(&reply, "/result/structuredContent/status").as_deref(),
+            Some("declined"),
+            "{reply:?}"
+        );
+    }
+    assert!(denied(&world.call(5, "pay_invoice", PAY, &token)));
+    let journal = world.lines("state/journal.jsonl");
+    let declined = journal
+        .iter()
+        .filter(|line| text(line, "/result").as_deref() == Some("declined"))
+        .count();
+    assert_eq!(declined, 3);
+    // A decline leaves the invoice's key unused, so a provider could still execute a retry.
+    let dedupe = fs::read_to_string(world.path("state/dedupe-a.jsonl")).unwrap();
+    assert_eq!(dedupe.lines().count(), 3);
+    assert!(
+        dedupe
+            .lines()
+            .all(|line| line.contains(r#""entity_key":null"#)),
+        "{dedupe}"
+    );
+    world.start_pep();
+    let token = world.start_episode("pay");
+    world.call(6, "get_invoice", r#"{"invoice_id":"INV-1001"}"#, &token);
+    assert!(denied(&world.call(
+        7,
+        "pay_invoice",
+        r#"{"invoice_id":"INV-1001","amount":30000,"currency":"USD"}"#,
+        &token
+    )));
+    assert_eq!(executed_payments(&world), 0);
 }

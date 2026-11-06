@@ -340,10 +340,18 @@ fn policy(
     };
     let max_result_bytes = fields.positive_usize("max_result_bytes")?;
     let max_result_nodes = fields.positive_usize("max_result_nodes")?;
-    let reads_stores = string_set(&mut fields, "reads_stores")?
+    let reads_stores: Vec<String> = string_set(&mut fields, "reads_stores")?
         .into_iter()
         .collect();
     fields.done()?;
+    check_clearance(
+        effect,
+        &args,
+        sink_clearance,
+        &destinations,
+        store_uri.is_some() || !reads_stores.is_empty(),
+        &sink_path,
+    )?;
     let policy = ToolPolicy {
         name: name.to_owned(),
         server_id: server_id.to_owned(),
@@ -435,6 +443,49 @@ fn integrity(text: &str, path: &str) -> Result<Integrity, LoadError> {
     })
 }
 
+/// What `secret` clearance may go on (RV5 D4). It turns `G_label`'s confidentiality check off for
+/// what the tool sends, so a tool that sends anywhere new would be an unchecked way out: a sink
+/// or a payment (whose memo becomes a sink) never gets it, nor does a destination, and a read
+/// tool with free `data` arguments gets it only if it reads a pinned store, whose server already
+/// holds what that store's readers can see.
+fn check_clearance(
+    effect: EffectClass,
+    args: &[ArgSpec],
+    clearance: Confidentiality,
+    destinations: &BTreeMap<String, Confidentiality>,
+    reads_a_store: bool,
+    path: &str,
+) -> Result<(), LoadError> {
+    if destinations
+        .values()
+        .any(|cleared| *cleared == Confidentiality::Secret)
+    {
+        return Err(LoadError::at(
+            path,
+            Problem::Invalid("a destination cannot be cleared for secret"),
+        ));
+    }
+    if clearance != Confidentiality::Secret {
+        return Ok(());
+    }
+    if matches!(effect, EffectClass::MutatingExternal | EffectClass::Payment) {
+        return Err(LoadError::at(
+            path,
+            Problem::Invalid("a sink or a payment cannot be cleared for secret"),
+        ));
+    }
+    let free = args.iter().any(|spec| spec.role == ArgRole::Data);
+    if effect == EffectClass::ReadOnly && free && !reads_a_store {
+        return Err(LoadError::at(
+            path,
+            Problem::Invalid(
+                "a read tool with data arguments must read a pinned store to be cleared for secret",
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// RV4 #8: a read tool that returns stored data without naming its location declares the
 /// stores it reads. If any pinned tool writes one of them, the reader's `output_label` must be
 /// at least [`STORE_HIGH_WATER`], or short secrets, which are never content-indexed (F-08),
@@ -462,8 +513,14 @@ fn check_reader(
                 Problem::Invalid("reads_stores names a store that is not pinned"),
             ));
         }
+        // Every tool whose call taints a store location (the engine's `planned_writes`): a
+        // `mutating_internal` tool, or any tool with a `store_write` argument (RV5 V15).
         let written = pins.tools.values().any(|tool| {
-            tool.effect == EffectClass::MutatingInternal
+            (tool.effect == EffectClass::MutatingInternal
+                || tool
+                    .args
+                    .iter()
+                    .any(|spec| spec.role == ArgRole::StoreWrite))
                 && (tool.store_uri.as_deref() == Some(store.as_str())
                     || tool.args.iter().any(|spec| spec.role == ArgRole::StoreUri))
         });

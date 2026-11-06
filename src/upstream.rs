@@ -6,13 +6,16 @@
 //! `Content-Type: application/json` and arrives whole by the deadline; anything else is no
 //! reply, which the actor treats as an unknown outcome.
 
-use std::io::{self, Write};
+use std::io;
 use std::net::TcpStream;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc;
+use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::actor::Upstream;
+use crate::actor::{Upstream, UpstreamFailure};
 use crate::forward::UpstreamRequest;
 use crate::http::{self, HttpError};
 use crate::mcp::is_json_content_type;
@@ -24,13 +27,19 @@ pub enum UpstreamError {
     /// The socket could not be reached.
     #[error("connect: {0}")]
     Connect(io::Error),
+    /// The connection was not made by the deadline.
+    #[error("connect deadline passed")]
+    ConnectTimeout,
     /// The peer is not the broker.
     #[error("peer: {0}")]
     Peer(#[from] PeerError),
     /// The request could not be written.
     #[error("write: {0}")]
     Write(io::Error),
-    /// The deadline passed.
+    /// The request was not fully written by the deadline.
+    #[error("write deadline passed")]
+    WriteTimeout,
+    /// The deadline passed after the whole request was written.
     #[error("deadline passed")]
     Timeout,
     /// The reply was not a response in the HTTP subset.
@@ -42,6 +51,22 @@ pub enum UpstreamError {
     /// The content type was not JSON.
     #[error("not JSON")]
     ContentType,
+}
+
+impl UpstreamError {
+    /// Whether the server cannot have acted on the request: no connection, the wrong peer, or
+    /// a request cut short, which the subset's exact `Content-Length` makes it refuse.
+    #[must_use]
+    pub const fn not_delivered(&self) -> bool {
+        matches!(
+            self,
+            Self::Connect(_)
+                | Self::ConnectTimeout
+                | Self::Peer(_)
+                | Self::Write(_)
+                | Self::WriteTimeout
+        )
+    }
 }
 
 /// The broker client: its socket, the uid and gid its peer must have, and the largest reply
@@ -168,34 +193,28 @@ pub fn post(request: &Post<'_>) -> Result<Vec<u8>, UpstreamError> {
     } = *request;
     let deadline = Instant::now()
         .checked_add(timeout)
-        .ok_or(UpstreamError::Timeout)?;
+        .ok_or(UpstreamError::ConnectTimeout)?;
     let mut connection = match endpoint {
         Endpoint::Unix(socket) => {
-            let stream = UnixStream::connect(socket).map_err(UpstreamError::Connect)?;
+            let socket = socket.clone();
+            let stream = connect_by(deadline, move || UnixStream::connect(socket))?;
             if let Some((uid, gid)) = peer {
                 require_peer(&stream, uid, gid)?;
             }
             Connection::Unix(stream)
         }
         Endpoint::Tcp(address) => {
-            Connection::Tcp(TcpStream::connect(address).map_err(UpstreamError::Connect)?)
+            let address = address.clone();
+            Connection::Tcp(connect_by(deadline, move || TcpStream::connect(address))?)
         }
     };
-    let left = deadline
-        .checked_duration_since(Instant::now())
-        .filter(|left| !left.is_zero())
-        .ok_or(UpstreamError::Timeout)?;
     let bytes = request_bytes(path, host, headers, body);
     let written = match &mut connection {
-        Connection::Unix(stream) => stream
-            .set_write_timeout(Some(left))
-            .and_then(|()| stream.write_all(&bytes)),
-        Connection::Tcp(stream) => stream
-            .set_write_timeout(Some(left))
-            .and_then(|()| stream.write_all(&bytes)),
+        Connection::Unix(stream) => http::write_by(stream, &bytes, deadline),
+        Connection::Tcp(stream) => http::write_by(stream, &bytes, deadline),
     };
     written.map_err(|error| match error.kind() {
-        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => UpstreamError::Timeout,
+        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => UpstreamError::WriteTimeout,
         _ => UpstreamError::Write(error),
     })?;
     let response = match &mut connection {
@@ -219,9 +238,67 @@ pub fn post(request: &Post<'_>) -> Result<Vec<u8>, UpstreamError> {
     Ok(response.body)
 }
 
+/// Connects in a helper thread, so `deadline` holds: `connect` has no timeout of its own, and
+/// on a Unix socket whose backlog is full it blocks for as long as the server does not accept
+/// (RV5 V13). A connection that comes after the deadline is closed unused. Past
+/// [`MAX_PENDING_CONNECTS`] blocked helpers, a new call fails at once, so a hung server cannot
+/// pile up threads.
+fn connect_by<T, F>(deadline: Instant, connect: F) -> Result<T, UpstreamError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> io::Result<T> + Send + 'static,
+{
+    let left = deadline
+        .checked_duration_since(Instant::now())
+        .filter(|left| !left.is_zero())
+        .ok_or(UpstreamError::ConnectTimeout)?;
+    let taken = PENDING_CONNECTS.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
+        (count < MAX_PENDING_CONNECTS).then(|| count.saturating_add(1))
+    });
+    if taken.is_err() {
+        return Err(UpstreamError::ConnectTimeout);
+    }
+    let (done, result) = mpsc::sync_channel(1);
+    let spawned = thread::Builder::new()
+        .name("upstream-connect".to_owned())
+        .spawn(move || {
+            let connected = connect();
+            PENDING_CONNECTS.fetch_sub(1, Ordering::SeqCst);
+            // Past the deadline no one is waiting, and the stream closes here.
+            drop(done.send(connected));
+        });
+    if let Err(error) = spawned {
+        PENDING_CONNECTS.fetch_sub(1, Ordering::SeqCst);
+        return Err(UpstreamError::Connect(error));
+    }
+    match result.recv_timeout(left) {
+        Ok(Ok(stream)) => Ok(stream),
+        Ok(Err(error)) => Err(UpstreamError::Connect(error)),
+        Err(_) => Err(UpstreamError::ConnectTimeout),
+    }
+}
+
+/// Connect helpers blocked at once.
+static PENDING_CONNECTS: AtomicUsize = AtomicUsize::new(0);
+/// The most connects that may block at once. Each holds a file descriptor, so the PEP's budget
+/// counts them.
+pub const MAX_PENDING_CONNECTS: usize = 64;
+
 impl Upstream for BrokerClient {
-    fn call(&self, request: &UpstreamRequest, timeout: Duration) -> Option<Vec<u8>> {
-        self.exchange(request, timeout).ok()
+    fn call(
+        &self,
+        request: &UpstreamRequest,
+        timeout: Duration,
+    ) -> Result<Vec<u8>, UpstreamFailure> {
+        self.exchange(request, timeout).map_err(|error| {
+            // The broker forwards a call only on its way to a 200, so any other status from it
+            // means nothing was forwarded (SPEC §3.4).
+            if error.not_delivered() || matches!(error, UpstreamError::Status(_)) {
+                UpstreamFailure::NotSent
+            } else {
+                UpstreamFailure::Lost
+            }
+        })
     }
 }
 
@@ -255,6 +332,7 @@ mod tests {
     use crate::forward::tools_call_request;
     use crate::http::{Deadlines, read_request};
     use crate::jcs::JcsValue;
+    use std::io::{Read as _, Write as _};
     use std::os::unix::net::UnixListener;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::thread;
@@ -315,6 +393,89 @@ mod tests {
             crate::jcs::parse(&body).unwrap().pointer("/params/name"),
             Some(&JcsValue::string("get_invoice"))
         );
+    }
+
+    #[test]
+    fn a_failure_says_whether_anything_was_sent() {
+        let (uid, gid) = me();
+        let call = |path: PathBuf| {
+            BrokerClient::new(path, uid, gid, 1024).call(&request(), Duration::from_secs(5))
+        };
+        // Nobody there: no byte left the PEP.
+        let missing = std::env::temp_dir().join(format!("pep-none-{}.sock", std::process::id()));
+        assert_eq!(call(missing), Err(UpstreamFailure::NotSent));
+        // A status: the broker's own contract says it forwarded nothing.
+        for reply in [
+            &b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n"[..],
+            b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n",
+        ] {
+            let (path, server) = broker(Some(reply));
+            assert_eq!(call(path), Err(UpstreamFailure::NotSent));
+            server.join().unwrap();
+        }
+        // Read and then closed with no reply: it may have gone upstream.
+        let (path, server) = broker(None);
+        assert_eq!(call(path), Err(UpstreamFailure::Lost));
+        server.join().unwrap();
+        // A reply that stops short: the same.
+        let (path, server) = broker(Some(
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 4\r\n\r\n{}",
+        ));
+        assert_eq!(call(path), Err(UpstreamFailure::Lost));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn a_server_that_reads_slowly_cannot_stretch_the_deadline() {
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let path =
+            std::env::temp_dir().join(format!("pep-upstream-{}-{n}.sock", std::process::id()));
+        drop(std::fs::remove_file(&path));
+        let listener = UnixListener::bind(&path).unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buffer = vec![0u8; 64 * 1024];
+            while matches!(stream.read(&mut buffer), Ok(read) if read > 0) {
+                thread::sleep(Duration::from_millis(5));
+            }
+        });
+        let body = vec![b'x'; 8 << 20];
+        let started = Instant::now();
+        let error = post(&Post {
+            endpoint: &Endpoint::Unix(path),
+            path: "/mcp",
+            host: "tool",
+            headers: &[],
+            body: &body,
+            timeout: Duration::from_millis(50),
+            max_body: 1024,
+            peer: None,
+        })
+        .unwrap_err();
+        assert!(matches!(error, UpstreamError::WriteTimeout), "{error}");
+        assert!(error.not_delivered());
+        assert!(started.elapsed() < Duration::from_secs(2));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn connect_keeps_the_deadline() {
+        let started = Instant::now();
+        let result: Result<(), UpstreamError> =
+            connect_by(started + Duration::from_millis(30), || {
+                thread::sleep(Duration::from_secs(1));
+                Ok(())
+            });
+        assert!(matches!(result, Err(UpstreamError::ConnectTimeout)));
+        assert!(started.elapsed() < Duration::from_millis(900));
+        let immediate: Result<u8, UpstreamError> =
+            connect_by(Instant::now() + Duration::from_secs(1), || Ok(7));
+        assert_eq!(immediate.unwrap(), 7);
+        let refused: Result<u8, UpstreamError> =
+            connect_by(Instant::now() + Duration::from_secs(1), || {
+                Err(io::ErrorKind::ConnectionRefused.into())
+            });
+        assert!(refused.unwrap_err().not_delivered());
     }
 
     #[test]

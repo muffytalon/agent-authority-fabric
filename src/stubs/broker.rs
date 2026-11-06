@@ -2,6 +2,9 @@
 //!
 //! One request per connection from the PEP, whose uid and gid it requires. It routes
 //! `/mcp/{server_id}` through its own static table (RV4 #12) and:
+//! - refuses, with a status and nothing forwarded, a body that is not one of the shapes the PEP
+//!   builds, so nothing the proof does not cover can reach a tool server (F-16); and any status
+//!   but 200 means nothing was forwarded (SPEC §3.4);
 //! - forwards a proof-less request only for `server/discover` and `tools/list` (drift polls);
 //! - verifies a `tools/call`'s Call Proof against its own lockfile: the server, the epoch, the
 //!   tool's pinned digest, the `action_digest` it recomputes from the forwarded body, and for
@@ -14,20 +17,27 @@
 //!   `_meta["dev.pep-sidecar/outcome"]`, after stripping any such member the tool server sent.
 //!   The tool's `status` maps as P1 says: `executed`, `declined` to `refused`, and anything
 //!   else, or no answer, to `unknown`;
-//! - logs one line per request.
+//! - gives each route its own share of connections for calls, so one slow server cannot take a
+//!   healthy server's, and a call past its route's share is refused unsent;
+//! - logs one line per request, and for a call a line before the upstream write as well, so an
+//!   execution always has a broker record, even if the broker dies mid-call (RV5 V12).
 
 use std::collections::BTreeMap;
+use std::fmt;
 use std::fs::{File, OpenOptions};
-use std::io::Write;
+use std::io::{Read as _, Write};
+use std::net::Shutdown;
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::time::Duration;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
 use crate::config::{Fields, LoadError, Problem, is_plain_name};
-use crate::engine::{ArgRole, EffectClass, ToolPolicy, idempotency_key};
+use crate::engine::{ArgRole, EffectClass, EntityKind, ToolPolicy, entity_key, idempotency_key};
 use crate::forward::{CALL_PROOF_META_KEY, OUTCOME_META_KEY, PROTOCOL_VERSION};
 use crate::http::{Request, Status, response};
 use crate::jcs::{self, JcsObject, JcsString, JcsValue, ParseOptions};
@@ -39,14 +49,28 @@ use crate::upstream::{Endpoint, Post, post};
 
 /// The prefix of every reserved `_meta` member.
 const RESERVED: &str = "dev.pep-sidecar/";
+/// The header carrying a payment's [`entity_key`] to the tool server (RV5 D5).
+pub const ENTITY_KEY_HEADER: &str = "Pep-Entity-Key";
+/// Connections kept out of the routes' shares, for proof-less drift polls (RV4 #9).
+const POLL_RESERVE: usize = 2;
 
 /// One route: where a server listens, and its credential.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Route {
     /// The tool server's endpoint.
     pub endpoint: Endpoint,
     /// Its credential, injected as `Authorization: Bearer …`.
     pub credential: String,
+}
+
+impl fmt::Debug for Route {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Route")
+            .field("endpoint", &self.endpoint)
+            .field("credential", &"<redacted>")
+            .finish()
+    }
 }
 
 /// The broker's own config (RV4 #12).
@@ -108,16 +132,30 @@ pub fn load(
         }
         let mut route = Fields::of(value, &path)?;
         let endpoint_path = route.path_of("endpoint");
-        let endpoint = Endpoint::parse(route.string("endpoint")?).ok_or_else(|| {
+        let endpoint_text = route.string("endpoint")?;
+        let endpoint = Endpoint::parse(endpoint_text).ok_or_else(|| {
             LoadError::at(
                 &endpoint_path,
                 Problem::Invalid("unix:/path or tcp:host:port"),
             )
         })?;
+        // The lockfile holds the reviewed endpoint (RV4 #12): a route elsewhere would hand this
+        // server's credential to whatever listens there.
+        if pins
+            .servers
+            .get(server_id)
+            .is_none_or(|server| server.endpoint != endpoint_text)
+        {
+            return Err(LoadError::at(
+                &endpoint_path,
+                Problem::Invalid("differs from the endpoint pinned for this server"),
+            ));
+        }
         let credential_path = route.path("credential")?;
+        // The file's exact bytes (§4): a tool's verifier is the hash of the file, so a trimmed
+        // credential could never match, and a file with a newline in it is refused here.
         let credential = read(&credential_path)
             .and_then(|bytes| String::from_utf8(bytes).ok())
-            .map(|text| text.trim().to_owned())
             .filter(|text| !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_graphic()))
             .ok_or_else(|| {
                 LoadError::at(
@@ -157,6 +195,31 @@ pub struct Broker {
     config: BrokerConfig,
     cache: ReplayCache,
     log: Mutex<File>,
+    /// Calls upstream now, per route.
+    in_use: BTreeMap<String, AtomicUsize>,
+    /// Calls one route may have upstream at once.
+    route_limit: usize,
+}
+
+/// How far a request got, for the log.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Phase {
+    /// Verified, and about to be written upstream.
+    Forwarding,
+    /// Written upstream.
+    Forwarded,
+    /// Refused here: nothing was written upstream.
+    Rejected,
+}
+
+impl Phase {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Forwarding => "forwarding",
+            Self::Forwarded => "forwarded",
+            Self::Rejected => "rejected",
+        }
+    }
 }
 
 /// What one request came to, for the log.
@@ -164,10 +227,52 @@ struct Verdict {
     jti: Option<String>,
     action_digest: Option<String>,
     idempotency_key: Option<String>,
-    forwarded: bool,
+    entity_key: Option<String>,
+    phase: Phase,
     reason: &'static str,
     outcome: Option<&'static str>,
 }
+
+/// When a request arrived: the times its checks and its log lines use.
+#[derive(Clone, Copy)]
+struct When {
+    now: u64,
+    now_ms: u64,
+    started: Instant,
+}
+
+impl When {
+    /// Microseconds since the request arrived, for the log (O1). Saturating: only a measurement.
+    fn broker_us(self) -> u64 {
+        u64::try_from(self.started.elapsed().as_micros()).unwrap_or(u64::MAX)
+    }
+}
+
+/// One call's share of its route; given back on drop.
+struct RouteSlot<'a>(&'a AtomicUsize);
+
+impl Drop for RouteSlot<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// What a connection past the broker's limit gets, instead of a close the PEP could not tell
+/// from a broker that died mid-call: a status, which says nothing was forwarded (RV5 V4).
+pub fn refuse_overflow(mut stream: UnixStream) {
+    drop(stream.set_write_timeout(Some(OVERFLOW_TIMEOUT)));
+    drop(stream.set_read_timeout(Some(OVERFLOW_TIMEOUT)));
+    let reply =
+        b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+    drop(stream.write_all(reply));
+    drop(stream.shutdown(Shutdown::Write));
+    // Closing with unread data could reset the peer before it reads the reply.
+    let mut sink = [0u8; 4096];
+    drop(stream.read(&mut sink));
+}
+
+/// How long the accept thread gives one refused connection.
+const OVERFLOW_TIMEOUT: Duration = Duration::from_millis(5);
 
 impl Broker {
     /// Opens the log; `boot_second` starts the replay cache's cutoff (R1).
@@ -181,12 +286,25 @@ impl Broker {
             .append(true)
             .open(&config.log)
             .map_err(|error| format!("{}: {error}", config.log.display()))?;
+        let routes = config.routes.len().max(1);
+        let route_limit = config
+            .connections
+            .saturating_sub(POLL_RESERVE)
+            .checked_div(routes)
+            .unwrap_or(0)
+            .max(1);
         Ok(Self {
             cache: ReplayCache::new(
                 config.replay_cache_entries,
                 boot_second,
                 config.clock_skew_secs,
             ),
+            in_use: config
+                .routes
+                .keys()
+                .map(|server| (server.clone(), AtomicUsize::new(0)))
+                .collect(),
+            route_limit,
             config,
             log: Mutex::new(log),
         })
@@ -209,6 +327,11 @@ impl Broker {
     /// Answers one request from the PEP: the HTTP response bytes.
     #[must_use]
     pub fn handle(&self, request: &Request, now: u64, now_ms: u64) -> Vec<u8> {
+        let when = When {
+            now,
+            now_ms,
+            started: Instant::now(),
+        };
         let Some((server_id, route)) = request
             .head
             .target
@@ -229,28 +352,32 @@ impl Broker {
         ) else {
             return response(Status::BadRequest, None);
         };
+        if !known_shape(&message, method) {
+            return response(Status::BadRequest, None);
+        }
         let proof = message
             .pointer("/params/_meta")
             .and_then(|meta| meta.get(CALL_PROOF_META_KEY))
             .and_then(JcsValue::as_str);
         let (body, verdict) = match (method, proof) {
             ("server/discover" | "tools/list", None) => {
-                self.forward(server_id, route, &message, method, None, None)
+                self.forward(server_id, route, &message, method, None, &[])
             }
-            ("tools/call", Some(proof)) => self.call(server_id, route, &message, proof, now),
+            ("tools/call", Some(proof)) => self.call(server_id, route, &message, proof, when),
             _ => (
                 refused(id, false),
                 Verdict {
                     jti: None,
                     action_digest: None,
                     idempotency_key: None,
-                    forwarded: false,
+                    entity_key: None,
+                    phase: Phase::Rejected,
                     reason: "a proof-less request other than discover or list",
                     outcome: None,
                 },
             ),
         };
-        self.write_log(server_id, method, id, &verdict, now_ms);
+        self.write_log(server_id, method, id, &verdict, when);
         response(Status::Ok, Some(("application/json", &body)))
     }
 
@@ -260,7 +387,7 @@ impl Broker {
         route: &Route,
         message: &JcsValue,
         proof: &str,
-        now: u64,
+        when: When,
     ) -> (Vec<u8>, Verdict) {
         let id = message
             .get("id")
@@ -273,7 +400,8 @@ impl Broker {
                     jti: None,
                     action_digest: digest,
                     idempotency_key: None,
-                    forwarded: false,
+                    entity_key: None,
+                    phase: Phase::Rejected,
                     reason,
                     outcome: payment.then_some("refused"),
                 },
@@ -320,36 +448,62 @@ impl Broker {
                     currency,
                 }),
         };
-        let Ok(claims) = verify_call_proof(proof, &verifier, &expect, &self.cache, now) else {
+        let Ok(claims) = verify_call_proof(proof, &verifier, &expect, &self.cache, when.now) else {
             return reject("call proof refused", payment, Some(digest));
         };
         let key = claims
             .payment
             .as_ref()
             .map(|payment| idempotency_key(claims.eid, payment.rid(), &digest));
-        let (body, mut verdict) = self.forward(
+        let invoice_key = expected_payment
+            .as_ref()
+            .and_then(|payment| invoice_key(policy, arguments, payment));
+        let Some(_slot) = self.route_slot(server_id) else {
+            return reject("route at capacity", payment, Some(digest));
+        };
+        // Before the upstream write, as the PEP's `allow` is (RV3 A6): if the broker dies during
+        // the leg, the execution still joins through this line.
+        self.write_log(
             server_id,
-            route,
-            message,
             "tools/call",
-            Some(name),
-            key.as_deref(),
+            id,
+            &Verdict {
+                jti: Some(claims.jti.clone()),
+                action_digest: Some(digest.clone()),
+                idempotency_key: key.clone(),
+                entity_key: invoice_key.clone(),
+                phase: Phase::Forwarding,
+                reason: "",
+                outcome: None,
+            },
+            when,
         );
-        let (body, outcome) = if payment {
-            settle(id, &body)
-        } else {
-            (body, None)
+        let mut extra = Vec::new();
+        if let Some(key) = &key {
+            extra.push(("Idempotency-Key", key.clone()));
+        }
+        if let Some(key) = &invoice_key {
+            extra.push((ENTITY_KEY_HEADER, key.clone()));
+        }
+        let (body, mut verdict) =
+            self.forward(server_id, route, message, "tools/call", Some(name), &extra);
+        let (body, outcome) = match (payment, verdict.phase) {
+            // The tool server cannot have seen it, so it did not execute.
+            (true, Phase::Rejected) => (refused(id, true), Some("refused")),
+            (true, _) => settle(id, &body),
+            (false, _) => (body, None),
         };
         verdict.jti = Some(claims.jti);
         verdict.action_digest = Some(digest);
         verdict.idempotency_key = key;
+        verdict.entity_key = invoice_key;
         verdict.outcome = outcome;
         (body, verdict)
     }
 
     /// Forwards `message`, `dev.pep-sidecar/*` stripped from its `_meta`, with the server's
-    /// credential and, for a payment, its `Idempotency-Key`. Returns the reply to give the PEP
-    /// (the tool server's, with its reserved `_meta` members stripped) and the verdict.
+    /// credential and `extra`, a payment's keys. Returns the reply to give the PEP (the tool
+    /// server's, with its reserved `_meta` members stripped) and the verdict.
     fn forward(
         &self,
         server_id: &str,
@@ -357,7 +511,7 @@ impl Broker {
         message: &JcsValue,
         method: &str,
         name: Option<&str>,
-        key: Option<&str>,
+        extra: &[(&'static str, String)],
     ) -> (Vec<u8>, Verdict) {
         let id = message
             .get("id")
@@ -373,9 +527,7 @@ impl Broker {
         if let Some(name) = name {
             headers.push(("Mcp-Name", name.to_owned()));
         }
-        if let Some(key) = key {
-            headers.push(("Idempotency-Key", key.to_owned()));
-        }
+        headers.extend_from_slice(extra);
         let body = strip_params_meta(message).to_canonical_bytes();
         let reply = post(&Post {
             endpoint: &route.endpoint,
@@ -387,21 +539,43 @@ impl Broker {
             max_body: jcs::MAX_DEFINITION_BYTES,
             peer: None,
         });
-        let verdict = |reason| Verdict {
+        let verdict = |phase, reason| Verdict {
             jti: None,
             action_digest: None,
             idempotency_key: None,
-            forwarded: true,
+            entity_key: None,
+            phase,
             reason,
             outcome: None,
         };
-        match reply.ok().and_then(|body| clean_reply(id, &body)) {
-            Some(clean) => (clean, verdict("")),
-            None => (
+        match reply {
+            Err(error) if error.not_delivered() => (
                 no_answer(id),
-                verdict("no usable answer from the tool server"),
+                verdict(Phase::Rejected, "tool server unreachable"),
             ),
+            Err(_) => (
+                no_answer(id),
+                verdict(Phase::Forwarded, "no usable answer from the tool server"),
+            ),
+            Ok(body) => match clean_reply(id, &body) {
+                Some(clean) => (clean, verdict(Phase::Forwarded, "")),
+                None => (
+                    no_answer(id),
+                    verdict(Phase::Forwarded, "no usable answer from the tool server"),
+                ),
+            },
         }
+    }
+
+    /// A share of `server_id`'s connections for one call, if it has any left.
+    fn route_slot(&self, server_id: &str) -> Option<RouteSlot<'_>> {
+        let counter = self.in_use.get(server_id)?;
+        counter
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
+                (count < self.route_limit).then(|| count.saturating_add(1))
+            })
+            .ok()
+            .map(|_| RouteSlot(counter))
     }
 
     fn pep_verifier(&self) -> Option<Es256Verifier> {
@@ -416,7 +590,7 @@ impl Broker {
         method: &str,
         upstream_id: &str,
         verdict: &Verdict,
-        now_ms: u64,
+        when: When,
     ) {
         let text = |value: Option<&str>| {
             value.map_or_else(
@@ -425,20 +599,19 @@ impl Broker {
             )
         };
         let line = format!(
-            r#"{{"action_digest":{},"idempotency_key":{},"jti":{},"method":{},"outcome":{},"reason":{},"server_id":{},"ts_ms":{now_ms},"upstream_id":{},"v":1,"verdict":{}}}"#,
+            r#"{{"action_digest":{},"broker_us":{},"entity_key":{},"idempotency_key":{},"jti":{},"method":{},"outcome":{},"reason":{},"server_id":{},"ts_ms":{},"upstream_id":{},"v":1,"verdict":{}}}"#,
             text(verdict.action_digest.as_deref()),
+            when.broker_us(),
+            text(verdict.entity_key.as_deref()),
             text(verdict.idempotency_key.as_deref()),
             text(verdict.jti.as_deref()),
             text(Some(method)),
             text(verdict.outcome),
             text(Some(verdict.reason)),
             text(Some(server_id)),
+            when.now_ms,
             text(Some(upstream_id)),
-            text(Some(if verdict.forwarded {
-                "forwarded"
-            } else {
-                "rejected"
-            })),
+            text(Some(verdict.phase.name())),
         );
         if let Ok(mut log) = self.log.lock() {
             drop(
@@ -447,6 +620,33 @@ impl Broker {
             );
         }
     }
+}
+
+/// Whether `message` is one of the shapes the PEP builds (F-16). The Call Proof covers only the
+/// name and the arguments, so nothing else may be forwarded on its strength.
+fn known_shape(message: &JcsValue, method: &str) -> bool {
+    let Some(object) = message.as_object() else {
+        return false;
+    };
+    let members_ok = object
+        .entries()
+        .iter()
+        .all(|(key, _)| matches!(key.as_str(), "id" | "jsonrpc" | "method" | "params"));
+    let params: &[&str] = match method {
+        "tools/call" => &["_meta", "arguments", "name"],
+        "tools/list" => &["_meta", "cursor"],
+        _ => &["_meta"],
+    };
+    members_ok
+        && message
+            .get("params")
+            .and_then(JcsValue::as_object)
+            .is_some_and(|given| {
+                given
+                    .entries()
+                    .iter()
+                    .all(|(key, _)| params.contains(&key.as_str()))
+            })
 }
 
 /// The forwarded amount and currency of a payment, at its declared pointers.
@@ -458,6 +658,21 @@ fn expected_payment(policy: &ToolPolicy, arguments: &JcsValue) -> Option<(u64, S
     let amount = u64::try_from(at(ArgRole::Amount)?.as_i64()?).ok()?;
     let currency = at(ArgRole::Currency)?.as_str()?.to_owned();
     Some((amount, currency))
+}
+
+/// A payment's [`entity_key`], if it pays an invoice (RV5 D5). A recipient has none: paying one
+/// payee twice can be legitimate.
+fn invoice_key(
+    policy: &ToolPolicy,
+    arguments: &JcsValue,
+    (amount, currency): &(u64, String),
+) -> Option<String> {
+    let spec = policy
+        .args
+        .iter()
+        .find(|spec| spec.role == ArgRole::Entity(EntityKind::Invoice))?;
+    let invoice = arguments.pointer(&spec.pointer)?.as_str()?;
+    Some(entity_key(invoice, *amount, currency))
 }
 
 /// `message` with every reserved member removed from `params._meta`.
@@ -636,6 +851,146 @@ fn no_answer_payment(id: &str) -> Vec<u8> {
 )]
 mod tests {
     use super::*;
+
+    /// A config for `connections` connections and routes to servers `a` and `b`, with `a`'s
+    /// route at `endpoint`.
+    fn config_text(connections: usize, endpoint: &str) -> String {
+        let log = std::env::temp_dir().join(format!(
+            "pep-broker-log-{}-{connections}",
+            std::process::id()
+        ));
+        format!(
+            r#"{{"socket":"/s","pep":{{"uid":1,"gid":1}},"pep_key":"/k","pins":"/pins",
+            "routes":{{"a":{{"endpoint":"{endpoint}","credential":"/c"}},"b":{{"endpoint":"unix:/b","credential":"/c"}}}},
+            "replay_cache_entries":16,"clock_skew_ms":0,"connections":{connections},"upstream_timeout_ms":1000,"log":"{}"}}"#,
+            log.display()
+        )
+    }
+
+    /// Loads [`config_text`], with its pins and credentials read from nowhere.
+    fn load_config(connections: usize, endpoint: &str) -> Result<BrokerConfig, LoadError> {
+        load_with(connections, endpoint, b"s3cret")
+    }
+
+    /// [`load_config`], with the file bytes of every credential.
+    fn load_with(
+        connections: usize,
+        endpoint: &str,
+        credential: &[u8],
+    ) -> Result<BrokerConfig, LoadError> {
+        let server = |name: &str, endpoint: &str| {
+            format!(
+                r#""{name}":{{"endpoint":"{endpoint}","identity":"spiffe://{name}","protocol_version":"2026-07-28","discover":{{}},"tools":{{}}}}"#
+            )
+        };
+        let pins = format!(
+            r#"{{"lockfile_version":1,"release_epoch":7,"stores":{{}},"servers":{{{},{}}}}}"#,
+            server("a", "unix:/a"),
+            server("b", "unix:/b"),
+        );
+        load(config_text(connections, endpoint).as_bytes(), &|path| {
+            Some(if path == Path::new("/pins") {
+                pins.clone().into_bytes()
+            } else {
+                credential.to_vec()
+            })
+        })
+    }
+
+    #[test]
+    fn a_credential_is_the_files_exact_bytes() {
+        // A tool's verifier hashes the file, so a trimmed newline could never match it.
+        assert!(load_with(8, "unix:/a", b"s3cret\n").is_err());
+        assert!(load_with(8, "unix:/a", b" s3cret").is_err());
+        assert!(load_with(8, "unix:/a", b"").is_err());
+        assert_eq!(
+            load_with(8, "unix:/a", b"s3cret").unwrap().routes["a"].credential,
+            "s3cret"
+        );
+    }
+
+    #[test]
+    fn a_route_never_prints_its_credential() {
+        let config = load_config(8, "unix:/a").unwrap();
+        assert_eq!(config.routes["a"].credential, "s3cret");
+        assert!(!format!("{config:?}").contains("s3cret"));
+    }
+
+    #[test]
+    fn a_route_must_go_where_the_lockfile_says() {
+        assert!(load_config(8, "unix:/a").is_ok());
+        let elsewhere = load_config(8, "unix:/attacker");
+        assert!(
+            elsewhere
+                .unwrap_err()
+                .to_string()
+                .contains("differs from the endpoint pinned")
+        );
+    }
+
+    #[test]
+    fn one_route_cannot_take_every_connection() {
+        let config = load_config(10, "unix:/a").unwrap();
+        let log = config.log.clone();
+        let broker = Broker::open(config, 0).unwrap();
+        // Ten connections, two kept back for polls, and two routes: four each.
+        let taken: Vec<_> = (0..4).map(|_| broker.route_slot("a").unwrap()).collect();
+        assert!(broker.route_slot("a").is_none());
+        assert!(
+            broker.route_slot("b").is_some(),
+            "the other route is not affected"
+        );
+        assert!(broker.route_slot("unrouted").is_none());
+        drop(taken);
+        assert!(broker.route_slot("a").is_some(), "slots are given back");
+        // Whatever the arithmetic says, a route can always make progress.
+        let few = load_config(1, "unix:/a").unwrap();
+        let log_few = few.log.clone();
+        assert!(Broker::open(few, 0).unwrap().route_slot("a").is_some());
+        drop(std::fs::remove_file(log));
+        drop(std::fs::remove_file(log_few));
+    }
+
+    #[test]
+    fn only_the_shapes_the_pep_builds_are_forwarded() {
+        let shape =
+            |text: &str, method: &str| known_shape(&jcs::parse(text.as_bytes()).unwrap(), method);
+        assert!(shape(
+            r#"{"id":"01J","jsonrpc":"2.0","method":"tools/call","params":{"_meta":{},"arguments":{},"name":"t"}}"#,
+            "tools/call"
+        ));
+        assert!(shape(
+            r#"{"id":"01J","jsonrpc":"2.0","method":"tools/list","params":{"_meta":{},"cursor":"c"}}"#,
+            "tools/list"
+        ));
+        // The proof covers the name and the arguments only, so nothing else may ride on it.
+        assert!(!shape(
+            r#"{"id":"01J","jsonrpc":"2.0","method":"tools/call","extra":1,"params":{"_meta":{},"arguments":{},"name":"t"}}"#,
+            "tools/call"
+        ));
+        assert!(!shape(
+            r#"{"id":"01J","jsonrpc":"2.0","method":"tools/call","params":{"_meta":{},"arguments":{},"name":"t","task":{}}}"#,
+            "tools/call"
+        ));
+        assert!(!shape(
+            r#"{"id":"01J","jsonrpc":"2.0","method":"tools/list","params":{"_meta":{},"arguments":{}}}"#,
+            "tools/list"
+        ));
+        assert!(!shape(
+            r#"{"id":"01J","jsonrpc":"2.0","method":"tools/list"}"#,
+            "tools/list"
+        ));
+        assert!(!shape("[]", "tools/list"));
+    }
+
+    #[test]
+    fn a_connection_past_the_limit_gets_a_status_not_a_close() {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        refuse_overflow(server);
+        let mut reply = Vec::new();
+        client.read_to_end(&mut reply).unwrap();
+        assert!(reply.starts_with(b"HTTP/1.1 503 "));
+    }
 
     #[test]
     fn the_tool_server_never_sees_reserved_meta() {

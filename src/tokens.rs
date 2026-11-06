@@ -78,6 +78,7 @@ const SEGMENT_OPTIONS: ParseOptions = ParseOptions {
 };
 
 const HEADER_MEMBERS: [&str; 3] = ["alg", "kid", "typ"];
+#[cfg(test)]
 const EPISODE_MEMBERS: [&str; 10] = [
     "client_id",
     "eid",
@@ -637,6 +638,7 @@ impl EpisodeClaims {
         ])
     }
 
+    #[cfg(test)]
     fn from_object(object: &JcsObject) -> Result<Self, TokenError> {
         if !has_exactly(object, &EPISODE_MEMBERS) {
             return Err(TokenError::InvalidClaims);
@@ -663,15 +665,16 @@ impl EpisodeClaims {
     }
 }
 
-/// What the PEP requires of an Episode Token on one connection (M1).
+/// What a test requires of an Episode Token (M1).
+#[cfg(test)]
 #[derive(Debug, Clone, Copy)]
-pub struct EpisodeExpectations<'a> {
+struct EpisodeExpectations<'a> {
     /// The connection's peer uid.
-    pub peer_uid: u32,
+    peer_uid: u32,
     /// The loaded lockfile's release epoch.
-    pub release_epoch: u64,
+    release_epoch: u64,
     /// The configured intent's digest.
-    pub intent_digest: &'a str,
+    intent_digest: &'a str,
 }
 
 /// Mints an Episode Token. The caller also registers the episode with
@@ -689,15 +692,12 @@ pub fn mint_episode_token(
     signer.sign(EPISODE_TYP, claims.to_object()?)
 }
 
-/// Verifies an Episode Token presented on a connection, and records the use against its
-/// episode (which resets the idle timer).
-///
-/// # Errors
-///
-/// Returns the [`TokenError`] of the first failing check: the JOSE rules, the claims, the
-/// expectations (`peer_uid`, `release_epoch`, `intent_digest`), then the time window and the
-/// episode's state.
-pub fn verify_episode_token(
+/// Verifies an Episode Token, and records the use against its episode. The PEP is the only
+/// issuer and the only verifier, so production admits a token by its exact bytes instead
+/// ([`admit_minted_episode`], T1). This remains for tests: what they verify here is that a minted
+/// token meets the profile.
+#[cfg(test)]
+fn verify_episode_token(
     token: &str,
     verifier: &Es256Verifier,
     expect: &EpisodeExpectations<'_>,
@@ -715,15 +715,10 @@ pub fn verify_episode_token(
     )
 }
 
-/// [`verify_episode_token`] for a PEP with several intents: the digest the token must carry is
-/// that of its own episode's intent, found by `intent_digest_of` from the token's `eid` once
-/// the signature, peer and epoch checks pass. An `eid` it does not know is
-/// [`TokenError::IntentMismatch`].
-///
-/// # Errors
-///
-/// As [`verify_episode_token`].
-pub fn verify_episode_token_with(
+/// [`verify_episode_token`], with the digest the token must carry found by `intent_digest_of`
+/// from the token's `eid`. An `eid` it does not know is [`TokenError::IntentMismatch`].
+#[cfg(test)]
+fn verify_episode_token_with(
     token: &str,
     verifier: &Es256Verifier,
     peer_uid: u32,
@@ -744,6 +739,30 @@ pub fn verify_episode_token_with(
     }
     episodes.admit(&claims, now)?;
     Ok(claims)
+}
+
+/// The checks on an Episode Token whose exact bytes this boot minted, so no signature check is
+/// left to do: the peer, the epoch, then the time window and the episode's state, which also
+/// resets its idle timer. The registry finds such a token by its digest (T1), so a forged token
+/// costs a hash and a lookup, never a P-256 verify (RV5 V6).
+///
+/// # Errors
+///
+/// Returns the [`TokenError`] of the first failing check.
+pub fn admit_minted_episode(
+    claims: &EpisodeClaims,
+    peer_uid: u32,
+    release_epoch: u64,
+    episodes: &EpisodeStates,
+    now: u64,
+) -> Result<(), TokenError> {
+    if claims.peer_uid != peer_uid {
+        return Err(TokenError::PeerMismatch);
+    }
+    if claims.release_epoch != release_epoch {
+        return Err(TokenError::EpochMismatch);
+    }
+    episodes.admit(claims, now)
 }
 
 /// End and idle state of this boot's episodes, keyed by `eid`, never by token bytes: every

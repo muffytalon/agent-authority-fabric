@@ -38,6 +38,10 @@ pub const MAX_RESULT_POINTER_BYTES: usize = 4_194_304;
 /// Total RFC 6901 pointer bytes the recorded results and trusted inputs of one episode may
 /// produce.
 pub const MAX_EPISODE_POINTER_BYTES: usize = 16_777_216;
+/// Bytes of tool results and trusted inputs one episode may keep. The node and pointer quotas
+/// bound how many values an episode keeps, not how large they are: without this, one 1 MiB note
+/// read 256 times pins hundreds of MiB per episode (RV5 V9).
+pub const MAX_EPISODE_RESULT_BYTES: usize = 64 * 1024 * 1024;
 /// Maximum number of allowed calls still awaiting their result. The host must record, abandon,
 /// release or settle every allowed call.
 pub const MAX_IN_FLIGHT: usize = 64;
@@ -189,10 +193,15 @@ pub enum PolicyError {
     #[error("episode call limit exceeded")]
     CallLimitExceeded,
     /// The episode cannot record another result: its recorded results plus the calls still in
-    /// flight have reached [`MAX_RECORDS`]. Denying here, before anything runs, keeps a call
-    /// from executing with no result the engine can record (RV4 #18).
+    /// flight have reached [`MAX_RECORDS`], or those calls' largest results would pass
+    /// [`MAX_EPISODE_RESULT_BYTES`]. Denying here, before anything runs, keeps a call from
+    /// executing with no result the engine can record (RV4 #18).
     #[error("episode records exhausted")]
     RecordsExhausted,
+    /// The tools have declined `limits.max_declines` of the intent's payments, so it pays no
+    /// more (RV5 D6).
+    #[error("payment decline limit reached")]
+    DeclineLimitReached,
     /// A payment to the same entity is still unresolved. An entity in the PEP-wide unresolved
     /// set (a `NeedsReconcile` reservation of any episode, or one restored at boot, R1) blocks
     /// every payment to it (P1), and a `Held`, `AwaitingStepUp` or `Forwarded` reservation
@@ -656,8 +665,9 @@ pub struct LabelEntry {
 /// Cross-episode taint labels, shared by every [`PepEngine`] through `Arc`.
 pub trait LabelStore: Send + Sync + fmt::Debug {
     /// Joins `entry.label` into the label stored under each of `indexes`: one call's F-08
-    /// entries, recorded together (RV3 A9). Atomic: on an error no index changes, so a
-    /// journal-backed store writes them as one record with one fsync.
+    /// entries, recorded together (RV3 A9), so a journal-backed store writes them as one record
+    /// with one fsync. All or none: a batch that does not fit changes nothing. If the store
+    /// cannot make a fitted batch durable it may keep it, which only taints more (fail closed).
     ///
     /// # Errors
     ///
@@ -709,18 +719,7 @@ impl InMemoryLabelStore {
     }
 }
 
-impl InMemoryLabelStore {
-    /// Whether `indexes` would fit: the store's entries plus those of `indexes` it does not
-    /// hold yet, counted once each, stay within its capacity.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`StoreError::Poisoned`] if the lock is poisoned.
-    pub fn fits(&self, indexes: &[TaintIndex]) -> Result<bool, StoreError> {
-        let entries = self.entries.lock().map_err(|_| StoreError::Poisoned)?;
-        Ok(fits_in(&entries, self.capacity, indexes))
-    }
-}
+impl InMemoryLabelStore {}
 
 fn fits_in(
     entries: &BTreeMap<TaintIndex, StoredLabel>,
@@ -897,6 +896,11 @@ pub struct Limits {
     pub max_calls: u32,
     /// Payments above this amount need step-up approval.
     pub step_up_over_minor: u64,
+    /// Payments a tool may decline before the intent stops paying. A decline refunds its amount
+    /// (P1), so a provider that says `declined` and executes anyway could otherwise move
+    /// `max_calls * per_call_max_minor` past the cap: this bounds that at
+    /// `max_declines * per_call_max_minor` (RV5 D6).
+    pub max_declines: u32,
 }
 
 /// The entities an intent authorizes.
@@ -995,6 +999,9 @@ pub enum Settlement {
     Executed,
     /// The payment did not execute, or nobody knows whether it did.
     Aborted(AbortOutcome),
+    /// The tool declined it: released as `Aborted(DefinitelyNotExecuted)` is, and counted
+    /// against `limits.max_declines`, because only the tool's word says it did not execute.
+    Declined,
 }
 
 /// Outcome reported when a payment is aborted.
@@ -1036,6 +1043,8 @@ pub struct Budget {
     pub committed: u64,
     /// Number of payment reservations made.
     pub calls: u32,
+    /// Payments a tool declined (RV5 D6).
+    pub declined: u32,
     /// Payments per entity.
     pub entity_uses: BTreeMap<String, u32>,
     /// Reservations by id.
@@ -1053,6 +1062,7 @@ impl Budget {
             reserved: 0,
             committed: 0,
             calls: 0,
+            declined: 0,
             entity_uses: BTreeMap::new(),
             reservations: BTreeMap::new(),
             restored: BTreeMap::new(),
@@ -1079,6 +1089,8 @@ pub struct Ledger {
     pub committed_minor: u64,
     /// Payment reservations made, released ones included (SPEC §3.1).
     pub calls: u32,
+    /// Payments a tool declined (RV5 D6).
+    pub declined: u32,
     /// Payments per entity (NFC), unresolved ones included.
     pub entity_uses: BTreeMap<String, u32>,
     /// Unresolved reservations, by their original (eid, rid).
@@ -1094,6 +1106,7 @@ impl Ledger {
         Self {
             committed_minor: 0,
             calls: 0,
+            declined: 0,
             entity_uses: BTreeMap::new(),
             unresolved: BTreeMap::new(),
             context_conf: Confidentiality::Public,
@@ -1138,15 +1151,6 @@ impl Recorded {
     }
 }
 
-/// A recorded leaf, located by record and pointer.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LeafRef {
-    /// `seq` of the record.
-    pub seq: u64,
-    /// Pointer of the leaf.
-    pub pointer: String,
-}
-
 /// An allowed call whose result has not been recorded yet.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InFlight {
@@ -1176,8 +1180,6 @@ pub struct EpisodeState {
     pub records: BTreeMap<u64, Recorded>,
     /// `seq` of the next record.
     pub next_seq: u64,
-    /// Recorded leaves keyed by canonical bytes (for the Week 2 `prov` claim).
-    pub leaf_index: BTreeMap<Vec<u8>, Vec<LeafRef>>,
     /// Every call id the episode has allowed, and every trusted-input id. Ids are never reused,
     /// so a late result cannot be attributed to a different call.
     pub recorded_call_ids: BTreeSet<String>,
@@ -1193,6 +1195,8 @@ pub struct EpisodeState {
     pub label_quota_remaining: usize,
     /// Pointer bytes the episode's recorded results and trusted inputs may still produce.
     pub pointer_bytes_remaining: usize,
+    /// Result bytes the episode may still keep ([`MAX_EPISODE_RESULT_BYTES`]).
+    pub result_bytes_remaining: usize,
 }
 
 impl EpisodeState {
@@ -1203,7 +1207,6 @@ impl EpisodeState {
             context_conf,
             records: BTreeMap::new(),
             next_seq: 1,
-            leaf_index: BTreeMap::new(),
             recorded_call_ids: BTreeSet::new(),
             in_flight: BTreeMap::new(),
             last_tool: None,
@@ -1211,6 +1214,7 @@ impl EpisodeState {
             result_nodes_remaining: MAX_EPISODE_RESULT_NODES,
             label_quota_remaining: MAX_LABEL_ENTRIES_PER_EPISODE,
             pointer_bytes_remaining: MAX_EPISODE_POINTER_BYTES,
+            result_bytes_remaining: MAX_EPISODE_RESULT_BYTES,
         }
     }
 }
@@ -1465,6 +1469,78 @@ impl UnresolvedEntities {
     }
 }
 
+/// How many payments each invoice has, live or committed, PEP-wide (RV5 V1). `entity_uses` and
+/// `PaymentPending` are per engine, and two intents may name one invoice (R1), so without this
+/// each intent pays it once, under its own F-07 key, which the provider cannot dedupe. A
+/// reservation of an invoice intent claims a use when it is made; a release gives it back; a
+/// commit or an unresolved outcome keeps it. Recipients are not claimed: paying one payee from
+/// two intents is ordinary.
+#[derive(Debug)]
+pub struct EntityClaims {
+    uses: Mutex<BTreeMap<String, u32>>,
+}
+
+impl EntityClaims {
+    /// No invoice claimed.
+    #[must_use]
+    pub const fn empty() -> Self {
+        Self {
+            uses: Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    /// Adds `uses` an earlier boot left behind (R1). They count once per intent's ledger.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Poisoned`] if the lock was poisoned, or
+    /// [`StoreError::CapacityExceeded`] if the count overflows.
+    pub fn restore(&self, entity: &str, uses: u32) -> Result<(), StoreError> {
+        let mut claims = self.uses.lock().map_err(|_| StoreError::Poisoned)?;
+        let count = claims.entry(entity.to_owned()).or_insert(0);
+        *count = count
+            .checked_add(uses)
+            .ok_or(StoreError::CapacityExceeded)?;
+        Ok(())
+    }
+
+    /// Whether `entity` has fewer than `max` uses. A poisoned lock allows none.
+    fn allows(&self, entity: &str, max: u32) -> bool {
+        self.uses
+            .lock()
+            .is_ok_and(|claims| claims.get(entity).copied().unwrap_or(0) < max)
+    }
+
+    /// Takes a use of `entity` if it has fewer than `max`, atomically: of two engines racing for
+    /// the last use, one gets it.
+    fn try_claim(&self, entity: &str, max: u32) -> bool {
+        let Ok(mut claims) = self.uses.lock() else {
+            return false;
+        };
+        let count = claims.entry(entity.to_owned()).or_insert(0);
+        if *count >= max {
+            return false;
+        }
+        match count.checked_add(1) {
+            Some(next) => {
+                *count = next;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Gives a use back. A count that is already zero, or a poisoned lock, keeps what it has,
+    /// which only ever blocks more.
+    fn release(&self, entity: &str) {
+        if let Ok(mut claims) = self.uses.lock()
+            && let Some(count) = claims.get_mut(entity)
+        {
+            *count = count.saturating_sub(1);
+        }
+    }
+}
+
 /// The PEP-wide state that every episode's engine shares.
 #[derive(Debug, Clone)]
 pub struct Shared {
@@ -1474,6 +1550,8 @@ pub struct Shared {
     pub servers: Arc<ServerStates>,
     /// The entities with an unresolved payment (R1, RV4 #1).
     pub unresolved: Arc<UnresolvedEntities>,
+    /// The invoices with a live or committed payment (RV5 V1).
+    pub claims: Arc<EntityClaims>,
 }
 
 /// The policy enforcement engine for one episode.
@@ -1485,6 +1563,7 @@ pub struct PepEngine {
     labels: Arc<dyn LabelStore>,
     servers: Arc<ServerStates>,
     unresolved: Arc<UnresolvedEntities>,
+    claims: Arc<EntityClaims>,
 }
 
 struct RoleArgs<'a> {
@@ -1552,8 +1631,9 @@ struct Plan {
 
 #[derive(Clone, Copy)]
 struct RecordQuotas {
-    result_nodes_remaining: usize,
-    pointer_bytes_remaining: usize,
+    result_nodes: usize,
+    pointer_bytes: usize,
+    result_bytes: usize,
 }
 
 struct LabelCtx<'a> {
@@ -1596,6 +1676,7 @@ impl PepEngine {
             labels: shared.labels,
             servers: shared.servers,
             unresolved: shared.unresolved,
+            claims: shared.claims,
         })
     }
 
@@ -1735,7 +1816,7 @@ impl PepEngine {
             return Err(StoreError::CapacityExceeded.into());
         }
         let options = ParseOptions::result(
-            tool.max_result_bytes,
+            tool.max_result_bytes.min(self.state.result_bytes_remaining),
             tool.max_result_nodes.min(self.state.result_nodes_remaining),
         );
         let parsed = jcs::parse_with(raw_result, &options).map_err(result_parse_error)?;
@@ -1762,7 +1843,11 @@ impl PepEngine {
         label_tree(&ctx, &result, "", 0, None, &mut remaining, &mut leaves)?;
         let seq = self.state.next_seq;
         let next_seq = seq.checked_add(1).ok_or(StoreError::CapacityExceeded)?;
-        let quotas = self.quotas_after(parsed.nodes, budget, remaining)?;
+        let quotas = self.quotas_after(parsed.nodes, budget, remaining, raw_result.len())?;
+        let keep_arguments = self.is_lookup_tool(&in_flight.tool);
+        // G_seq: a call counts once it has really run, so one that failed, was released or came
+        // back an error leaves the sequence where it was. A payment counts at its commit.
+        let ran = !is_error && tool.effect != EffectClass::Payment;
         let ratchet = leaves
             .iter()
             .map(|leaf| leaf.label.conf)
@@ -1772,13 +1857,22 @@ impl PepEngine {
             .in_flight
             .remove(call_id)
             .ok_or(PepError::UnknownCall)?;
+        if ran {
+            self.state.last_tool = Some(in_flight.tool.clone());
+        }
         self.commit_record(
             Recorded {
                 seq,
                 source_call_id: call_id.to_owned(),
                 tool: in_flight.tool,
                 query_digest: in_flight.action_digest,
-                arguments: in_flight.arguments,
+                // Only a witness search reads them. A free-form tool's arguments are the agent's
+                // to size, up to 1 MiB per call, so they are not kept (RV5 V9).
+                arguments: if keep_arguments {
+                    in_flight.arguments
+                } else {
+                    JcsValue::Null
+                },
                 is_error,
                 leaves,
             },
@@ -1822,7 +1916,7 @@ impl PepEngine {
         trusted_leaves(&value, "", label, &mut remaining, &mut leaves)?;
         let seq = self.state.next_seq;
         let next_seq = seq.checked_add(1).ok_or(StoreError::CapacityExceeded)?;
-        let quotas = self.quotas_after(0, budget, remaining)?;
+        let quotas = self.quotas_after(0, budget, remaining, raw.len())?;
         let query_digest = jcs::digest_value(&value);
         self.commit_record(
             Recorded {
@@ -1952,6 +2046,7 @@ impl PepEngine {
         Ledger {
             committed_minor: budget.committed,
             calls: budget.calls,
+            declined: budget.declined,
             entity_uses,
             unresolved,
             context_conf: self.state.context_conf,
@@ -2019,8 +2114,15 @@ impl PepEngine {
         // 7. G_budget (computes the plan, applies nothing)
         let taint_writes = planned_writes(tool, canon.store_key.as_ref(), &canon.roles);
         let payment = payment_inputs(tool, amount, entity, witness.as_ref())?;
-        let (payment, label_quota_after) =
-            g_budget(state, &self.unresolved, tool, payment, taint_writes.len())?;
+        let (payment, label_quota_after) = g_budget(
+            state,
+            &self.pins,
+            &self.unresolved,
+            &self.claims,
+            tool,
+            payment,
+            taint_writes.len(),
+        )?;
 
         // 8. G_label
         let input = g_label(&*self.labels, state, tool, &canon, witness.as_ref())?;
@@ -2043,8 +2145,10 @@ impl PepEngine {
         })
     }
 
-    /// The only mutation point. The fallible label writes run first, so nothing ever needs
-    /// rolling back; everything after them was computed by the guards and cannot fail.
+    /// The only mutation point. The invoice claim and the fallible label writes run first, in
+    /// that order, and a failed write gives the claim back, so nothing else ever needs rolling
+    /// back; everything after them was computed by the guards and cannot fail. A claim lost to
+    /// another engine is `G_budget`'s denial, found here, because only this step can take it.
     fn apply(&mut self, plan: Plan, input_conf: Confidentiality) -> Result<Decision, PepError> {
         let Plan {
             call_id,
@@ -2063,7 +2167,27 @@ impl PepEngine {
             label: write_label,
             writer_episode: episode_id,
         };
-        self.labels.record_all(&taint_writes, entry)?;
+        // G_budget saw a free use, but another episode may have taken it since. First, so losing
+        // that race changes nothing (F-06).
+        let claimed = payment
+            .as_ref()
+            .filter(|_| self.state.intent.entities.ids.kind() == EntityKind::Invoice);
+        if let Some(payment) = claimed
+            && !self.claims.try_claim(
+                &payment.entity,
+                self.state.intent.entities.per_entity_max_uses,
+            )
+        {
+            // F-09: this is G_budget's denial, only found late.
+            self.state.context_conf = self.state.context_conf.max(input_conf);
+            return Err(deny(GuardId::Budget, PolicyError::PaymentPending));
+        }
+        if let Err(error) = self.labels.record_all(&taint_writes, entry) {
+            if let Some(payment) = claimed {
+                self.claims.release(&payment.entity);
+            }
+            return Err(error.into());
+        }
 
         let state = &mut self.state;
         state.label_quota_remaining = label_quota_after;
@@ -2136,38 +2260,54 @@ impl PepEngine {
         state.in_flight.insert(
             call_id,
             InFlight {
-                tool: tool.clone(),
+                tool,
                 action_digest,
                 arguments,
                 store_key,
                 input_conf,
             },
         );
-        state.last_tool = Some(tool);
         Ok(decision)
     }
 
-    /// The episode's result-node and pointer-byte quotas once a record that used `nodes` values
-    /// and `budget - remaining` pointer bytes is stored. Computed before anything changes, so an
+    /// Whether a pinned payment's amount binding names `tool` as its lookup, so that a witness
+    /// search needs the arguments of its records.
+    fn is_lookup_tool(&self, tool: &str) -> bool {
+        self.pins.tools.values().any(|policy| {
+            policy
+                .amount_binding
+                .as_ref()
+                .is_some_and(|binding| binding.lookup_tool == tool)
+        })
+    }
+
+    /// The episode's quotas once a record that used `nodes` values, `budget - remaining` pointer
+    /// bytes and `bytes` result bytes is stored. Computed before anything changes, so an
     /// inconsistent count refuses the record instead of leaving the episode half-updated.
     fn quotas_after(
         &self,
         nodes: usize,
         budget: usize,
         remaining: usize,
+        bytes: usize,
     ) -> Result<RecordQuotas, StoreError> {
         let full = StoreError::CapacityExceeded;
         let pointer_bytes = budget.checked_sub(remaining).ok_or(full)?;
         Ok(RecordQuotas {
-            result_nodes_remaining: self
+            result_nodes: self
                 .state
                 .result_nodes_remaining
                 .checked_sub(nodes)
                 .ok_or(full)?,
-            pointer_bytes_remaining: self
+            pointer_bytes: self
                 .state
                 .pointer_bytes_remaining
                 .checked_sub(pointer_bytes)
+                .ok_or(full)?,
+            result_bytes: self
+                .state
+                .result_bytes_remaining
+                .checked_sub(bytes)
                 .ok_or(full)?,
         })
     }
@@ -2180,19 +2320,10 @@ impl PepEngine {
         ratchet: Confidentiality,
     ) {
         let state = &mut self.state;
-        for leaf in &record.leaves {
-            state
-                .leaf_index
-                .entry(leaf.value.to_canonical_bytes())
-                .or_default()
-                .push(LeafRef {
-                    seq: record.seq,
-                    pointer: leaf.pointer.clone(),
-                });
-        }
         state.context_conf = state.context_conf.max(ratchet);
-        state.result_nodes_remaining = quotas.result_nodes_remaining;
-        state.pointer_bytes_remaining = quotas.pointer_bytes_remaining;
+        state.result_nodes_remaining = quotas.result_nodes;
+        state.pointer_bytes_remaining = quotas.pointer_bytes;
+        state.result_bytes_remaining = quotas.result_bytes;
         state
             .recorded_call_ids
             .insert(record.source_call_id.clone());
@@ -2262,6 +2393,7 @@ impl PepEngine {
     ///   in flight, so its result can still be recorded.
     /// - `Aborted(DefinitelyNotExecuted)` releases the reservation, its amount and its entity
     ///   use.
+    /// - `Declined` does the same, and counts against `limits.max_declines`.
     /// - `Aborted(Unknown)` makes it `NeedsReconcile`, still counted in `reserved` (fail closed),
     ///   and adds its entity to the PEP-wide unresolved set.
     ///
@@ -2283,6 +2415,17 @@ impl PepEngine {
             Settlement::Executed => self.commit(reservation_id),
             Settlement::Aborted(AbortOutcome::DefinitelyNotExecuted) => {
                 self.release(reservation_id)
+            }
+            Settlement::Declined => {
+                let declined = self
+                    .state
+                    .budget
+                    .declined
+                    .checked_add(1)
+                    .ok_or(PepError::InvalidTransition)?;
+                self.release(reservation_id)?;
+                self.state.budget.declined = declined;
+                Ok(())
             }
             Settlement::Aborted(AbortOutcome::Unknown) => {
                 // PEP-wide first: if that fails, nothing changes and the reservation stays
@@ -2338,9 +2481,12 @@ impl PepEngine {
             .committed
             .checked_add(amount)
             .ok_or(PepError::InvalidTransition)?;
-        self.set_state(reservation_id, ResState::Committed)?;
+        let call_id = self.set_state(reservation_id, ResState::Committed)?;
         self.state.budget.reserved = reserved;
         self.state.budget.committed = committed;
+        if let Some(call) = self.state.in_flight.get(&call_id) {
+            self.state.last_tool = Some(call.tool.clone());
+        }
         Ok(())
     }
 
@@ -2367,6 +2513,9 @@ impl PepEngine {
         let entity = reservation.entity.clone();
         let call_id = self.set_state(reservation_id, ResState::Released)?;
         self.state.budget.reserved = reserved;
+        if self.state.intent.entities.ids.kind() == EntityKind::Invoice {
+            self.claims.release(&entity);
+        }
         self.state.budget.entity_uses.insert(entity, uses);
         self.state.in_flight.remove(&call_id);
         Ok(())
@@ -2396,6 +2545,7 @@ fn restore_budget(
         reserved,
         committed: ledger.committed_minor,
         calls: ledger.calls,
+        declined: ledger.declined,
         entity_uses: ledger.entity_uses,
         reservations: BTreeMap::new(),
         restored: ledger.unresolved,
@@ -2415,6 +2565,8 @@ pub fn validate_config(intent: &PepIntent, pins: &ToolPins) -> Result<(), Config
     if limits.per_call_max_minor == 0
         || limits.per_call_max_minor > limits.cumulative_max_minor
         || limits.max_calls == 0
+        || limits.max_declines == 0
+        || limits.max_declines > limits.max_calls
     {
         return Err(ConfigError::InconsistentLimits);
     }
@@ -3040,9 +3192,24 @@ fn blocks_payment(reservation: &Reservation, tool: &ToolPolicy, entity: &str) ->
         }
 }
 
+/// Whether every call in flight, and one more of `tool`, could record its largest result within
+/// the episode's byte quota. An overflow counts as no room (fail closed).
+fn result_bytes_fit(state: &EpisodeState, pins: &ToolPins, tool: &ToolPolicy) -> bool {
+    state
+        .in_flight
+        .values()
+        .filter_map(|call| pins.tools.get(&call.tool))
+        .try_fold(tool.max_result_bytes, |total, other| {
+            total.checked_add(other.max_result_bytes)
+        })
+        .is_some_and(|needed| needed <= state.result_bytes_remaining)
+}
+
 fn g_budget(
     state: &EpisodeState,
+    pins: &ToolPins,
     unresolved: &UnresolvedEntities,
+    claims: &EntityClaims,
     tool: &ToolPolicy,
     payment: Option<PaymentInputs>,
     writes: usize,
@@ -3054,7 +3221,9 @@ fn g_budget(
     if state.recorded_call_ids.len() >= MAX_CALLS_PER_EPISODE {
         return Err(fail(PolicyError::CallLimitExceeded));
     }
-    if records_full(state) {
+    // Like `records_full`: deny before anything runs, so a call never executes with a result the
+    // engine could not record.
+    if records_full(state) || !result_bytes_fit(state, pins, tool) {
         return Err(fail(PolicyError::RecordsExhausted));
     }
     let quota_after = state
@@ -3072,7 +3241,14 @@ fn g_budget(
     };
     let limits = &state.intent.limits;
     let budget = &state.budget;
-    if unresolved.contains(&entity)
+    if budget.declined >= limits.max_declines {
+        return Err(fail(PolicyError::DeclineLimitReached));
+    }
+    let entities = &state.intent.entities;
+    let claimed = entities.ids.kind() == EntityKind::Invoice
+        && !claims.allows(&entity, entities.per_entity_max_uses);
+    if claimed
+        || unresolved.contains(&entity)
         || budget
             .reservations
             .values()
@@ -3342,6 +3518,27 @@ pub fn idempotency_key(episode_id: u128, reservation_id: u64, action_digest: &st
     key
 }
 
+/// The key for one invoice at one amount, whichever reservation pays it (RV5 D5): the broker sends
+/// it beside F-07's, which differs per reservation, so a provider can refuse to execute an
+/// invoice twice even if the PEP's journal is lost. `"pep-entity-" + b64url(SHA-256(domain ||
+/// entity_len_be || entity || amount_be || currency))`; the domain keeps it from ever equalling
+/// an F-07 preimage, and the entity's length keeps the encoding injective.
+#[must_use]
+pub fn entity_key(entity: &str, amount_minor: u64, currency: &str) -> String {
+    const DOMAIN: &[u8] = b"pep-entity-key-v1\0";
+    let mut preimage = Vec::new();
+    preimage.extend_from_slice(DOMAIN);
+    // A length past u64 cannot be held in memory, so this never saturates in practice.
+    let length = u64::try_from(entity.len()).unwrap_or(u64::MAX);
+    preimage.extend_from_slice(&length.to_be_bytes());
+    preimage.extend_from_slice(entity.as_bytes());
+    preimage.extend_from_slice(&amount_minor.to_be_bytes());
+    preimage.extend_from_slice(currency.as_bytes());
+    let mut key = String::from("pep-entity-");
+    key.push_str(&jcs::sha256_b64url(&preimage));
+    key
+}
+
 /// Encodes an episode id as a 26-character uppercase Crockford Base32 ULID.
 #[must_use]
 pub fn encode_ulid(id: u128) -> String {
@@ -3408,6 +3605,7 @@ mod tests {
             labels,
             servers,
             unresolved: Arc::new(UnresolvedEntities::empty()),
+            claims: Arc::new(EntityClaims::empty()),
         }
     }
 
@@ -3577,6 +3775,7 @@ mod tests {
             cumulative_max_minor: 500_000,
             max_calls: 5,
             step_up_over_minor: 50_000,
+            max_declines: 3,
         }
     }
 
@@ -3885,6 +4084,7 @@ mod tests {
             SeqPolicy::Unconstrained,
             Shared {
                 unresolved: Arc::new(UnresolvedEntities::empty()),
+                claims: Arc::new(EntityClaims::empty()),
                 labels: store(),
                 servers,
             },
@@ -4033,6 +4233,7 @@ mod tests {
             SeqPolicy::Unconstrained,
             Shared {
                 unresolved: Arc::new(UnresolvedEntities::empty()),
+                claims: Arc::new(EntityClaims::empty()),
                 labels: shared,
                 servers: servers.clone(),
             },
@@ -4083,6 +4284,111 @@ mod tests {
     }
 
     #[test]
+    fn only_a_call_that_really_ran_advances_the_sequence() {
+        let transitions = BTreeSet::from([
+            (None, "get_ticket".to_owned()),
+            (Some("get_ticket".to_owned()), "save_note".to_owned()),
+        ]);
+        let mut engine = PepEngine::new(
+            &HostAuthority::for_tests(),
+            intent(invoices(), limits("USD")),
+            pins(),
+            SeqPolicy::Transitions(transitions),
+            serving(store()),
+            Ledger::empty(),
+        )
+        .unwrap();
+        let note = r#"{"key":"k1","text":"x"}"#;
+        // It failed upstream: nothing ran.
+        allow(
+            &mut engine,
+            &request(1, "get_ticket", r#"{"ticket_id":"T-1"}"#),
+        );
+        engine.abandon("1").unwrap();
+        assert_eq!(
+            denied(engine.evaluate_raw(&request(2, "save_note", note))),
+            (GuardId::Seq, PolicyError::SequenceViolation)
+        );
+        // It came back an error: the same.
+        allow(
+            &mut engine,
+            &request(3, "get_ticket", r#"{"ticket_id":"T-1"}"#),
+        );
+        engine
+            .record_result_raw(
+                "3",
+                br#"{"content":[],"isError":true,"resultType":"complete"}"#,
+            )
+            .unwrap();
+        assert_eq!(
+            denied(engine.evaluate_raw(&request(4, "save_note", note))),
+            (GuardId::Seq, PolicyError::SequenceViolation)
+        );
+        allow(
+            &mut engine,
+            &request(5, "get_ticket", r#"{"ticket_id":"T-1"}"#),
+        );
+        engine
+            .record_result_raw("5", &complete(br#"{"content":[]}"#))
+            .unwrap();
+        allow(&mut engine, &request(6, "save_note", note));
+    }
+
+    #[test]
+    fn a_payment_advances_the_sequence_only_when_it_commits() {
+        let transitions = BTreeSet::from([
+            (None, "get_invoice".to_owned()),
+            (Some("get_invoice".to_owned()), "pay_invoice".to_owned()),
+            (Some("pay_invoice".to_owned()), "get_ticket".to_owned()),
+        ]);
+        let mut engine = PepEngine::new(
+            &HostAuthority::for_tests(),
+            intent(invoices(), limits("USD")),
+            pins(),
+            SeqPolicy::Transitions(transitions),
+            serving(store()),
+            Ledger::empty(),
+        )
+        .unwrap();
+        let ticket = r#"{"ticket_id":"T-1"}"#;
+        lookup(&mut engine, 1, "INV-1001", "30000", "USD");
+        let rid = allowed(pay(&mut engine, 2, "INV-1001", 30_000))
+            .reservation
+            .unwrap()
+            .reservation_id;
+        engine.release_unforwarded(rid).unwrap();
+        assert_eq!(
+            denied(engine.evaluate_raw(&request(3, "get_ticket", ticket))),
+            (GuardId::Seq, PolicyError::SequenceViolation)
+        );
+        // A tool's decline comes with a result, recorded before the release (P1): no payment ran.
+        let rid = allowed(pay(&mut engine, 4, "INV-1001", 30_000))
+            .reservation
+            .unwrap()
+            .reservation_id;
+        engine.mark_forwarded(rid).unwrap();
+        engine
+            .record_result_raw("4", &complete(br#"{"content":[]}"#))
+            .unwrap();
+        engine
+            .settle(&HostAuthority::for_tests(), rid, Settlement::Declined)
+            .unwrap();
+        assert_eq!(
+            denied(engine.evaluate_raw(&request(5, "get_ticket", ticket))),
+            (GuardId::Seq, PolicyError::SequenceViolation)
+        );
+        let rid = allowed(pay(&mut engine, 6, "INV-1001", 30_000))
+            .reservation
+            .unwrap()
+            .reservation_id;
+        engine.mark_forwarded(rid).unwrap();
+        engine
+            .settle(&HostAuthority::for_tests(), rid, Settlement::Executed)
+            .unwrap();
+        allow(&mut engine, &request(7, "get_ticket", ticket));
+    }
+
+    #[test]
     fn sequence_policy_enforced() {
         let transitions = BTreeSet::from([
             (None, "get_invoice".to_owned()),
@@ -4106,6 +4412,67 @@ mod tests {
     }
 
     // ---- Ratchet and agent codes (F-09) ----
+
+    /// Serves each index once, so `pre_pass` sees a label and the guards' second look fails.
+    #[derive(Debug)]
+    struct OneLookEach {
+        inner: Arc<InMemoryLabelStore>,
+        seen: Mutex<BTreeSet<TaintIndex>>,
+    }
+
+    impl LabelStore for OneLookEach {
+        fn record_all(&self, indexes: &[TaintIndex], entry: LabelEntry) -> Result<(), StoreError> {
+            self.inner.record_all(indexes, entry)
+        }
+        fn lookup(&self, index: &TaintIndex) -> Result<Option<Label>, StoreError> {
+            let mut seen = self.seen.lock().map_err(|_| StoreError::Poisoned)?;
+            if seen.insert(index.clone()) {
+                self.inner.lookup(index)
+            } else {
+                Err(StoreError::Poisoned)
+            }
+        }
+    }
+
+    #[test]
+    fn a_store_failure_in_the_guards_still_ratchets() {
+        let shared = store();
+        let mut writer = engine_on(&shared, invoices(), limits("USD"));
+        writer
+            .record_trusted_input(
+                &HostAuthority::for_tests(),
+                "s",
+                br#"{"note":"secret"}"#,
+                Confidentiality::Confidential,
+            )
+            .unwrap();
+        allow(
+            &mut writer,
+            &request(1, "save_note", r#"{"key":"k1","text":"x"}"#),
+        );
+        let once: Arc<dyn LabelStore> = Arc::new(OneLookEach {
+            inner: shared,
+            seen: Mutex::new(BTreeSet::new()),
+        });
+        let mut reader = PepEngine::new(
+            &HostAuthority::for_tests(),
+            intent(invoices(), limits("USD")),
+            pins(),
+            SeqPolicy::Unconstrained,
+            Shared {
+                labels: once,
+                ..serving(store())
+            },
+            Ledger::empty(),
+        )
+        .unwrap();
+        let raw = request(1, "save_note", r#"{"key":"k1","text":"y"}"#);
+        assert!(matches!(
+            reader.evaluate_raw(&raw),
+            Err(PepError::Store(StoreError::Poisoned))
+        ));
+        assert_eq!(reader.state().context_conf, Confidentiality::Confidential);
+    }
 
     #[test]
     fn denial_ratchets_context_conf() {
@@ -5447,6 +5814,7 @@ mod tests {
     fn max_calls_counts_payments_only() {
         let mut one_payment = limits("USD");
         one_payment.max_calls = 1;
+        one_payment.max_declines = 1;
         let mut engine = engine_on(&store(), invoices(), one_payment);
         lookup(&mut engine, 1, "INV-1001", "1000", "USD");
         lookup(&mut engine, 2, "INV-1002", "1000", "USD");
@@ -5790,6 +6158,349 @@ mod tests {
         assert_ne!(idempotency_key(0, 0x31, ""), idempotency_key(0, 0, "1"));
     }
 
+    // ---- The second key and the decline limit (RV5 D5, D6) ----
+
+    #[test]
+    fn the_entity_key_matches_the_spec_vector() {
+        assert_eq!(
+            entity_key("INV-1001", 30_000, "USD"),
+            "pep-entity-Yu_eNyRGZBgMDDn-pCt9Ta9fcfYfG_P_it-H435XEsc"
+        );
+    }
+
+    #[test]
+    fn the_entity_key_names_one_invoice_at_one_amount() {
+        let key = entity_key("INV-1", 100, "USD");
+        assert!(key.starts_with("pep-entity-"));
+        assert_eq!(key, entity_key("INV-1", 100, "USD"));
+        for other in [
+            entity_key("INV-2", 100, "USD"),
+            entity_key("INV-1", 101, "USD"),
+            entity_key("INV-1", 100, "EUR"),
+            // The length keeps the fields apart.
+            entity_key("INV-1\0", 100, "USD"),
+        ] {
+            assert_ne!(key, other);
+        }
+        // It never equals F-07's key: the reservation plays no part, and the prefix differs.
+        assert_ne!(key, idempotency_key(1, 1, "INV-1"));
+    }
+
+    /// Reserves a payment of `INV-1001` and forwards it.
+    fn forwarded_payment(engine: &mut PepEngine, id: u64) -> u64 {
+        let rid = allowed(pay(engine, id, "INV-1001", 1000))
+            .reservation
+            .unwrap()
+            .reservation_id;
+        engine.mark_forwarded(rid).unwrap();
+        rid
+    }
+
+    #[test]
+    fn a_tools_declines_stop_the_intent_and_outlast_the_episode() {
+        let host = HostAuthority::for_tests();
+        let mut limit = limits("USD");
+        limit.max_declines = 2;
+        let mut engine = engine_on(&store(), invoices(), limit.clone());
+        lookup(&mut engine, 1, "INV-1001", "1000", "USD");
+        for id in [2, 3] {
+            let rid = forwarded_payment(&mut engine, id);
+            engine.settle(&host, rid, Settlement::Declined).unwrap();
+        }
+        // F-10: each was released all the same.
+        assert_eq!(engine.state().budget.reserved, 0);
+        assert_eq!(engine.state().budget.declined, 2);
+        assert_eq!(
+            denied(pay(&mut engine, 4, "INV-1001", 1000)),
+            (GuardId::Budget, PolicyError::DeclineLimitReached)
+        );
+        let ledger = engine.ledger();
+        assert_eq!(ledger.declined, 2);
+        let mut next = PepEngine::new(
+            &host,
+            intent(invoices(), limit),
+            pins(),
+            SeqPolicy::Unconstrained,
+            serving(store()),
+            ledger,
+        )
+        .unwrap();
+        lookup(&mut next, 1, "INV-1001", "1000", "USD");
+        assert_eq!(
+            denied(pay(&mut next, 2, "INV-1001", 1000)),
+            (GuardId::Budget, PolicyError::DeclineLimitReached)
+        );
+    }
+
+    #[test]
+    fn a_refusal_the_tool_never_saw_is_no_decline() {
+        let host = HostAuthority::for_tests();
+        let mut limit = limits("USD");
+        limit.max_declines = 1;
+        let mut engine = engine_on(&store(), invoices(), limit);
+        lookup(&mut engine, 1, "INV-1001", "1000", "USD");
+        for id in [2, 3, 4] {
+            let rid = forwarded_payment(&mut engine, id);
+            engine
+                .settle(
+                    &host,
+                    rid,
+                    Settlement::Aborted(AbortOutcome::DefinitelyNotExecuted),
+                )
+                .unwrap();
+        }
+        assert_eq!(engine.state().budget.declined, 0);
+        allowed(pay(&mut engine, 5, "INV-1001", 1000));
+    }
+
+    #[test]
+    fn a_decline_limit_outside_the_call_limit_is_refused() {
+        for declines in [0, limits("USD").max_calls + 1] {
+            let mut limit = limits("USD");
+            limit.max_declines = declines;
+            assert!(matches!(
+                validate_config(&intent(invoices(), limit), &pins()),
+                Err(ConfigError::InconsistentLimits)
+            ));
+        }
+    }
+
+    // ---- PEP-wide invoice claims and the result byte quota (RV5 V1, V9) ----
+
+    /// An invoice episode with one use per invoice, as `config.rs` requires.
+    fn single_use_episode(shared: &Shared, eid: u128) -> PepEngine {
+        let mut intent = intent(invoices(), limits("USD"));
+        intent.episode_id = eid;
+        intent.entities.per_entity_max_uses = 1;
+        PepEngine::new(
+            &HostAuthority::for_tests(),
+            intent,
+            pins(),
+            SeqPolicy::Unconstrained,
+            shared.clone(),
+            Ledger::empty(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn entity_claims_count_uses_up_to_a_limit() {
+        let claims = EntityClaims::empty();
+        assert!(claims.allows("INV", 1));
+        assert!(claims.try_claim("INV", 1));
+        assert!(!claims.allows("INV", 1));
+        assert!(!claims.try_claim("INV", 1));
+        assert!(claims.try_claim("INV", 2));
+        // A release never goes below zero, which would hide a later use.
+        for _ in 0..3 {
+            claims.release("INV");
+        }
+        assert!(claims.try_claim("INV", 1));
+        claims.restore("OLD", 1).unwrap();
+        claims.restore("OLD", 1).unwrap();
+        assert!(!claims.allows("OLD", 2));
+    }
+
+    #[test]
+    fn of_many_racing_for_the_last_use_one_gets_it() {
+        for _ in 0..200 {
+            let claims = Arc::new(EntityClaims::empty());
+            let racers: Vec<_> = (0..4)
+                .map(|_| {
+                    let claims = claims.clone();
+                    std::thread::spawn(move || claims.try_claim("INV", 1))
+                })
+                .collect();
+            let winners = racers
+                .into_iter()
+                .map(|racer| racer.join().unwrap())
+                .filter(|won| *won)
+                .count();
+            assert_eq!(winners, 1);
+        }
+    }
+
+    #[test]
+    fn a_second_intent_cannot_pay_an_invoice_another_has_reserved_or_paid() {
+        let shared = serving(store());
+        let mut first = single_use_episode(&shared, EID);
+        let mut second = single_use_episode(&shared, EID + 1);
+        lookup(&mut first, 1, "INV-1001", "30000", "USD");
+        lookup(&mut second, 1, "INV-1001", "30000", "USD");
+        let rid = allowed(pay(&mut first, 2, "INV-1001", 30_000))
+            .reservation
+            .unwrap()
+            .reservation_id;
+        // Live in the first intent: refused in the second, with no reservation or use.
+        assert_eq!(
+            denied(pay(&mut second, 2, "INV-1001", 30_000)),
+            (GuardId::Budget, PolicyError::PaymentPending)
+        );
+        assert_eq!(second.state().budget.calls, 0);
+        // Released: the claim comes back.
+        first.release_unforwarded(rid).unwrap();
+        let other = allowed(pay(&mut second, 3, "INV-1001", 30_000))
+            .reservation
+            .unwrap()
+            .reservation_id;
+        // Committed: it stays, for good.
+        second.mark_forwarded(other).unwrap();
+        second
+            .settle(&HostAuthority::for_tests(), other, Settlement::Executed)
+            .unwrap();
+        lookup(&mut first, 3, "INV-1001", "30000", "USD");
+        assert_eq!(
+            denied(pay(&mut first, 4, "INV-1001", 30_000)),
+            (GuardId::Budget, PolicyError::PaymentPending)
+        );
+    }
+
+    #[test]
+    fn a_claim_lives_and_dies_with_its_reservation() {
+        let host = HostAuthority::for_tests();
+        for (settlement, kept) in [
+            (Settlement::Executed, true),
+            (Settlement::Aborted(AbortOutcome::Unknown), true),
+            (
+                Settlement::Aborted(AbortOutcome::DefinitelyNotExecuted),
+                false,
+            ),
+        ] {
+            let shared = serving(store());
+            let mut engine = single_use_episode(&shared, EID);
+            lookup(&mut engine, 1, "INV-1001", "30000", "USD");
+            let rid = allowed(pay(&mut engine, 2, "INV-1001", 30_000))
+                .reservation
+                .unwrap()
+                .reservation_id;
+            assert!(!shared.claims.allows("INV-1001", 1), "taken by the reserve");
+            engine.mark_forwarded(rid).unwrap();
+            assert!(!shared.claims.allows("INV-1001", 1), "kept while forwarded");
+            engine.settle(&host, rid, settlement).unwrap();
+            assert_eq!(!shared.claims.allows("INV-1001", 1), kept, "{settlement:?}");
+        }
+        // A step-up wait holds it, and a release frees it.
+        let shared = serving(store());
+        let mut engine = single_use_episode(&shared, EID);
+        lookup(&mut engine, 1, "INV-1001", "60000", "USD");
+        let Decision::StepUpRequired(pending) = pay(&mut engine, 2, "INV-1001", 60_000).unwrap()
+        else {
+            panic!("expected a step-up");
+        };
+        assert!(!shared.claims.allows("INV-1001", 1));
+        engine.release_unforwarded(pending.reservation_id).unwrap();
+        assert!(shared.claims.allows("INV-1001", 1));
+    }
+
+    #[test]
+    fn a_race_past_the_guard_is_denied_and_changes_nothing() {
+        // Another engine takes the last use between this one's guards and its apply.
+        let shared = serving(store());
+        let mut engine = single_use_episode(&shared, EID);
+        lookup(&mut engine, 1, "INV-1001", "30000", "USD");
+        let plan = engine
+            .check(&ToolCall::from_value(
+                jcs::parse(&request(
+                    2,
+                    "pay_invoice",
+                    r#"{"invoice_id":"INV-1001","amount":30000,"currency":"USD"}"#,
+                ))
+                .unwrap(),
+            ))
+            .unwrap();
+        assert!(shared.claims.try_claim("INV-1001", 1));
+        assert_eq!(
+            engine.apply(plan, Confidentiality::Secret).unwrap_err(),
+            deny(GuardId::Budget, PolicyError::PaymentPending)
+        );
+        assert_eq!(engine.state().budget.calls, 0);
+        assert!(engine.state().budget.reservations.is_empty());
+        // F-09: a guard's denial, so the one state change a denial may make.
+        assert_eq!(engine.state().context_conf, Confidentiality::Secret);
+    }
+
+    #[test]
+    fn a_failed_label_write_gives_the_claim_back() {
+        #[derive(Debug)]
+        struct FullStore(AtomicBool);
+        impl LabelStore for FullStore {
+            fn record_all(&self, _: &[TaintIndex], _: LabelEntry) -> Result<(), StoreError> {
+                if self.0.load(Ordering::SeqCst) {
+                    return Err(StoreError::CapacityExceeded);
+                }
+                Ok(())
+            }
+            fn lookup(&self, _: &TaintIndex) -> Result<Option<Label>, StoreError> {
+                Ok(None)
+            }
+        }
+        let full = Arc::new(FullStore(AtomicBool::new(false)));
+        let shared = Shared {
+            labels: full.clone(),
+            ..serving(store())
+        };
+        let mut engine = single_use_episode(&shared, EID);
+        lookup(&mut engine, 1, "INV-1001", "30000", "USD");
+        full.0.store(true, Ordering::SeqCst);
+        assert!(matches!(
+            pay(&mut engine, 2, "INV-1001", 30_000),
+            Err(PepError::Store(StoreError::CapacityExceeded))
+        ));
+        assert!(shared.claims.allows("INV-1001", 1));
+        assert_eq!(engine.state().budget.calls, 0);
+    }
+
+    #[test]
+    fn recipients_are_not_claimed_across_intents() {
+        let shared = serving(store());
+        let mut first = episode(&shared, recipients(), EID, Ledger::empty()).unwrap();
+        let mut second = episode(&shared, recipients(), EID + 1, Ledger::empty()).unwrap();
+        fund(&mut first, "u1", "rcpt_A", 100);
+        fund(&mut second, "u1", "rcpt_A", 100);
+        allowed(pay_to(&mut first, 1, "rcpt_A", 100));
+        allowed(pay_to(&mut second, 1, "rcpt_A", 100));
+    }
+
+    #[test]
+    fn the_result_byte_quota_denies_before_a_call_runs() {
+        let mut engine = engine();
+        // get_ticket may return 1 MiB. Leave room for less than one more.
+        engine.state.result_bytes_remaining = 512 * 1024;
+        assert_eq!(
+            denied(engine.evaluate_raw(&request(1, "get_ticket", r#"{"id":"T-1"}"#))),
+            (GuardId::Budget, PolicyError::RecordsExhausted)
+        );
+        // Room for one in flight, but not for two.
+        engine.state.result_bytes_remaining = 3 * 1024 * 1024 / 2;
+        allow(&mut engine, &request(2, "get_ticket", r#"{"id":"T-1"}"#));
+        assert_eq!(
+            denied(engine.evaluate_raw(&request(3, "get_ticket", r#"{"id":"T-1"}"#))),
+            (GuardId::Budget, PolicyError::RecordsExhausted)
+        );
+        // A recorded result is charged by what it really took.
+        let before = engine.state().result_bytes_remaining;
+        let result = complete(br#"{"content":[]}"#);
+        engine.record_result_raw("2", &result).unwrap();
+        assert_eq!(before - engine.state().result_bytes_remaining, result.len());
+    }
+
+    #[test]
+    fn only_a_lookups_arguments_are_kept() {
+        let mut engine = engine();
+        lookup(&mut engine, 1, "INV-1001", "30000", "USD");
+        allow(&mut engine, &request(2, "get_ticket", r#"{"id":"T-1"}"#));
+        engine
+            .record_result_raw("2", &complete(br#"{"content":[]}"#))
+            .unwrap();
+        let records: Vec<&Recorded> = engine.state().records.values().collect();
+        assert_ne!(
+            records[0].arguments,
+            JcsValue::Null,
+            "a witness search reads these"
+        );
+        assert_eq!(records[1].arguments, JcsValue::Null);
+    }
+
     // ---- Ledger restore and the PEP-wide unresolved set (R1, RV3 A1, A3, RV4 #1) ----
 
     const OLD_EID: u128 = 0x0191_0000_0000_0000_0000_0000_0000_0001;
@@ -5826,6 +6537,7 @@ mod tests {
         let ledger = Ledger {
             committed_minor: 420_000,
             calls: 4,
+            declined: 0,
             entity_uses: BTreeMap::from([("rcpt_A".to_owned(), 2)]),
             unresolved: BTreeMap::new(),
             context_conf: Confidentiality::Internal,

@@ -9,6 +9,10 @@
 //! - A payment needs an `Idempotency-Key` and is executed at most once per key, in a store
 //!   that survives restarts. Its result carries an explicit `status`: `executed`, `declined`
 //!   or `pending` (RV3 B6).
+//! - A payment of an invoice also needs a `Pep-Entity-Key`, and executes at most once per key
+//!   whichever reservation asks, as a provider's own invoice check would: this holds even if
+//!   the PEP's journal is lost. Only an execution uses it up, so a declined invoice can be
+//!   retried (RV5 D5).
 //! - Every `tools/call` adds one line to the execution log, which the oracle joins (§2a).
 
 use std::collections::BTreeMap;
@@ -20,7 +24,7 @@ use std::sync::Mutex;
 use sha2::{Digest as _, Sha256};
 
 use crate::config::{Fields, LoadError, Problem};
-use crate::engine::EffectClass;
+use crate::engine::{ArgRole, EffectClass, EntityKind};
 use crate::http::{Request, Status, response};
 use crate::jcs::{self, JcsValue, ParseOptions};
 use crate::lockfile::{Lockfile, PinnedServer, parse_payload};
@@ -161,10 +165,19 @@ pub struct ToolServer {
     state: Mutex<State>,
 }
 
+/// A `tools/call`'s payment headers.
+#[derive(Clone, Copy)]
+struct PaymentKeys<'a> {
+    idempotency: Option<&'a str>,
+    entity: Option<&'a str>,
+}
+
 #[derive(Debug)]
 struct State {
     /// Results already returned, by `Idempotency-Key`.
     done: BTreeMap<String, Vec<u8>>,
+    /// Results of executed payments, by `Pep-Entity-Key`.
+    paid: BTreeMap<String, Vec<u8>>,
     store: File,
     log: File,
     notes: BTreeMap<String, String>,
@@ -184,6 +197,7 @@ impl ToolServer {
             .cloned()
             .ok_or_else(|| "server not pinned".to_owned())?;
         let mut done = BTreeMap::new();
+        let mut paid = BTreeMap::new();
         if let Ok(existing) = File::open(&config.store) {
             for line in BufReader::new(existing).lines() {
                 let line = line.map_err(|error| format!("store: {error}"))?;
@@ -195,6 +209,9 @@ impl ToolServer {
                     value.get("result"),
                 ) {
                     done.insert(key.to_owned(), result.to_canonical_bytes());
+                    if let Some(entity_key) = value.get("entity_key").and_then(JcsValue::as_str) {
+                        paid.insert(entity_key.to_owned(), result.to_canonical_bytes());
+                    }
                 }
             }
         }
@@ -207,6 +224,7 @@ impl ToolServer {
         };
         let state = State {
             done,
+            paid,
             store: append(&config.store)?,
             log: append(&config.log)?,
             notes: BTreeMap::new(),
@@ -252,8 +270,11 @@ impl ToolServer {
             "server/discover" => Some(self.pinned.discover.to_canonical_bytes()),
             "tools/list" => Some(tools_list(&self.pinned.definitions)),
             "tools/call" => {
-                let key = request.head.headers.get("idempotency-key");
-                self.call(&message, &id, key, now_ms)
+                let keys = PaymentKeys {
+                    idempotency: request.head.headers.get("idempotency-key"),
+                    entity: request.head.headers.get("pep-entity-key"),
+                };
+                self.call(&message, &id, keys, now_ms)
             }
             _ => None,
         };
@@ -278,9 +299,10 @@ impl ToolServer {
         &self,
         message: &JcsValue,
         id: &JcsValue,
-        idempotency_key: Option<&str>,
+        keys: PaymentKeys<'_>,
         now_ms: u64,
     ) -> Option<Vec<u8>> {
+        let idempotency_key = keys.idempotency;
         let name = message.pointer("/params/name")?.as_str()?.to_owned();
         let empty = JcsValue::Object(jcs::JcsObject::from_entries(Vec::new()).ok()?);
         let arguments = message
@@ -301,7 +323,15 @@ impl ToolServer {
         let mut state = self.state.lock().ok()?;
         let (result, executed) = if policy.effect == EffectClass::Payment {
             let key = idempotency_key?.to_owned();
-            if let Some(previous) = state.done.get(&key) {
+            let invoice_tool = policy
+                .args
+                .iter()
+                .any(|spec| spec.role == ArgRole::Entity(EntityKind::Invoice));
+            if invoice_tool && keys.entity.is_none() {
+                return None;
+            }
+            let paid = keys.entity.and_then(|entity| state.paid.get(entity));
+            if let Some(previous) = state.done.get(&key).or(paid) {
                 (previous.clone(), false)
             } else {
                 let invoice = text("invoice_id").and_then(|invoice| {
@@ -318,8 +348,14 @@ impl ToolServer {
                     ),
                     &format!("payment {status}"),
                 );
+                // Only an execution uses the invoice up, so a decline can be retried.
+                let spent = keys.entity.filter(|_| status == "executed");
                 let record = format!(
-                    r#"{{"idempotency_key":{},"result":{}}}"#,
+                    r#"{{"entity_key":{},"idempotency_key":{},"result":{}}}"#,
+                    spent.map_or_else(
+                        || "null".to_owned(),
+                        |entity| JcsValue::string(entity).to_canonical_string()
+                    ),
                     JcsValue::string(key.as_str()).to_canonical_string(),
                     String::from_utf8_lossy(&result)
                 );
@@ -328,6 +364,9 @@ impl ToolServer {
                 state.store.write_all(b"\n").ok()?;
                 state.store.sync_data().ok()?;
                 state.done.insert(key, result.clone());
+                if let Some(entity) = spent {
+                    state.paid.insert(entity.to_owned(), result.clone());
+                }
                 (result, status == "executed")
             }
         } else {
@@ -337,8 +376,12 @@ impl ToolServer {
             )
         };
         let log = format!(
-            r#"{{"action_digest":{},"executed":{executed},"idempotency_key":{},"server_id":{},"tool":{},"ts_ms":{now_ms},"upstream_id":{},"v":1}}"#,
+            r#"{{"action_digest":{},"entity_key":{},"executed":{executed},"idempotency_key":{},"server_id":{},"tool":{},"ts_ms":{now_ms},"upstream_id":{},"v":1}}"#,
             JcsValue::string(digest.as_str()).to_canonical_string(),
+            keys.entity.map_or_else(
+                || "null".to_owned(),
+                |key| JcsValue::string(key).to_canonical_string()
+            ),
             idempotency_key.map_or_else(
                 || "null".to_owned(),
                 |key| JcsValue::string(key).to_canonical_string()

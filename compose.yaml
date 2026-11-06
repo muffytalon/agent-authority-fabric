@@ -9,7 +9,8 @@
 name: pep-gate1
 
 # Healthchecks probe every second while a service starts (first polls wait on them), then
-# rarely. A probe connects as the container's own uid, which the peer checks drop unlogged.
+# rarely. A probe connects as the container's own uid, so the peer check drops it. The PEP notes
+# each one in its noise log (`decisions.jsonl.protocol`), never in the decision log (RV5 V5).
 x-probe: &probe
   interval: 60s
   timeout: 2s
@@ -92,6 +93,15 @@ services:
     build: { context: ., target: pep }
     image: pep-gate1/pep:dev
     user: "20002:20002"
+    # What config/pep's limits need (RV5); compose/check.py recomputes all three. The PEP refuses
+    # to boot below nofile: 4 x connections + 2 x control_connections + 64 x episodes + 128.
+    # Memory is about 72 MiB per episode, plus 2 MiB per connection at worst. Threads are about
+    # 3 x connections + 65 x episodes. G4's episode count needs all three raised. `cpus` keeps a
+    # flood of bodies that are costly to normalize (up to about 26 ms each) off the other services.
+    ulimits: { nofile: { soft: 4096, hard: 4096 } }
+    mem_limit: 1g
+    pids_limit: 512
+    cpus: 2
     depends_on:                # every server's first poll needs the broker and the tools (RV4 #5)
       oracle: { condition: service_started }
       broker: { condition: service_healthy }
@@ -141,6 +151,7 @@ volumes:
   pep-ctl:      { driver: local, driver_opts: { type: tmpfs, device: tmpfs, o: "uid=20002,gid=20004,mode=2750" } }
   pep-pub:      { driver: local, driver_opts: { type: tmpfs, device: tmpfs, o: "uid=20002,gid=20003,mode=2750" } }
   pep-state:    {}             # on disk; owner 20002 and mode 0700 come from the image's /var/lib/pep
+  # A full pep-log stops calls (RV5), so size it at 2.5 x log.max_bytes or more: both logs, and their `.1`s.
   pep-log:      { driver: local, driver_opts: { type: tmpfs, device: tmpfs, o: "uid=20002,gid=20007,mode=2750,size=256m" } }
   broker-state: {}             # 20003:20007, 2750, from the image
   tool-a-state: {}             # 20005:20007, 2750, from the image

@@ -9,10 +9,11 @@ empty volumes (`down -v` first), so it never touches a `pep-gate1` stack. Then i
   2. every volume's and socket's owner and mode, as the containers left them (§4);
   3. C-POSTURE, apart from the probe service (step 9). The profile's socket and io_uring
      denials run natively, under the profile, from the glibc image's perl; the int 0x80 and
-     x32 routes are checked in the profile's text here, and run for real in step 9's C-NET;
-  4. the step 7 flows: the router's rows, reads, payments, a step-up approved, declined and
-     timed out, every broker outcome, a wrong credential, a refused Call Proof, a restart's
-     replay, and server b over its own network;
+     x32 routes are checked in the profile's text here, and run for real in step 9's C-NET.
+     Also what config/pep's limits need of the PEP's container (RV5);
+  4. the step 7 flows: the router's rows, noise going to its own file, reads, payments, a
+     step-up approved, declined and timed out, every broker outcome, a wrong credential, a
+     refused Call Proof, a restart's replay, and server b over its own network;
   5. that pep-log keeps its records across `docker restart` and `docker kill` of the PEP;
   6. the oracle's join (§2a) over the logs the oracle service mounts.
 The step-up timeout waits out the PEP's 45 s. The project is torn down at the end, unless
@@ -223,7 +224,7 @@ VOLUME_LAYOUT = [
     ("tool-a-state", "", "20005:20007", "2750", "d"),
     ("tool-b-state", "", "20008:20007", "2750", "d"),
 ]
-LOGS = [("pep-log", "decisions.jsonl"), ("broker-state", "broker.jsonl"),
+LOGS = [("pep-log", "decisions.jsonl"), ("pep-log", "decisions.jsonl.protocol"), ("broker-state", "broker.jsonl"),
         ("tool-a-state", "tool.jsonl"), ("tool-b-state", "tool.jsonl")]
 
 
@@ -263,6 +264,39 @@ def status_of(pid):
             key, _, value = line.partition(":")
             fields[key] = value.strip()
     return fields
+
+
+def cgroup_limit(pid, name):
+    with open(f"/proc/{pid}/cgroup") as f:
+        group = f.read().strip().split(":", 2)[2]
+    with open(f"/sys/fs/cgroup{group}/{name}") as f:
+        return f.read().strip()
+
+
+def check_pep_limits():
+    """What config/pep's limits need of the PEP's container, recomputed so neither can drift (RV5)."""
+    with open(os.path.join(ROOT, "config/pep/config.json")) as f:
+        config = json.load(f)
+    limits = config["limits"]
+    connections, control, episodes = limits["connections"], limits["control_connections"], limits["episodes"]
+    info = inspect(container("pep"))
+    pid = info["State"]["Pid"]
+    expect("pep: a CPU limit is set", info["HostConfig"]["NanoCpus"] > 0, info["HostConfig"]["NanoCpus"])
+    with open(f"/proc/{pid}/limits") as f:
+        nofile = next(line.split()[3] for line in f if line.startswith("Max open files"))
+    fds = 4 * connections + 2 * control + 64 * episodes + 128
+    expect(f"pep: nofile {nofile} covers the {fds} its limits need", int(nofile) >= fds, nofile)
+    threads = 3 * connections + 65 * episodes
+    pids = cgroup_limit(pid, "pids.max")
+    expect(f"pep: pids.max {pids} covers about {threads} threads", int(pids) >= threads, pids)
+    bytes_needed = (72 * episodes + 2 * connections) << 20
+    memory = cgroup_limit(pid, "memory.max")
+    expect(f"pep: memory.max {memory} covers about {bytes_needed} bytes", int(memory) >= bytes_needed, memory)
+    options = json.loads(run(["docker", "volume", "inspect", f"{PROJECT}_pep-log"]).stdout)[0]["Options"]["o"]
+    size = re.search(r"size=(\d+)m", options)
+    needed_log = config["log"]["max_bytes"] * 5 // 2
+    expect(f"pep-log: its cap holds both logs and their rotations, {needed_log} bytes",
+           size is not None and int(size.group(1)) << 20 >= needed_log, options)
 
 
 def posture(label, name, service, profile):
@@ -327,6 +361,7 @@ def check_posture():
     # Every running container, and an agent and an operator held open on their stdin.
     for service in SERVICES:
         posture(service, container(service), service, profile)
+    check_pep_limits()
     held = {}
     for service, args in [("agent", ["tools/list"]), ("operator", ["-"])]:
         name = f"{PROJECT}-{service}-posture"
@@ -341,12 +376,7 @@ def check_posture():
             if service != "agent":
                 continue
             host = info["HostConfig"]
-            with open(f"/proc/{pid}/cgroup") as f:
-                group = f.read().strip().split(":", 2)[2]
-            with open(f"/sys/fs/cgroup{group}/pids.max") as f:
-                pids = f.read().strip()
-            with open(f"/sys/fs/cgroup{group}/memory.max") as f:
-                memory = f.read().strip()
+            pids, memory = cgroup_limit(pid, "pids.max"), cgroup_limit(pid, "memory.max")
             expect("agent: pids_limit 256 in effect", host["PidsLimit"] == 256 and pids == "256", (host["PidsLimit"], pids))
             expect("agent: mem_limit 1g in effect", host["Memory"] == 1 << 30 and memory == str(1 << 30), (host["Memory"], memory))
             with open(f"/proc/{pid}/mountinfo") as f:
@@ -378,6 +408,9 @@ def check_flows():
     expect("router: tools/list without a token is PEP_DENIED", denied(agent("tools/list")))
     expect("router: tools/call without a token is PEP_DENIED",
            denied(agent("tools/call", "get_note", {"name": "get_note", "arguments": {"key": "k"}})))
+    noise = fetch("oracle", "/logs/pep/decisions.jsonl.protocol")
+    expect("noise: a refusal with no episode goes to its own file (RV5 V5)", "no episode token" in noise, noise[-300:])
+    expect("noise: the decision log has none of it", "no episode token" not in fetch("oracle", "/logs/pep/decisions.jsonl"))
     status = raw_status("GET /mcp HTTP/1.1\r\nHost: pep\r\n\r\n")
     expect("router: GET /mcp is 405", status.startswith("HTTP/1.1 405"), status)
     ping = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "ping", "params": {"_meta": {
@@ -441,8 +474,8 @@ def check_flows():
     expect("tool-a: the decline and the timeout sent it nothing", len(executions) == sent, len(executions))
     expect("tool-a: two executed", sum(1 for line in executions if line.get("executed") is True) == 2, executions)
     results = journal_results()
-    expect("journal: executed, executed, refused, unknown, released, released",
-           results == ["executed", "executed", "refused", "unknown", "released", "released"], results)
+    expect("journal: executed, executed, declined, unknown, released, released",
+           results == ["executed", "executed", "declined", "unknown", "released", "released"], results)
 
     # Server b, over its own network and credential.
     notes, notes_eid, started = start_episode("notes")
@@ -534,6 +567,8 @@ def check_join():
             if not allow:
                 problems.append(f"{service} {upstream_id}: no broker hop or allow")
                 continue
+            if hop.get("verdict") != "forwarding":
+                problems.append(f"{service} {upstream_id}: the broker's first line came after the upstream write")
             if (allow.get("upstream_id"), allow.get("action_digest"), allow.get("idempotency_key")) != (
                     upstream_id, execution.get("action_digest"), execution.get("idempotency_key")):
                 problems.append(f"{service} {upstream_id}: the allow disagrees")
@@ -541,8 +576,8 @@ def check_join():
                 problems.append(f"{service} {upstream_id}: no outcome record")
             joined += 1
     expect(f"oracle join: every execution ({joined}) joins to an allow and an outcome", joined > 0 and not problems, problems)
-    raw = fetch("oracle", "/logs/pep/decisions.jsonl")
-    expect("decision log: no token or proof", "eyJ" not in raw)
+    for name in ["decisions.jsonl", "decisions.jsonl.protocol"]:
+        expect(f"{name}: no token or proof", "eyJ" not in fetch("oracle", f"/logs/pep/{name}"))
 
 
 def main():
