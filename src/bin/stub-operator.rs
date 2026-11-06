@@ -1,10 +1,11 @@
 //! `stub-operator SOCKET REQUEST`: the scripted operator. Sends one control request (a JSON
 //! object, [`pep_sidecar::control`]) to the PEP's control socket and writes the reply's body
 //! to stdout: for `start_episode`, the Episode Token the harness hands to a fresh agent on
-//! its stdin (E1). Exits 0 for a result, 1 for an error reply, 2 for a usage or transport
-//! failure.
+//! its stdin (E1). A REQUEST of `-` is read from stdin to its end instead, which keeps a
+//! trusted input's value out of argv, where `/proc/<pid>/cmdline` shows it to every process.
+//! Exits 0 for a result, 1 for an error reply, 2 for a usage or transport failure.
 
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -24,10 +25,20 @@ fn log(message: &str) {
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let [socket, request] = args.as_slice() else {
-        log("usage: stub-operator SOCKET REQUEST-JSON");
+        log("usage: stub-operator SOCKET REQUEST-JSON|-");
         return ExitCode::from(2);
     };
-    match exchange(&PathBuf::from(socket), request.as_bytes()) {
+    let mut from_stdin = Vec::new();
+    let request = if request == "-" {
+        if let Err(error) = io::stdin().lock().read_to_end(&mut from_stdin) {
+            log(&format!("stdin: {error}"));
+            return ExitCode::from(2);
+        }
+        from_stdin.as_slice()
+    } else {
+        request.as_bytes()
+    };
+    match exchange(&PathBuf::from(socket), request) {
         Ok((status, body)) => {
             let stdout = io::stdout();
             let mut out = stdout.lock();

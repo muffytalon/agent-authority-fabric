@@ -80,6 +80,10 @@ jobs:
       - name: 6. cargo deny check
         run: cargo deny check
 
+      - name: "compose.yaml interpolates (WEEK2_PLAN §6, RV4 #16)"
+        # `config` only interpolates; PEP_SECRETS_DIR is unset in CI, so a dummy value stands in.
+        run: PEP_SECRETS_DIR=/nonexistent docker compose config --quiet
+
       - name: "G5: no getrandom on any target (fail-closed)"
         # `cargo tree -i getrandom` exits 101 when nothing matches, so inverting its status would
         # also pass when cargo itself fails. Instead, list the whole tree and fail if that fails,

@@ -25,12 +25,24 @@ fn log(message: &str) {
 }
 
 fn main() -> ExitCode {
-    let mut args = std::env::args_os().skip(1);
-    let (Some(path), None) = (args.next(), args.next()) else {
-        log("usage: stub-tool CONFIG");
-        return ExitCode::from(2);
+    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    let (check, path) = match args.as_slice() {
+        [path] => (false, path),
+        [flag, path] if flag == "--check" => (true, path),
+        _ => {
+            log("usage: stub-tool [--check] CONFIG");
+            return ExitCode::from(2);
+        }
     };
-    match run(Path::new(&path)) {
+    if check {
+        // A container healthcheck: is the server accepting connections?
+        return if check_ready(Path::new(path)) {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::FAILURE
+        };
+    }
+    match run(Path::new(path)) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             log(&format!("stub-tool: {error}"));
@@ -71,4 +83,23 @@ fn run(path: &Path) -> Result<(), String> {
         }
     }
     Err("stopped accepting".to_owned())
+}
+
+/// Whether the endpoint named in the config at `path` accepts a connection.
+fn check_ready(path: &Path) -> bool {
+    let Some(endpoint) = std::fs::read(path)
+        .ok()
+        .and_then(|bytes| tool::load(&bytes, &tool::read_file).ok())
+        .and_then(|config| Endpoint::parse(&config.listen))
+    else {
+        return false;
+    };
+    match endpoint {
+        Endpoint::Unix(socket) => std::os::unix::net::UnixStream::connect(socket).is_ok(),
+        Endpoint::Tcp(address) => {
+            // A wildcard listener is reached on loopback.
+            let address = address.replace("0.0.0.0:", "127.0.0.1:");
+            std::net::TcpStream::connect(address).is_ok()
+        }
+    }
 }

@@ -52,12 +52,24 @@ const REAP_EVERY: Duration = Duration::from_secs(30);
 const CALL_MARGIN: Duration = Duration::from_secs(5);
 
 fn main() -> ExitCode {
-    let mut args = std::env::args_os().skip(1);
-    let (Some(path), None) = (args.next(), args.next()) else {
-        log("usage: pep-sidecar CONFIG");
-        return ExitCode::from(2);
+    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    let (check, path) = match args.as_slice() {
+        [path] => (false, path),
+        [flag, path] if flag == "--check" => (true, path),
+        _ => {
+            log("usage: pep-sidecar [--check] CONFIG");
+            return ExitCode::from(2);
+        }
     };
-    match run(Path::new(&path)) {
+    if check {
+        // A container healthcheck: is the server accepting connections?
+        return if check_ready(Path::new(path)) {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::FAILURE
+        };
+    }
+    match run(Path::new(path)) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             log(&format!("pep-sidecar: {error}"));
@@ -307,4 +319,10 @@ fn first_polls(
         log(&format!("pep-sidecar: server {server_id}: {outcome:?}"));
     }
     Ok(())
+}
+
+/// Whether the agent socket named in the config at `path` accepts a connection.
+fn check_ready(path: &Path) -> bool {
+    load_config(path)
+        .is_ok_and(|config| std::os::unix::net::UnixStream::connect(&config.agent.socket).is_ok())
 }

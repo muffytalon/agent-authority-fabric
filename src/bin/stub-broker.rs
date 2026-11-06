@@ -21,12 +21,24 @@ fn log(message: &str) {
 }
 
 fn main() -> ExitCode {
-    let mut args = std::env::args_os().skip(1);
-    let (Some(path), None) = (args.next(), args.next()) else {
-        log("usage: stub-broker CONFIG");
-        return ExitCode::from(2);
+    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    let (check, path) = match args.as_slice() {
+        [path] => (false, path),
+        [flag, path] if flag == "--check" => (true, path),
+        _ => {
+            log("usage: stub-broker [--check] CONFIG");
+            return ExitCode::from(2);
+        }
     };
-    match run(Path::new(&path)) {
+    if check {
+        // A container healthcheck: is the server accepting connections?
+        return if check_ready(Path::new(path)) {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::FAILURE
+        };
+    }
+    match run(Path::new(path)) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             log(&format!("stub-broker: {error}"));
@@ -58,4 +70,12 @@ fn run(path: &Path) -> Result<(), String> {
         });
     });
     Err("stopped accepting".to_owned())
+}
+
+/// Whether the broker socket named in the config at `path` accepts a connection.
+fn check_ready(path: &Path) -> bool {
+    std::fs::read(path)
+        .ok()
+        .and_then(|bytes| broker::load(&bytes, &|path| std::fs::read(path).ok()).ok())
+        .is_some_and(|config| std::os::unix::net::UnixStream::connect(&config.socket).is_ok())
 }

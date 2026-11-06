@@ -1,6 +1,6 @@
 # WEEK2_PLAN.md: pep-sidecar Week 2 (Gate 1)
 
-Status: 2026-11-04. Steps 1–6 are done, and RV4's findings are folded in (Appendix C). 16 of the 18 decisions in §1 are CLOSED: D2 before step 2, the 13 others that block steps 3–7 in step 2, and N1 and O1 on 2026-11-04, each with its §6 SPEC wording applied. B1 stays OPEN until just before step 8, and S1 until just before step 9. This plan supersedes two earlier drafts:
+Status: 2026-11-06. Steps 1–8 are done, and step 8's acceptance passed with the real credentials (§4, as built). RV4's findings are folded in (Appendix C). 17 of the 18 decisions in §1 are CLOSED: D2 before step 2, the 13 others that block steps 3–7 in step 2, N1 and O1 on 2026-11-04, each with its §6 SPEC wording applied, and B1 on 2026-11-05. S1 stays OPEN until just before step 9. This plan supersedes two earlier drafts:
 - **AP:** the attached Week 2 plan, "pep-sidecar Week 2 Plan: Toolchain, MCP Transport and Gate 1 Readiness", in the parent folder;
 - **MG:** the 29 Oct merge notes.
 
@@ -1469,6 +1469,30 @@ networks:
   - the PEP's own keys are per-boot (R1), so they need no secret.
 - **Host user 20004.** The operator uid is new. SPEC §1 gains it in step 2.
 
+**As built (step 8, 2026-11-05).** `compose.yaml`, `Dockerfile`, `.dockerignore`, `.gitattributes`, `seccomp-unix-only.json`, and `compose/` (the profile's generator and its vendored source, the configs' generator, and `check.py`). Checked against Docker Engine 29.9.2 with Compose v5.7.0, native in WSL (Ubuntu 26.04, containerd image store, cgroup v2).
+- **Where it differs from the sketch above:**
+  - each service names a `build` target and an `image` (`pep-gate1/<service>:dev`). The hardened keys (read-only root, `cap_drop: [ALL]`, `no-new-privileges`, the AF_UNIX-only profile, `network_mode: none`) come from one `x-hardened` anchor, so the agent, the PEP, the operator and the oracle cannot drift apart;
+  - **healthchecks** run each binary's `--check CONFIG`, which connects to the socket or port the config names. The PEP waits on `service_healthy` from the broker and both tool servers, so its first polls (RV4 #5) find them up, and it waits on `service_started` from the oracle, so pep-log is held before the first record. Probes run every second during a 60 s start period and every 60 s after. A probe connects as its container's own uid, which the peer checks drop without a log line, and a tool server's probe sends no request;
+  - **the tool servers** read a config file (`config/tool-*`, bound at `/etc/tool`) and the shared lockfile, not `TOOL_SERVER_ID`. `make-config.py` writes every config from one source, so the PEP's `lockfile_digest` always matches the pins the broker and the tools read;
+  - **the operator and the agent** sit in a `run` profile. `up` leaves them out, and each `docker compose run --rm -T` is one container: an episode's agent, or one operator request (E1, RV4 #3);
+  - **the oracle** is `stub-oracle`, which only parks and holds its mounts; step 9 gives it the join. `probe` and `injector` come with step 9;
+  - `stub-operator` takes `-` for its request and reads it from stdin. That keeps a trusted input out of argv, and lets the posture check hold an operator container open.
+- **Images (B1):**
+  - the build stage is `rust:1.97.1-bookworm` plus the musl target. `rust-toolchain.toml` stays out of the context, so rustup fetches neither the macOS target nor the lint components; the stage checks `rustc 1.97.1`;
+  - both base images are pinned by index digest, and the `# syntax=` line is gone, so no frontend image is pulled at build time;
+  - sizes: pep 3.05 MB (`pep-sidecar` 2.1 MB static-pie), broker 1.91 MB, operator 1.22 MB, agent 1.24 MB, oracle 0.84 MB, each tool server 115 MB.
+  - `COPY --from=roots` keeps owners and modes (`docker export`): `/run` is root's and 0755, `/var/lib/pep` is 20002:20002 and 0700, `/var/lib/broker` is 20003:20007 and 2750, and the tool images' `/var/lib/tool` is 20005 or 20008, with group 20007 and mode 2750.
+- **Fixtures:** the `pay` intent gains INV-5005 (60,000, executed) and `max_calls` 8. `check.py` makes seven payments across the intent, and `calls` keeps counting the released ones: the decline and the timeout both release INV-5005, and the refused proof releases INV-3003.
+- **`compose/check.py`** builds, then runs its own project, `pep-check`, from empty volumes, so it never touches a `pep-gate1` stack. It tears that project down afterwards (`--keep` leaves it up). It checks:
+  - the credentials' owners and modes;
+  - every volume and socket, as seen by a read-only root container whose only capability is `CAP_DAC_READ_SEARCH`;
+  - C-POSTURE apart from the probe: `/proc/<pid>/status` (CapEff and CapBnd 0, NoNewPrivs 1, Seccomp 2) for all five services, and for an agent and an operator held open on stdin. It also checks the profile in `HostConfig.SecurityOpt`, the agent's cgroup `pids.max` and `memory.max` and its `/tmp` in `mountinfo`, and that no container mounts `docker.sock`;
+  - the profile, by its text and natively. Run from the glibc image's perl under the agent's flags, `socket()` across families 0 to 63 gives `EAFNOSUPPORT` for everything but `AF_UNIX`, and `io_uring_setup` gives `EPERM` (`EFAULT` would mean it ran). A control run under Docker's default profile lets `AF_INET` through, so the probe can tell the two apart. The `int 0x80` and x32 routes are checked in the profile's text only, and stay with C-NET (step 9);
+  - every flow of `tests/e2e.rs` over the real sockets, with their journal, tool-log and decision-log effects: M1's router rows (raw HTTP from the glibc image's perl, as the agent's uid), a read, a payment, a step-up approved, declined and timed out, the refused and unknown outcomes, server b over its own network, a wrong credential (tool-b recreated with a verifier nothing matches, then restored, and the drift poll sets it serving again), a Call Proof the broker refuses (the PEP's published key overwritten, as its uid, with the P-256 generator), and a restart that replays spend and an unresolved invoice;
+  - pep-log across a `docker restart` and a `docker kill` of the PEP, that the new boot's key replaces the stranger's, and the oracle's join.
+- **Result (2026-11-06, with the real credentials from the snippet above):** all 129 checks pass, on the images built from the digests pinned here, and `check.py` exits 0. The step-up timeout answers after 47 s, and the join covers 16 executions. Run it with `PEP_SECRETS_DIR=~/.config/pep-gate1/secrets python3 compose/check.py`.
+- **Image ownership in volumes (Appendix B), settled:** on Docker 29.9.2, a fresh on-disk volume takes the owner and mode of the image's directory (`pep-state` 20002:20002 0700, `broker-state` 20003:20007 2750, and the tool states). The tmpfs volumes, mounted with `nocopy` where the image has no directory, keep their `driver_opts`.
+
 ## 5. Forward constraints (decided now so Week 2 does not paint later weeks into a corner)
 - **Week 3:**
   - Tokio reuses the sans-IO modules of §2a, and A1's per-episode actors become `EpisodeActor`s, so the std-threads binary is not rewritten.
@@ -1542,7 +1566,7 @@ networks:
   - **Week 3:** "SQLite replaces the Week 2 journal; reconciliation replaces the Week 2 `NeedsReconcile` entity check". *Applied.*
 
 **CLAUDE.md:**
-- **§2 (once `compose.yaml` exists):** add `PEP_SECRETS_DIR=/nonexistent docker compose config --quiet` to the loop, and the same step to CI. `config` only interpolates, and fails when the variable is unset, as it is in CI, so a dummy value is enough (RV4 #16). *Waits for step 8.*
+- **§2 (once `compose.yaml` exists):** add `PEP_SECRETS_DIR=/nonexistent docker compose config --quiet` to the loop, and the same step to CI. `config` only interpolates, and fails when the variable is unset, as it is in CI, so a dummy value is enough (RV4 #16). The CI step was added in step 8 (2026-11-05); the line in CLAUDE.md's loop is yours to apply.
 - **§3, new rule "Binaries":** "Binaries log with `writeln!` to a locked `stderr` handle and return `std::process::ExitCode` from `main`. `print_stdout`, `print_stderr` and `exit` stay denied. Never log raw tokens, proofs or keys." *Applied*, headed `Binaries (print_stdout, print_stderr and exit = "deny")`, and with "keys or credentials": §2a's log rule also excludes credentials, and step 7 adds the broker's.
 - **Two-Phase Budget, append (R1 (a)); amended 2026-11-04 after RV4 #4, and the section is now headed F-10 (RV4 #21):** "Journal each payment reservation when it is made, and fsync its `forwarded` record and the call's F-08 taint and F-09 ratchet records before the call is forwarded. At boot, truncate a torn tail under the journal lock; reservations forwarded without a final outcome return as `NeedsReconcile`, keyed by their original (eid, rid), and count against their intent." *Applied*, with "reservations forwarded with no outcome, or with outcome unknown" in place of "without a final outcome", which could be read as excluding `unknown` (R1 restores both as `NeedsReconcile`).
 - **F-11/F-12, append:** "Before unlinking or binding, take an exclusive `File::try_lock` on `<socket>.lock`, opened with `O_NOFOLLOW | O_NONBLOCK` (from `nix::libc`, through `custom_flags`), created with `create_new` and set to exactly 0600, and checked by fstat (regular file, mode 0600, owner euid, `nlink` 1). Hold it for the listener's lifetime, and never remove the lock file." (Updated in step 5 with `O_NONBLOCK`, the exact mode and the never-remove rule.) *Applied* ("created if absent with create_new and then set to exactly 0600").
@@ -1855,7 +1879,7 @@ The stand-in, the clients and their pinned SDKs are in `spikes/d2-transport/`, a
 
 | Item | Why it is open | Settled at |
 |---|---|---|
-| Engines copying an image directory's owner and mode into an empty volume (RV, from moby [84][85]); `*-state` volumes taking the image's owner | Docker is installed (step 1), but the check needs step 8's images | Step 8 |
+| Engines copying an image directory's owner and mode into an empty volume (RV, from moby [84][85]); `*-state` volumes taking the image's owner | Settled 2026-11-05 on Docker 29.9.2: the state volumes take the image directory's owner and mode, and the `nocopy` tmpfs volumes keep their `driver_opts` (§4, as built) | Step 8 (done) |
 | Whether the MCP conformance suite can run against the PEP | It takes an HTTP URL, its scenarios may need fixture tools, and the bridge must attach an Episode Token to `tools/list` and `tools/call` (RV3 D5) | Step 9 |
 | Source [65] | No reachable mirror; the plan does not rely on it | — |
 

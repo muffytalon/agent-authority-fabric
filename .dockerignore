@@ -1,0 +1,5 @@
+# Only the build's inputs enter the context: no secrets, spikes, reports or build output.
+*
+!Cargo.toml
+!Cargo.lock
+!src/

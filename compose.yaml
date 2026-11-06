@@ -1,0 +1,151 @@
+# The Gate 1 topology (WEEK2_PLAN §4, SPEC §1). Run from the WSL-side clone:
+#   PEP_SECRETS_DIR=~/.config/pep-gate1/secrets docker compose up -d --build --wait
+# The operator and the agent run on demand, one container each time (E1, RV4 #3):
+#   docker compose run --rm -T operator '{"call":"start_episode","intent":"pay"}'
+#   docker compose run --rm -T agent tools/call get_invoice '{"name":"get_invoice","arguments":{"invoice_id":"INV-1001"}}' <<< "$TOKEN"
+# Step 8's acceptance (volumes, C-POSTURE, the step 7 flows) runs as its own project:
+#   PEP_SECRETS_DIR=~/.config/pep-gate1/secrets python3 compose/check.py
+# The `probe` and `injector` services of §4 come with Gate 1 (step 9).
+name: pep-gate1
+
+# Healthchecks probe every second while a service starts (first polls wait on them), then
+# rarely. A probe connects as the container's own uid, which the peer checks drop unlogged.
+x-probe: &probe
+  interval: 60s
+  timeout: 2s
+  retries: 3
+  start_period: 60s
+  start_interval: 1s
+
+x-hardened: &hardened
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true", "seccomp=./seccomp-unix-only.json"]
+  network_mode: "none"
+
+services:
+  oracle:                      # holds pep-log mounted across PEP restarts (RV4 #10); step 9 joins the logs
+    <<: *hardened
+    build: { context: ., target: oracle }
+    image: pep-gate1/oracle:dev
+    user: "20006:20007"        # 20007 is the log group every log directory grants read to
+    volumes:
+      - { type: volume, source: pep-log,      target: /logs/pep,    read_only: true }
+      - { type: volume, source: broker-state, target: /logs/broker, read_only: true }
+      - { type: volume, source: tool-a-state, target: /logs/tool-a, read_only: true }
+      - { type: volume, source: tool-b-state, target: /logs/tool-b, read_only: true }
+
+  tool-a: &tool                # stub tool servers: their own uid, network and credential (RV4 #7)
+    build: { context: ., target: tool, args: { TOOL_UID: "20005" } }
+    image: pep-gate1/tool-a:dev
+    user: "20005:20005"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]     # Docker's default seccomp: tool servers need inet
+    networks: [tools_a]
+    volumes:
+      - { type: volume, source: tool-a-state, target: /var/lib/tool }
+      - { type: bind, source: ./config/tool-a,   target: /etc/tool,     read_only: true }
+      - { type: bind, source: ./config/lockfile, target: /etc/lockfile, read_only: true }
+      - { type: bind, source: "${PEP_SECRETS_DIR:?set PEP_SECRETS_DIR}/broker-credential-a.sha256", target: /run/credential.sha256, read_only: true }
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/stub-tool", "--check", "/etc/tool/config.json"]
+      <<: *probe
+
+  tool-b:                      # second server, for mutations #12 and #25
+    <<: *tool                  # `<<` replaces whole keys, so per-server keys are restated in full
+    build: { context: ., target: tool, args: { TOOL_UID: "20008" } }
+    image: pep-gate1/tool-b:dev
+    user: "20008:20008"
+    networks: [tools_b]
+    volumes:
+      - { type: volume, source: tool-b-state, target: /var/lib/tool }
+      - { type: bind, source: ./config/tool-b,   target: /etc/tool,     read_only: true }
+      - { type: bind, source: ./config/lockfile, target: /etc/lockfile, read_only: true }
+      - { type: bind, source: "${PEP_SECRETS_DIR:?set PEP_SECRETS_DIR}/broker-credential-b.sha256", target: /run/credential.sha256, read_only: true }
+
+  broker:
+    build: { context: ., target: broker }
+    image: pep-gate1/broker:dev
+    user: "20003:20003"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]     # needs inet to reach the tool servers
+    networks: [tools_a, tools_b]                 # one network per tool server (RV4 #7)
+    depends_on:
+      tool-a: { condition: service_healthy }
+      tool-b: { condition: service_healthy }
+    volumes:
+      - { type: volume, source: broker-sock,  target: /run/broker,  volume: { nocopy: true } }
+      - { type: volume, source: pep-pub,      target: /run/pep-pub, read_only: true, volume: { nocopy: true } }
+      - { type: volume, source: broker-state, target: /var/lib/broker }
+      - { type: bind, source: ./config/broker,   target: /etc/broker,   read_only: true }   # static routes (RV4 #12)
+      - { type: bind, source: ./config/lockfile, target: /etc/lockfile, read_only: true }   # the same lockfile as the PEP
+      - { type: bind, source: "${PEP_SECRETS_DIR:?set PEP_SECRETS_DIR}/broker-credential-a", target: /run/credential-a, read_only: true }
+      - { type: bind, source: "${PEP_SECRETS_DIR:?set PEP_SECRETS_DIR}/broker-credential-b", target: /run/credential-b, read_only: true }
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/stub-broker", "--check", "/etc/broker/config.json"]
+      <<: *probe
+
+  pep:
+    <<: *hardened
+    build: { context: ., target: pep }
+    image: pep-gate1/pep:dev
+    user: "20002:20002"
+    depends_on:                # every server's first poll needs the broker and the tools (RV4 #5)
+      oracle: { condition: service_started }
+      broker: { condition: service_healthy }
+      tool-a: { condition: service_healthy }
+      tool-b: { condition: service_healthy }
+    volumes:
+      - { type: volume, source: pep-sock,    target: /run/pep,     volume: { nocopy: true } }
+      - { type: volume, source: pep-ctl,     target: /run/pep-ctl, volume: { nocopy: true } }
+      - { type: volume, source: pep-pub,     target: /run/pep-pub, volume: { nocopy: true } }
+      - { type: volume, source: broker-sock, target: /run/broker,  volume: { nocopy: true } }
+      - { type: volume, source: pep-state,   target: /var/lib/pep }   # R1 journal; only the PEP mounts it
+      - { type: volume, source: pep-log,     target: /var/log/pep }   # decision log (RV3 B4)
+      - { type: bind, source: ./config/pep,      target: /etc/pep,      read_only: true }
+      - { type: bind, source: ./config/lockfile, target: /etc/lockfile, read_only: true }   # shared with the broker (RV4 #12)
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/pep-sidecar", "--check", "/etc/pep/config.json"]
+      <<: *probe
+
+  operator:                    # the scripted operator (H1); runs on demand
+    <<: *hardened
+    profiles: [run]
+    build: { context: ., target: operator }
+    image: pep-gate1/operator:dev
+    user: "20004:20004"
+    depends_on:
+      pep: { condition: service_healthy }
+    volumes:
+      - { type: volume, source: pep-ctl, target: /run/pep-ctl, volume: { nocopy: true } }
+
+  agent:                       # the step 8 stub agent; one container per episode (E1, RV4 #3)
+    <<: *hardened
+    profiles: [run]
+    build: { context: ., target: agent }
+    image: pep-gate1/agent:dev
+    user: "20001:20001"
+    pids_limit: 256
+    mem_limit: 1g
+    tmpfs: ["/tmp:size=64m,mode=1777,nosuid,nodev,noexec"]
+    depends_on:
+      pep: { condition: service_healthy }
+    volumes:
+      - { type: volume, source: pep-sock, target: /run/pep, volume: { nocopy: true } }
+
+volumes:
+  pep-sock:     { driver: local, driver_opts: { type: tmpfs, device: tmpfs, o: "uid=20002,gid=20001,mode=2750" } }
+  broker-sock:  { driver: local, driver_opts: { type: tmpfs, device: tmpfs, o: "uid=20003,gid=20002,mode=2750" } }
+  pep-ctl:      { driver: local, driver_opts: { type: tmpfs, device: tmpfs, o: "uid=20002,gid=20004,mode=2750" } }
+  pep-pub:      { driver: local, driver_opts: { type: tmpfs, device: tmpfs, o: "uid=20002,gid=20003,mode=2750" } }
+  pep-state:    {}             # on disk; owner 20002 and mode 0700 come from the image's /var/lib/pep
+  pep-log:      { driver: local, driver_opts: { type: tmpfs, device: tmpfs, o: "uid=20002,gid=20007,mode=2750,size=256m" } }
+  broker-state: {}             # 20003:20007, 2750, from the image
+  tool-a-state: {}             # 20005:20007, 2750, from the image
+  tool-b-state: {}             # 20008:20007, 2750, from the image
+
+networks:
+  tools_a: { internal: true }
+  tools_b: { internal: true }
