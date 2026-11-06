@@ -39,6 +39,7 @@
   | `origin_hash` with `cid` `"7"`, `tool` `get_invoice`, that `qd`, `ptr` `/total_minor`, `val` `5000` | `sha-256:2pEVfWny8jku05UQCRDDarGnSs_F2tZB7_YtsC-7SYU` |
   | F-07 key: `episode_id` `0x0192d4e07c3a7b2e9f103c4d5e6f7a8b`, `rid` 1, the `pay_invoice` `action_digest` (75 hashed bytes) | `pep-UhReNoSbXP-SykKxyF9adQ4g5F1oTTAKAJPlYrbk9V0` |
   | The same with `rid` 2 | `pep-xi_53ViTWcbekOTZepC96vxdqaHXZyIGrok6uJGrvPA` |
+  | Entity key (§3.4): `INV-1001`, amount 30000, `USD` (45 hashed bytes) | `pep-entity-Yu_eNyRGZBgMDDn-pCt9Ta9fcfYfG_P_it-H435XEsc` |
   | The RFC 8785 §3.2.3 sorting object (keys U+20AC, CR, U+FB33, `1`, U+1F600, U+0080, U+00F6), NFC-adjusted, 181 canonical bytes | `sha-256:mgPbgbBjohAvazT5LBgyJA_w6YmlxvrHDvBHwIx3EZ8` |
   | UTF-16 versus code-point order: keys U+E000, U+1F600, U+20AC, which sort as U+20AC, U+1F600, U+E000 | `sha-256:jNh0WYS4ffXX2aXqkhvL-ODli8yRoW9Hl5cJkVcLwgU` |
   | `episode_id` as a ULID: 0 / 1 / 2^128 − 1 / the F-07 `episode_id` | `00000000000000000000000000` / `00000000000000000000000001` / `7ZZZZZZZZZZZZZZZZZZZZZZZZZ` / `01JBAE0Z1TFCQ9Y41W9NF6YYMB` |
@@ -46,8 +47,8 @@
 ## 3. Standard OAuth, WIMSE, MCP & Payment Artifacts
 1. **RFC 9396 RAR `authorization_details` (`type: "https://schemas.pep-sidecar.dev/rar/agent-payment-intent/v1"`):**
    - Carried inside ID-JAG (`draft-ietf-oauth-identity-assertion-authz-grant-04`, `typ: "oauth-id-jag+jwt"`).
-   - Fields: `actions`, `locations`, and `pep_intent: {episode_id, intent_digest, release_epoch, lockfile_digest, limits: {currency, per_call_max_minor, cumulative_max_minor, max_calls, step_up_over_minor}, entities: {recipient_ids | invoice_ids | entity_set_digest, resolution, per_entity_max_uses}}`.
-   - **Limits Semantics:** `max_calls` counts all payment reservations, aborted ones included. Step-up applies when the amount is strictly greater than `step_up_over_minor` (`amount > step_up_over_minor`).
+   - Fields: `actions`, `locations`, and `pep_intent: {episode_id, intent_digest, release_epoch, lockfile_digest, limits: {currency, per_call_max_minor, cumulative_max_minor, max_calls, step_up_over_minor, max_declines}, entities: {recipient_ids | invoice_ids | entity_set_digest, resolution, per_entity_max_uses}}`.
+   - **Limits Semantics:** `max_calls` counts all payment reservations, aborted ones included. Step-up applies when the amount is strictly greater than `step_up_over_minor` (`amount > step_up_over_minor`). `max_declines`, from 1 to `max_calls`, stops an intent's payments once its tools have declined that many, because a decline refunds its amount on the tool's word alone: real spend can pass `cumulative_max_minor` by at most `max_declines × per_call_max_minor`. A refusal the tool never saw does not count.
 2. **Transaction Token (`draft-ietf-oauth-transaction-tokens-11`):**
    - Requested via RFC 8693 (`requested_token_type=urn:ietf:params:oauth:token-type:txn_token`).
    - Required claims: `txn` (set to `episode_id`), `sub`, `scope`, `aud`, `iat`, `exp`, `req_wl` (`spiffe://corp.example/pep`).
@@ -56,7 +57,7 @@
    - ES256 JWS carried in `_meta["dev.pep-sidecar/episode"]` (and optional matching `Pep-Episode` header; mismatch returns JSON-RPC error `-32020`).
    - Claims: `{eid, intent_digest, sub, client_id, peer_uid, release_epoch, rar_digest, txn, iat, exp}` with `exp - iat <= 28800` (8 hours).
    - Minted by the PEP on the host `start_episode` call and revoked by `end_episode`; idle timeout 30 minutes; signed with a per-boot key, so a PEP restart invalidates every token; delivered to the agent on stdin.
-   - Each `start_episode` mints a fresh `eid`, which is also `txn` (§3.2) and the engine's `episode_id`. An intent has at most one live episode. Revocation and idle state are keyed by `eid`. The PEP rejects high-S signatures, and applies §3.4's header and encoding rules.
+   - Each `start_episode` mints a fresh `eid`, which is also `txn` (§3.2) and the engine's `episode_id`. An intent has at most one live episode. Revocation and idle state are keyed by `eid`. The PEP is the only issuer and the only verifier of its tokens, so it admits one by comparing its exact bytes, by digest, with those minted this boot. So each token has exactly one accepted encoding, and a forged token costs a hash and a lookup, not a P-256 verify.
    - Required on `tools/call`, in `_meta`, where a matching `Pep-Episode` header is optional. On `tools/list`, it may come in `_meta` or as a `Pep-Episode` header alone, because SDKs send their own `tools/list` without caller `_meta`; if both are present they must match. Its `peer_uid` must equal the connection's uid, its `release_epoch` the loaded lockfile's, and its `intent_digest` the configured intent's.
    - A token is delivered only to a fresh agent container: each episode runs in its own container, removed when the episode ends, and episodes after a PEP restart get new ones. A fresh process in a reused container is not enough, because files and helper processes survive it.
    - No `iss`, `aud`, `jti` or `nbf`: the PEP is the only issuer and verifier; the `typ` and key differ from the Call Proof's, which makes the two validations mutually exclusive.
@@ -80,6 +81,8 @@
      - `action_digest` equals the broker's own recomputation from the forwarded body;
      - `rid`, `prov` and `budget` are present exactly when the lockfile marks the tool as a payment, and `budget`'s `amount_minor` and `currency` equal the forwarded arguments.
    - The replay cache is keyed by `jti`. Its capacity follows from the per-episode rate limit and the episode cap; a full cache rejects.
+   - **What a status means.** The broker forwards a call only on its way to a 200. Any other status means nothing was forwarded, and past its connection limit it answers 503. A broker that cannot keep this promise answers 200 with outcome `unknown`. Each route may use at most `(connections − 2) / routes` connections.
+   - **Entity key.** For a payment of an invoice, the broker also sends `Pep-Entity-Key`, recomputed from the forwarded arguments: `"pep-entity-" + b64url(SHA-256("pep-entity-key-v1" || 0x00 || len(entity) as u64 BE || entity || amount_minor as u64 BE || currency))`. It names the invoice and amount, whichever reservation pays, so a provider can refuse a second execution even if the PEP's journal is lost. Only an execution uses it up, so a declined invoice can be retried. It adds to the F-07 `Idempotency-Key`, which does not change.
 5. **AuthZEN 1.0 (`POST /access/v1/evaluation`) & AgentCore Mapping:**
    - AuthZEN payload: `subject`, `action`, `resource`, and `context: {episode_id, intent, args, prov, labels, budget, automaton, release_epoch}`.
    - AWS AgentCore (no AuthZEN): map into JWT claim tags (`principal.getTag()`), `context.input._pep`, and `x-amzn-bedrock-agentcore-policy-session-id`.
