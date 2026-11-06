@@ -1620,9 +1620,11 @@ mod tests {
             .unwrap()
             .len();
         let count = PREALLOCATED_BYTES / u64::try_from(line_bytes).unwrap() * 3;
+        // `append` waits for the writer. This many `enqueue`s in a row can outrun it, and a full
+        // queue refuses them, which is what it is for.
         for rid in 1..=count {
             handle
-                .enqueue(&[reserve(EID, rid, "pay", "INV-1", 100)])
+                .append(&[reserve(EID, rid, "pay", "INV-1", 100)])
                 .unwrap();
         }
         handle.commit(&[]).unwrap();

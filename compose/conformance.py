@@ -49,6 +49,8 @@ def actual_failures(results):
 
 
 def start_bridge(token):
+    # Pulled apart, because its first line of output is how the bridge says it is serving.
+    run(["docker", "pull", "-q", PYTHON_IMAGE], timeout=300)
     process = subprocess.Popen(
         ["docker", "run", "--rm", "-i", "--name", f"{check.PROJECT}-agent-bridge", "--read-only", "--cap-drop", "ALL",
          "--security-opt", "no-new-privileges:true", "--user", "20001:20001", "-p", f"127.0.0.1:{PORT}:8080",
