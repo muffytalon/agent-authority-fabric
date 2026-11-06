@@ -4,6 +4,7 @@
 #   RUSTFLAGS, on the toolchain rust-toolchain.toml pins.
 # - `ignored-tests` runs the three #[ignore] peercred tests. Two need root, which
 #   GitHub-hosted runners give through passwordless sudo.
+# - `compose` builds every image and runs compose/check.py, with throwaway credentials.
 # - The weekly run catches new RustSec advisories against an unchanged Cargo.lock.
 #
 # Actions are pinned to full commit SHAs, with the release tag in the trailing comment.
@@ -137,3 +138,42 @@ jobs:
             "RUSTFLAGS=$RUSTFLAGS" \
             "CARGO_TERM_COLOR=$CARGO_TERM_COLOR" \
             cargo test --locked -- --ignored --nocapture
+
+  compose:
+    # WEEK2_PLAN step 8: builds every image and runs compose/check.py on the runner's engine and
+    # kernel: volume owners and modes, C-POSTURE, every flow of tests/e2e.rs, pep-log across a
+    # restart and a kill, and the oracle's join. The credentials are throwaway, made for this
+    # run with §4's snippet, and sudo gives them §4's owners. They guard nothing but the stubs.
+    name: Compose topology, posture and flows
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Record the engine and the kernel
+        run: |
+          docker version --format 'Docker {{.Server.Version}}'
+          docker compose version
+          uname -r
+          echo "Docker \`$(docker version --format '{{.Server.Version}}')\`, kernel \`$(uname -r)\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Create throwaway credentials (WEEK2_PLAN §4)
+        run: |
+          secrets="$RUNNER_TEMP/pep-secrets"
+          install -d -m 0700 "$secrets"
+          cd "$secrets"
+          for pair in a:20005 b:20008; do
+            server=${pair%%:*} uid=${pair##*:}
+            ( umask 077
+              head -c 32 /dev/urandom | base64 -w0 > "broker-credential-$server"
+              sha256sum "broker-credential-$server" | cut -d' ' -f1 | tr -d '\n' > "broker-credential-$server.sha256" )
+            sudo chown 20003:20003 "broker-credential-$server"
+            sudo chown "$uid:$uid" "broker-credential-$server.sha256"
+            sudo chmod 0400 "broker-credential-$server" "broker-credential-$server.sha256"
+          done
+          echo "PEP_SECRETS_DIR=$secrets" >> "$GITHUB_ENV"
+
+      - name: compose/check.py
+        run: python3 compose/check.py
