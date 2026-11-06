@@ -217,15 +217,13 @@ impl DecisionLog {
         ])
     }
 
-    /// Writes an outcome record: how the call `upstream_id` of episode `eid` ended, `pep_us`
-    /// after its decision.
+    /// Writes an outcome record: how the call `upstream_id` of episode `eid` ended.
     pub fn outcome(
         &self,
         eid: u128,
         upstream_id: &str,
         jti: Option<&str>,
         ending: Ending,
-        pep_us: u64,
         ts_ms: u64,
     ) {
         let line = object(vec![
@@ -233,12 +231,25 @@ impl DecisionLog {
             ("eid", JcsValue::string(encode_ulid(eid))),
             ("jti", text(jti)),
             ("outcome", JcsValue::string(ending.name())),
-            ("pep_us", number(Some(pep_us))),
             ("ts_ms", number(Some(ts_ms))),
             ("upstream_id", JcsValue::string(upstream_id)),
             ("v", number(Some(1))),
         ]);
         // The decision before it is what the oracle needs, and the journal has the outcome.
+        let _ = write(self.writer.as_ref(), &line);
+    }
+
+    /// Writes how long the PEP held the call `upstream_id`: `pep_us` is O1's residence, from the
+    /// first byte read from the agent to the last byte written back, less the upstream leg. Only
+    /// a measurement, so a record the log cannot take is lost.
+    pub fn residence(&self, upstream_id: &str, pep_us: u64, ts_ms: u64) {
+        let line = object(vec![
+            ("boot_ms", number(Some(self.boot_ms))),
+            ("pep_us", number(Some(pep_us))),
+            ("ts_ms", number(Some(ts_ms))),
+            ("upstream_id", JcsValue::string(upstream_id)),
+            ("v", number(Some(1))),
+        ]);
         let _ = write(self.writer.as_ref(), &line);
     }
 }
@@ -378,14 +389,7 @@ mod tests {
             },
             1_700_000_000_000,
         );
-        log.outcome(
-            1,
-            "01J",
-            Some("jti-1"),
-            Ending::Executed,
-            1234,
-            1_700_000_000_001,
-        );
+        log.outcome(1, "01J", Some("jti-1"), Ending::Executed, 1_700_000_000_001);
         let text = fs::read_to_string(&path).unwrap();
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines.len(), 2);
@@ -408,7 +412,7 @@ mod tests {
         let path = dir.join("decisions.jsonl");
         let log = DecisionLog::open(&path, 300).unwrap();
         for _ in 0..10 {
-            log.outcome(1, "01J", None, Ending::Abandoned, 1, 1);
+            log.outcome(1, "01J", None, Ending::Abandoned, 1);
         }
         assert!(fs::metadata(&path).unwrap().len() <= 300);
         assert!(dir.join("decisions.jsonl.1").exists());
@@ -494,7 +498,7 @@ mod tests {
             ..Decision::default()
         };
         assert!(log.decision(Verdict::Allow, &record, 1));
-        log.outcome(1, "01J", None, Ending::Declined, 0, 2);
+        log.outcome(1, "01J", None, Ending::Declined, 2);
         let text = fs::read_to_string(&path).unwrap();
         let boot = format!(r#""boot_ms":{}"#, log.boot_ms);
         assert!(log.boot_ms > 0);
@@ -521,6 +525,6 @@ mod tests {
 
     #[test]
     fn a_disabled_log_writes_nothing() {
-        DecisionLog::disabled().outcome(1, "01J", None, Ending::Released, 0, 0);
+        DecisionLog::disabled().outcome(1, "01J", None, Ending::Released, 0);
     }
 }

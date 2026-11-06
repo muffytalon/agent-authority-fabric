@@ -74,7 +74,8 @@ def fetch(service, path):
 
 
 def lines(service, path):
-    return [json.loads(line) for line in fetch(service, path).splitlines() if line]
+    # The journal is preallocated, so it ends in NULs.
+    return [json.loads(line) for line in fetch(service, path).split("\0", 1)[0].splitlines() if line]
 
 
 def pointer(value, path):

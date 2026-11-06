@@ -17,6 +17,7 @@ use crate::engine::{
 };
 use crate::jcs::{self, JcsError, JcsObject, JcsValue, ParseOptions};
 use crate::lockfile::{self, Lockfile};
+use crate::tokens::EPISODE_MAX_LIFETIME_SECS;
 use crate::tokens::Es256Verifier;
 
 /// The longest the step-up wait and the upstream leg may take together, in milliseconds: the
@@ -338,6 +339,8 @@ pub struct RuntimeLimits {
     pub step_up_timeout_ms: u64,
     /// An episode with no call for this long ends (T1).
     pub episode_idle_ms: u64,
+    /// How long an Episode Token lasts, at most `EPISODE_MAX_LIFETIME_SECS`.
+    pub episode_lifetime_ms: u64,
     /// Live episodes at once (E1).
     pub episodes: usize,
     /// Calls an episode may make at once before the rate applies.
@@ -592,6 +595,11 @@ fn limits_section(mut fields: Fields<'_>) -> Result<RuntimeLimits, LoadError> {
             DEFAULT_STEP_UP_TIMEOUT_MS,
         )?,
         episode_idle_ms: fields.positive("episode_idle_ms")?,
+        episode_lifetime_ms: defaulted(
+            &mut fields,
+            "episode_lifetime_ms",
+            EPISODE_MAX_LIFETIME_SECS.saturating_mul(1000),
+        )?,
         episodes: fields.positive_usize("episodes")?,
         call_burst: positive_u32(&mut fields, "call_burst")?,
         call_rate_per_s: positive_u32(&mut fields, "call_rate_per_s")?,
@@ -619,6 +627,14 @@ fn limits_section(mut fields: Fields<'_>) -> Result<RuntimeLimits, LoadError> {
         return fail(
             "step_up_timeout_ms",
             "step_up_timeout_ms plus upstream_timeout_ms exceeds 55,000 (P1)",
+        );
+    }
+    if limits.episode_lifetime_ms < 1000
+        || limits.episode_lifetime_ms.checked_div(1000) > Some(EPISODE_MAX_LIFETIME_SECS)
+    {
+        return fail(
+            "episode_lifetime_ms",
+            "from 1,000 up to the token profile's 8 hours",
         );
     }
     if limits.drift_poll_deadline_ms >= limits.drift_poll_ms {
@@ -1609,6 +1625,32 @@ mod tests {
     }
 
     #[test]
+    fn a_token_lifetime_stays_inside_the_profile() {
+        assert_eq!(
+            load_str(&config_with(PINS))
+                .unwrap()
+                .limits
+                .episode_lifetime_ms,
+            28_800_000
+        );
+        let with = |value: u64| {
+            edit(
+                &config_with(PINS),
+                r#""episodes": 8,"#,
+                &format!(r#""episodes": 8, "episode_lifetime_ms": {value},"#),
+            )
+        };
+        assert_eq!(
+            load_str(&with(30_000)).unwrap().limits.episode_lifetime_ms,
+            30_000
+        );
+        for bad in [999, 28_801_000] {
+            let error = load_str(&with(bad)).unwrap_err();
+            assert_eq!(error.path, "limits.episode_lifetime_ms", "{bad}");
+        }
+    }
+
+    #[test]
     fn a_decline_limit_is_between_one_and_max_calls() {
         let limits = r#""max_calls": 5, "step_up_over_minor": 50000, "max_declines": 3"#;
         let with = |declines: u32| {
@@ -1637,6 +1679,24 @@ mod tests {
         assert_eq!(
             problem,
             Problem::Invalid("two invoice ids differ only by case")
+        );
+    }
+
+    #[test]
+    fn a_secret_cannot_leave_through_another_servers_cleared_tool() {
+        // `search_notes` on b is cleared for secret and takes free data. A tool on a that outputs
+        // secret could hand it a secret its server never held.
+        let (path, problem) = error(
+            true,
+            r#""output_label": {"conf": "internal", "integ": "trusted"}"#,
+            r#""output_label": {"conf": "secret", "integ": "trusted"}"#,
+        );
+        assert_eq!(path, "pins");
+        assert_eq!(
+            problem,
+            Problem::Invalid(
+                "a tool cleared for secret with data arguments shares a server with every tool that outputs secret"
+            )
         );
     }
 

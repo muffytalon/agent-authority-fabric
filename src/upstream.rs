@@ -11,7 +11,7 @@ use std::net::TcpStream;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc;
+use std::sync::{Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -69,6 +69,45 @@ impl UpstreamError {
     }
 }
 
+/// When an upstream leg's first byte left and its last byte came back: what O1's residence
+/// subtracts from a hop's time, so a hop is not charged for the time spent upstream.
+#[derive(Debug, Default)]
+pub struct LegTimer {
+    marks: Mutex<(Option<Instant>, Option<Instant>)>,
+}
+
+impl LegTimer {
+    /// The first byte is going upstream.
+    pub fn wrote(&self) {
+        if let Ok(mut marks) = self.marks.lock() {
+            marks.0.get_or_insert_with(Instant::now);
+        }
+    }
+
+    /// The last byte came back.
+    pub fn read(&self) {
+        if let Ok(mut marks) = self.marks.lock() {
+            marks.1 = Some(Instant::now());
+        }
+    }
+
+    /// How long the leg took, once it has ended.
+    #[must_use]
+    pub fn duration(&self) -> Option<Duration> {
+        let marks = self.marks.lock().ok()?;
+        let (wrote, read) = (marks.0?, marks.1?);
+        read.checked_duration_since(wrote)
+    }
+}
+
+/// A hop's residence (O1): `since` to now, less the upstream leg. Saturating, as only a
+/// measurement; `None` if the call went upstream and that leg has not ended.
+#[must_use]
+pub fn residence_us(since: Instant, leg: Option<Duration>) -> u64 {
+    let total = since.elapsed().saturating_sub(leg.unwrap_or_default());
+    u64::try_from(total.as_micros()).unwrap_or(u64::MAX)
+}
+
 /// The broker client: its socket, the uid and gid its peer must have, and the largest reply
 /// body it reads.
 #[derive(Debug, Clone)]
@@ -102,6 +141,20 @@ impl BrokerClient {
         request: &UpstreamRequest,
         timeout: Duration,
     ) -> Result<Vec<u8>, UpstreamError> {
+        self.exchange_timed(request, timeout, None)
+    }
+
+    /// [`BrokerClient::exchange`], with `timer` marking the leg's ends.
+    ///
+    /// # Errors
+    ///
+    /// As [`BrokerClient::exchange`].
+    pub fn exchange_timed(
+        &self,
+        request: &UpstreamRequest,
+        timeout: Duration,
+        timer: Option<&LegTimer>,
+    ) -> Result<Vec<u8>, UpstreamError> {
         let headers: Vec<(&str, String)> = request
             .headers
             .iter()
@@ -116,6 +169,7 @@ impl BrokerClient {
             timeout,
             max_body: self.max_body,
             peer: Some((self.uid, self.gid)),
+            timer,
         })
     }
 }
@@ -172,6 +226,8 @@ pub struct Post<'a> {
     /// check is possible, and the caller authenticates otherwise (the broker's per-server
     /// credential).
     pub peer: Option<(u32, u32)>,
+    /// Marks the leg's first byte written and last byte read (O1).
+    pub timer: Option<&'a LegTimer>,
 }
 
 /// Sends `request` and returns the body of a 200 JSON reply that arrives whole within its
@@ -190,6 +246,7 @@ pub fn post(request: &Post<'_>) -> Result<Vec<u8>, UpstreamError> {
         timeout,
         max_body,
         peer,
+        timer,
     } = *request;
     let deadline = Instant::now()
         .checked_add(timeout)
@@ -209,6 +266,9 @@ pub fn post(request: &Post<'_>) -> Result<Vec<u8>, UpstreamError> {
         }
     };
     let bytes = request_bytes(path, host, headers, body);
+    if let Some(timer) = timer {
+        timer.wrote();
+    }
     let written = match &mut connection {
         Connection::Unix(stream) => http::write_by(stream, &bytes, deadline),
         Connection::Tcp(stream) => http::write_by(stream, &bytes, deadline),
@@ -225,6 +285,9 @@ pub fn post(request: &Post<'_>) -> Result<Vec<u8>, UpstreamError> {
         HttpError::Timeout => UpstreamError::Timeout,
         other => UpstreamError::Response(other),
     })?;
+    if let Some(timer) = timer {
+        timer.read();
+    }
     if response.status != 200 {
         return Err(UpstreamError::Status(response.status));
     }
@@ -290,15 +353,36 @@ impl Upstream for BrokerClient {
         request: &UpstreamRequest,
         timeout: Duration,
     ) -> Result<Vec<u8>, UpstreamFailure> {
-        self.exchange(request, timeout).map_err(|error| {
-            // The broker forwards a call only on its way to a 200, so any other status from it
-            // means nothing was forwarded (SPEC §3.4).
-            if error.not_delivered() || matches!(error, UpstreamError::Status(_)) {
-                UpstreamFailure::NotSent
-            } else {
-                UpstreamFailure::Lost
-            }
-        })
+        self.call_marked(request, timeout, None)
+    }
+
+    fn call_timed(
+        &self,
+        request: &UpstreamRequest,
+        timeout: Duration,
+        timer: &LegTimer,
+    ) -> Result<Vec<u8>, UpstreamFailure> {
+        self.call_marked(request, timeout, Some(timer))
+    }
+}
+
+impl BrokerClient {
+    fn call_marked(
+        &self,
+        request: &UpstreamRequest,
+        timeout: Duration,
+        timer: Option<&LegTimer>,
+    ) -> Result<Vec<u8>, UpstreamFailure> {
+        self.exchange_timed(request, timeout, timer)
+            .map_err(|error| {
+                // The broker forwards a call only on its way to a 200, so any other status from it
+                // means nothing was forwarded (SPEC §3.4).
+                if error.not_delivered() || matches!(error, UpstreamError::Status(_)) {
+                    UpstreamFailure::NotSent
+                } else {
+                    UpstreamFailure::Lost
+                }
+            })
     }
 }
 
@@ -442,6 +526,7 @@ mod tests {
         let body = vec![b'x'; 8 << 20];
         let started = Instant::now();
         let error = post(&Post {
+            timer: None,
             endpoint: &Endpoint::Unix(path),
             path: "/mcp",
             host: "tool",
@@ -456,6 +541,29 @@ mod tests {
         assert!(error.not_delivered());
         assert!(started.elapsed() < Duration::from_secs(2));
         server.join().unwrap();
+    }
+
+    #[test]
+    fn a_residence_leaves_the_upstream_leg_out() {
+        let timer = LegTimer::default();
+        assert_eq!(timer.duration(), None, "not started");
+        timer.wrote();
+        assert_eq!(timer.duration(), None, "not ended");
+        thread::sleep(Duration::from_millis(30));
+        timer.read();
+        let leg = timer.duration().unwrap();
+        assert!(leg >= Duration::from_millis(30));
+        let since = Instant::now()
+            .checked_sub(leg + Duration::from_millis(5))
+            .unwrap();
+        assert!(residence_us(since, Some(leg)) >= 5_000);
+        assert!(
+            residence_us(since, Some(leg)) < 30_000,
+            "the leg is left out"
+        );
+        // A later first write does not move the start.
+        timer.wrote();
+        assert_eq!(timer.duration(), Some(leg));
     }
 
     #[test]

@@ -42,6 +42,7 @@ use crate::tokens::{
     CALL_PROOF_TTL_SECS, CallProofClaims, Es256Signer, PaymentClaims, TokenError, issue_call_proof,
     new_jti,
 };
+use crate::upstream::LegTimer;
 
 /// How long past the upstream timeout the actor waits for a worker's report.
 const LEG_MARGIN: Duration = Duration::from_secs(1);
@@ -87,6 +88,24 @@ pub trait Upstream: Send + Sync + fmt::Debug {
         request: &UpstreamRequest,
         timeout: Duration,
     ) -> Result<Vec<u8>, UpstreamFailure>;
+
+    /// [`Upstream::call`], with `timer` marking the leg's ends for O1's residence. The default
+    /// marks either side of the call; the real client marks the bytes themselves.
+    ///
+    /// # Errors
+    ///
+    /// As [`Upstream::call`].
+    fn call_timed(
+        &self,
+        request: &UpstreamRequest,
+        timeout: Duration,
+        timer: &LegTimer,
+    ) -> Result<Vec<u8>, UpstreamFailure> {
+        timer.wrote();
+        let reply = self.call(request, timeout);
+        timer.read();
+        reply
+    }
 }
 
 /// What every actor shares (A1). No connection thread holds it.
@@ -138,6 +157,8 @@ pub enum AgentMessage {
         peer_uid: u32,
         /// Where to answer.
         reply: SyncSender<CallReply>,
+        /// Marks the upstream leg, for the connection's residence record (O1).
+        leg: Arc<LegTimer>,
     },
     /// The agent's connection closed before its reply (P1).
     Disconnected {
@@ -278,13 +299,13 @@ struct Call {
     prov: Vec<String>,
     reply: SyncSender<CallReply>,
     peer_uid: u32,
-    /// When the engine decided it, for the outcome record's `pep_us`.
-    decided: Instant,
     /// Its Call Proof's `jti`, once built.
     jti: Option<String>,
     /// While it is upstream: when the actor stops waiting for its worker, whatever the worker
     /// is doing, so a leg always ends (P1).
     leg_deadline: Option<Instant>,
+    /// Marks the upstream leg (O1).
+    leg: Arc<LegTimer>,
 }
 
 struct Actor {
@@ -404,7 +425,8 @@ impl Actor {
                 request,
                 peer_uid,
                 reply,
-            } => self.on_call(pep_id, peer_uid, &request, reply),
+                leg,
+            } => self.on_call(pep_id, peer_uid, &request, reply, leg),
             AgentMessage::Disconnected { pep_id } => {
                 // Before its point of forwarding a call is released; after it, the upstream
                 // leg decides (P1).
@@ -421,6 +443,7 @@ impl Actor {
         peer_uid: u32,
         request: &[u8],
         reply: SyncSender<CallReply>,
+        leg: Arc<LegTimer>,
     ) {
         if self.ended {
             answer(&reply, CallReply::Denied);
@@ -468,9 +491,9 @@ impl Actor {
                     prov: allowed.prov,
                     reply,
                     peer_uid,
-                    decided: Instant::now(),
                     jti: None,
                     leg_deadline: None,
+                    leg,
                 };
                 if self.journal_reserve(&call) {
                     self.forward(call);
@@ -487,9 +510,9 @@ impl Actor {
                     prov: pending.prov,
                     reply,
                     peer_uid,
-                    decided: Instant::now(),
                     jti: None,
                     leg_deadline: None,
+                    leg,
                 };
                 if self.journal_reserve(&call) {
                     self.log_decision(Verdict::StepUp, &call, None);
@@ -526,7 +549,7 @@ impl Actor {
                 idempotency_key: idempotency_key(eid, rid, &reservation.action_digest),
             });
         let journaled =
-            record.is_some_and(|record| self.services.journal.append(&[record]).is_ok());
+            record.is_some_and(|record| self.services.journal.enqueue(&[record]).is_ok());
         if !journaled {
             // The reservation was just made, so it is releasable.
             let _ = self.engine.release_unforwarded(rid);
@@ -569,13 +592,14 @@ impl Actor {
         let upstream = Arc::clone(&self.services.upstream);
         let timeout = self.services.upstream_timeout;
         let pep_id = call.pep_id.clone();
+        let leg = Arc::clone(&call.leg);
         let worker = thread::Builder::new()
             .name("upstream".to_owned())
             .spawn(move || {
                 let Ok(request) = ready.recv() else {
                     return;
                 };
-                let body = upstream.call(&request, timeout);
+                let body = upstream.call_timed(&request, timeout, &leg);
                 // An actor that stopped has no one to tell.
                 let _ = events.event(HostEvent::Upstream { pep_id, body });
             });
@@ -710,13 +734,11 @@ impl Actor {
 
     /// Writes the outcome record of `call`.
     fn log_outcome(&self, call: &Call, ending: Ending) {
-        let pep_us = u64::try_from(call.decided.elapsed().as_micros()).unwrap_or(u64::MAX);
         self.services.log.outcome(
             self.eid(),
             &call.pep_id,
             call.jti.as_deref(),
             ending,
-            pep_us,
             unix_ms(),
         );
     }
@@ -738,7 +760,7 @@ impl Actor {
                     // Losing this record is safe: replay treats a reservation that was never
                     // forwarded as released (R1).
                     let eid = self.eid();
-                    drop(self.services.journal.append(&[Record::Outcome {
+                    drop(self.services.journal.enqueue(&[Record::Outcome {
                         eid,
                         rid,
                         result: OutcomeKind::Released,
@@ -1037,7 +1059,7 @@ impl Actor {
         drop(
             self.services
                 .journal
-                .append(&[Record::Outcome { eid, rid, result }]),
+                .enqueue(&[Record::Outcome { eid, rid, result }]),
         );
     }
 
@@ -1200,6 +1222,7 @@ mod tests {
         exited: Arc<Mutex<Option<Ledger>>>,
         actor: Option<JoinHandle<()>>,
         next: u128,
+        journal: JournalHandle,
     }
 
     impl Drop for Harness {
@@ -1293,7 +1316,7 @@ mod tests {
         let broker = Arc::new(broker);
         let services = Arc::new(Services {
             host,
-            journal: handle,
+            journal: handle.clone(),
             proof_key: Es256Signer::from_secret_bytes(&[7; 32]).unwrap(),
             entropy: Mutex::new(Box::new(io::repeat(0x5a))),
             upstream: wrap.map_or_else(
@@ -1324,6 +1347,7 @@ mod tests {
             exited,
             actor: Some(actor),
             next: 1,
+            journal: handle,
         }
     }
 
@@ -1342,6 +1366,7 @@ mod tests {
                     request: request.into_bytes(),
                     peer_uid: 0,
                     reply,
+                    leg: Arc::default(),
                 })
                 .unwrap();
             (pep_id, answer)
@@ -1394,10 +1419,12 @@ mod tests {
 
         /// The journal's records, read back from the file.
         fn records(&self) -> Vec<Record> {
+            // A commit of nothing waits for whatever is queued ahead of it.
+            drop(self.journal.commit(&[]));
             fs::read(self.dir.join("journal.jsonl"))
                 .unwrap()
                 .split(|&byte| byte == b'\n')
-                .filter(|line| !line.is_empty())
+                .filter(|line| !line.is_empty() && line.first() != Some(&0))
                 .map(|line| Record::parse(line).unwrap())
                 .collect()
         }
@@ -1793,7 +1820,8 @@ mod tests {
                 pep_id: encode_ulid(99),
                 request: Vec::new(),
                 peer_uid: 0,
-                reply
+                reply,
+                leg: Arc::default(),
             }),
             Err(ActorGone)
         );

@@ -4,10 +4,45 @@
 # compose/kit.py does that. Nothing here is in a release image (RV3 D2, RV4 #20): the capturing
 # broker, the injector and the socket probe are separate binaries in images of their own.
 services:
+  tool-a:                      # the kit's fixtures, and tool-a's misbehaviour (make-config.py)
+    volumes:
+      - { type: volume, source: tool-a-state, target: /var/lib/tool }
+      - { type: bind, source: ./config/kit/tool-a,   target: /etc/tool,     read_only: true }
+      - { type: bind, source: ./config/kit/lockfile, target: /etc/lockfile, read_only: true }
+      - { type: bind, source: "${PEP_SECRETS_DIR:?set PEP_SECRETS_DIR}/broker-credential-a.sha256", target: /run/credential.sha256, read_only: true }
+
+  tool-b:                      # drifts once the kit creates its flag file
+    volumes:
+      - { type: volume, source: tool-b-state, target: /var/lib/tool }
+      - { type: bind, source: ./config/kit/tool-b,   target: /etc/tool,     read_only: true }
+      - { type: bind, source: ./config/kit/lockfile, target: /etc/lockfile, read_only: true }
+      - { type: bind, source: "${PEP_SECRETS_DIR:?set PEP_SECRETS_DIR}/broker-credential-b.sha256", target: /run/credential.sha256, read_only: true }
+
   broker:                      # writes each Call Proof it receives, for the injector (G3)
     build: { context: ., target: broker-capture }
     image: pep-gate1/broker-capture:dev
     entrypoint: ["/usr/local/bin/stub-broker-capture", "/var/lib/broker/proofs.jsonl", "/etc/broker/config.json"]
+    volumes:
+      - { type: volume, source: broker-sock,  target: /run/broker,  volume: { nocopy: true } }
+      - { type: volume, source: pep-pub,      target: /run/pep-pub, read_only: true, volume: { nocopy: true } }
+      - { type: volume, source: broker-state, target: /var/lib/broker }
+      - { type: bind, source: ./config/kit/broker,   target: /etc/broker,   read_only: true }
+      - { type: bind, source: ./config/kit/lockfile, target: /etc/lockfile, read_only: true }
+      - { type: bind, source: "${PEP_SECRETS_DIR:?set PEP_SECRETS_DIR}/broker-credential-a", target: /run/credential-a, read_only: true }
+      - { type: bind, source: "${PEP_SECRETS_DIR:?set PEP_SECRETS_DIR}/broker-credential-b", target: /run/credential-b, read_only: true }
+
+  pep:                         # 12 episodes at 72 MiB, and 48 connections (compose.yaml's formulas)
+    mem_limit: 2g
+    pids_limit: 2048
+    volumes:
+      - { type: volume, source: pep-sock,    target: /run/pep,     volume: { nocopy: true } }
+      - { type: volume, source: pep-ctl,     target: /run/pep-ctl, volume: { nocopy: true } }
+      - { type: volume, source: pep-pub,     target: /run/pep-pub, volume: { nocopy: true } }
+      - { type: volume, source: broker-sock, target: /run/broker,  volume: { nocopy: true } }
+      - { type: volume, source: pep-state,   target: /var/lib/pep }
+      - { type: volume, source: pep-log,     target: /var/log/pep }
+      - { type: bind, source: ./config/kit/pep,      target: /etc/pep,      read_only: true }
+      - { type: bind, source: ./config/kit/lockfile, target: /etc/lockfile, read_only: true }
 
   probe:                       # C-UID and C-NET; `run --user` sets each uid:gid
     profiles: [gate1]
@@ -19,6 +54,7 @@ services:
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true", "seccomp=./seccomp-unix-only.json"]
     network_mode: "none"
+    tmpfs: ["/tmp:size=64m,mode=1777,nosuid,nodev,noexec"]   # as the agent's: C-OUT tries to share it
     volumes:
       - { type: volume, source: pep-sock, target: /run/pep, volume: { nocopy: true } }
 

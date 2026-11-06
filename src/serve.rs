@@ -17,6 +17,7 @@
 //! listener itself is broken: running out of file descriptors must not stop the PEP (RV5 V10,
 //! V11).
 
+use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::io::{self, Read};
 use std::net::Shutdown;
@@ -37,6 +38,7 @@ use crate::mcp::{self, AgentRequest, Inbound, Method, Reply};
 use crate::peercred::require_peer;
 use crate::registry::{Admission, Registry};
 use crate::tokens::TokenError;
+use crate::upstream::{LegTimer, residence_us};
 
 /// The agent socket's request target.
 pub const AGENT_ENDPOINT: &str = "/mcp";
@@ -339,6 +341,9 @@ fn deadlines(timeout: Duration) -> Deadlines {
     Deadlines { head: at, body: at }
 }
 
+/// A call's id and its upstream leg, for the residence record once the reply has gone (O1).
+type CallTiming = RefCell<Option<(String, Arc<LegTimer>)>>;
+
 /// How long in total, and how much, `finish` drains of what the client sent after its reply.
 const DRAIN_TIME: Duration = Duration::from_millis(50);
 const DRAIN_BYTES: usize = 64 * 1024;
@@ -417,6 +422,7 @@ fn serve_agent_tracked(
         }
     };
     // 2 to 13.
+    let timing = RefCell::new(None);
     let reply = match mcp::check(&request.head, &request.body) {
         Err(reply) => {
             context.log.decision(
@@ -432,12 +438,25 @@ fn serve_agent_tracked(
             reply.to_http()
         }
         Ok(Inbound::Ignored) => mcp::accepted().to_http(),
-        Ok(Inbound::Request(agent_request)) => {
-            route(&mut stream, peer.uid, &agent_request, context, track)
-        }
+        Ok(Inbound::Request(agent_request)) => route(
+            &mut stream,
+            peer.uid,
+            &agent_request,
+            context,
+            track,
+            &timing,
+        ),
     };
     finish_then(&mut stream, &reply, context.read_timeout, &|| {
         let _ = track(Progress::Answered);
+        // O1: only a call that went upstream has a residence, and step-up waits are in it, which
+        // the latency harness leaves out.
+        if let Some((pep_id, leg)) = timing.borrow().as_ref()
+            && let Some(leg) = leg.duration()
+        {
+            let pep_us = residence_us(request.first_byte, Some(leg));
+            context.log.residence(pep_id, pep_us, unix_ms());
+        }
     });
 }
 
@@ -460,6 +479,7 @@ fn route(
     request: &AgentRequest,
     context: &AgentContext,
     track: &dyn Fn(Progress) -> bool,
+    timing: &CallTiming,
 ) -> Vec<u8> {
     let id = &request.id;
     match request.method {
@@ -520,7 +540,7 @@ fn route(
                     .tools_list(|server| context.servers.state(server) == ServerState::Serving);
                 return mcp::result_reply(id, &mcp::tools_list_result(&tools)).to_http();
             }
-            call(stream, peer_uid, request, admitted.agent(), context).to_http()
+            call(stream, peer_uid, request, admitted.agent(), context, timing).to_http()
         }
     }
 }
@@ -533,17 +553,21 @@ fn call(
     request: &AgentRequest,
     agent: &crate::actor::AgentSender,
     context: &AgentContext,
+    timing: &CallTiming,
 ) -> Reply {
     let id = &request.id;
     let Ok(pep_id) = context.registry.call_id() else {
         return mcp::unavailable(id);
     };
     let (reply, answer) = mpsc::sync_channel(1);
+    let leg = Arc::new(LegTimer::default());
+    timing.replace(Some((pep_id.clone(), Arc::clone(&leg))));
     let message = AgentMessage::Call {
         pep_id: pep_id.clone(),
         request: request.engine_request(&pep_id),
         peer_uid,
         reply,
+        leg,
     };
     if agent.send(message).is_err() {
         // The episode's actor has stopped: the episode ended.

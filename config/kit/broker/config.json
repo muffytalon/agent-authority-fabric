@@ -1,0 +1,24 @@
+{
+  "clock_skew_ms": 2000,
+  "connections": 64,
+  "log": "/var/lib/broker/broker.jsonl",
+  "pep": {
+    "gid": 20002,
+    "uid": 20002
+  },
+  "pep_key": "/run/pep-pub/call-proof.pub",
+  "pins": "/etc/lockfile/pins.json",
+  "replay_cache_entries": 32768,
+  "routes": {
+    "a": {
+      "credential": "/run/credential-a",
+      "endpoint": "tcp:tool-a:8080"
+    },
+    "b": {
+      "credential": "/run/credential-b",
+      "endpoint": "tcp:tool-b:8080"
+    }
+  },
+  "socket": "/run/broker/broker.sock",
+  "upstream_timeout_ms": 3000
+}

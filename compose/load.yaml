@@ -1,0 +1,36 @@
+# G4's load (WEEK2_PLAN O1), over compose.yaml. Release images, with no capture: only the fixtures
+# and the limits differ, and `probe` is where the load generator runs. compose/latency.py applies it.
+services:
+  tool-a:
+    volumes:
+      - { type: volume, source: tool-a-state, target: /var/lib/tool }
+      - { type: bind, source: ./config/load/tool-a, target: /etc/tool,     read_only: true }
+      - { type: bind, source: ./config/lockfile,    target: /etc/lockfile, read_only: true }
+      - { type: bind, source: "${PEP_SECRETS_DIR:?set PEP_SECRETS_DIR}/broker-credential-a.sha256", target: /run/credential.sha256, read_only: true }
+
+  tool-b:
+    volumes:
+      - { type: volume, source: tool-b-state, target: /var/lib/tool }
+      - { type: bind, source: ./config/load/tool-b, target: /etc/tool,     read_only: true }
+      - { type: bind, source: ./config/lockfile,    target: /etc/lockfile, read_only: true }
+      - { type: bind, source: "${PEP_SECRETS_DIR:?set PEP_SECRETS_DIR}/broker-credential-b.sha256", target: /run/credential.sha256, read_only: true }
+
+  pep:                         # 48 episodes and 192 connections, by compose.yaml's formulas
+    pids_limit: 4096
+    mem_limit: 2g
+    cpus: ${PEP_LOAD_CPUS:-2}
+    ulimits: { nofile: { soft: 8192, hard: 8192 } }
+    volumes:
+      - { type: volume, source: pep-sock,    target: /run/pep,     volume: { nocopy: true } }
+      - { type: volume, source: pep-ctl,     target: /run/pep-ctl, volume: { nocopy: true } }
+      - { type: volume, source: pep-pub,     target: /run/pep-pub, volume: { nocopy: true } }
+      - { type: volume, source: broker-sock, target: /run/broker,  volume: { nocopy: true } }
+      - { type: volume, source: pep-state,   target: /var/lib/pep }
+      - { type: volume, source: pep-log,     target: /var/log/pep }
+      - { type: bind, source: ./config/load/pep, target: /etc/pep,      read_only: true }
+      - { type: bind, source: ./config/lockfile, target: /etc/lockfile, read_only: true }
+
+  probe:                       # built here only so the image exists; the harness parks it
+    profiles: [load]
+    build: { context: ., target: probe }
+    image: pep-gate1/probe:dev

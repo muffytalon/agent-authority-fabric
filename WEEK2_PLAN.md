@@ -1,6 +1,6 @@
 # WEEK2_PLAN.md: pep-sidecar Week 2 (Gate 1)
 
-Status: 2026-11-06. Steps 1–8 are done, and step 8's acceptance passed with the real credentials (§4, as built). Step 9's groundwork is built, and its first attacks hold (§4, Step 9 groundwork). RV4's and RV5's findings are folded in (Appendices C and D). All 18 decisions in §1 are CLOSED: D2 before step 2, the 13 others that block steps 3–7 in step 2, N1 and O1 on 2026-11-04, B1 on 2026-11-05 and S1 on 2026-11-06, each with its §6 SPEC wording applied. This plan supersedes two earlier drafts:
+Status: 2026-11-06. Steps 1–8 are done, and step 8's acceptance passed with the real credentials (§4, as built). Step 9's kit, latency harness and conformance run are built, and all 61 attacks hold (§4, Step 9, as built). G4's record, with 6 of 25 runs missing it, is for the owner to judge (O1). RV4's and RV5's findings are folded in (Appendices C and D). All 18 decisions in §1 are CLOSED: D2 before step 2, the 13 others that block steps 3–7 in step 2, N1 and O1 on 2026-11-04, B1 on 2026-11-05 and S1 on 2026-11-06, each with its §6 SPEC wording applied. This plan supersedes two earlier drafts:
 - **AP:** the attached Week 2 plan, "pep-sidecar Week 2 Plan: Toolchain, MCP Transport and Gate 1 Readiness", in the parent folder;
 - **MG:** the 29 Oct merge notes.
 
@@ -42,7 +42,7 @@ RV2's repo claims were re-checked on 2026-11-03, and its p256 build was reproduc
   - forwarding to a tool that drifted during a step-up wait (P1);
   - drift hidden by a poll that fails (L1).
 
-  It also showed that about half of the 62 "attacks" could never reveal a bypass. §3 now counts 54 genuine attacks, and RV4 adds six, for 60.
+  It also showed that about half of the 62 "attacks" could never reveal a bypass. §3 now counts 54 genuine attacks, RV4 adds six, and RV5 D4 adds one, for 61.
 - **The engine needs nine changes** (§2a; RV4 added the last two):
   - forwarded bytes are built by a new `forward` module, so the Episode Token never leaves the PEP;
   - `record_result_raw` accepts only `complete` results;
@@ -93,7 +93,7 @@ Gate 1 is evaluated on the release profile in the Compose topology (§4), not in
 
 | # | Criterion | Threshold |
 |---|---|---|
-| G1 | Containment attack tests passing, judged by the bypass oracle (§2a) | ≥ 50 attack tests per deployment profile in S1, run in Compose on this machine, with 0 bypasses. §3 lists 60. Its 79 conformance and robustness checks run in CI and must pass, but don't count |
+| G1 | Containment attack tests passing, judged by the bypass oracle (§2a) | ≥ 50 attack tests per deployment profile in S1, run in Compose on this machine, with 0 bypasses. §3 lists 61. Its 79 conformance and robustness checks run in CI and must pass, but don't count |
 | G2 | Rug-pull mutations quarantined | All of ≥ 20 (§3 lists 28), each quarantining the mutated server (or, for #26, suspending it) within the detection window T (L1), with no call forwarded to it after detection (re-checked just before each upstream write), and 0 false positives on the negatives |
 | G3 | Replays of captured Call Proofs, and misuses of captured Episode Tokens, rejected | 1,000 of 1,000 in Compose, split across §3's classes, restart replays included. A live Episode Token reused by its own peer is by design, not a replay. Clock steps are tested in-process (step 6) and reported beside G3 |
 | G4 | p99 added latency of the PEP plus the broker, as defined in O1 | ≤ 25 ms, with the PEP-only p99 reported beside it. Release build, in Compose on this machine, with the CPU model recorded |
@@ -507,6 +507,8 @@ RV2 had T1, L1 and Q1 closing after step 2. RV2's own reordering (§2) moves the
   - **Taint and ratchet records.** A journal-backed `LabelStore` takes one call's F-08 entries as a single record (`record_all`). The intent's F-09 ratchet level is journaled whenever it rises (RV3 A3). The taint record is durable before the call is forwarded. A ratchet rise is durable before any reply that depends on it is written: a denial's rise (F-09) before the denial, and a rise in `record_result_raw` before the result bytes reach the agent. That second rise happens after forwarding, so "before the call is forwarded" did not cover it; a crash in between left the agent holding Secret data and restored the lower level (RV4 #4). An intent rises at most three times, so this costs nothing.
   - **Quarantine records (RV4 #5).** `quarantine` {server_id, lockfile_digest} is appended and fsynced when a server is quarantined (not when it is only suspended, L1). At boot, a server quarantined under the loaded lockfile's digest stays quarantined. Only a lockfile with a different digest lifts it; re-signing an identical payload gives an identical digest, so it does not.
   - **One fsync per call, with group commit (RV3 A9).** A call's records go in one append and one fsync. The shared writer batches appends that arrive together, so one agent write, with its tens of taint entries, cannot stall every episode's payments. G4's load mix includes writes (O1).
+  - **As built (2026-11-06, for G4).** A payment's `reserve` record and its outcome are queued in order and nobody waits for them, because no action depends on either alone: the `forwarded` commit carries the `reserve` to disk before the call goes out, and a lost outcome returns the reservation as `NeedsReconcile`, which fails closed. So a payment waits for one fsync, that commit. A write that fails while nobody waits stops the next commit, so a queued record is never lost quietly.
+  - **Preallocated (2026-11-06).** The file grows in zero-filled megabytes, synced as they are made, and each record is written in place and synced with `sync_data`. An fsync that also has to commit a new size cost 3.1 ms here, against 1.2 ms in place. The log ends at the first NUL, and whatever follows the last newline before it is a torn tail, as it was at the end of a growing file.
   - **Capacity.** The label store's capacity is checked before an append. A write that would exceed it is denied (fail closed), so replay can never overflow the store.
   - **Fail closed:** if an append or fsync fails, a payment gets `abort(DefinitelyNotExecuted)`, a write is denied, and the agent gets `PEP_UNAVAILABLE`. `outcome` records need no fsync: losing one only replays its reservation as unresolved, which fails closed.
   - **Replay at boot:**
@@ -749,7 +751,14 @@ The unsigned lockfile v1 payload is also the config's `pins` section from step 7
   - `pep`'s `ulimits`, `mem_limit` and `pids_limit` rise with that config, as `compose/check.py`'s formulas say.
   - The head-of-line case stops at about 63 results of 1 MiB, at `MAX_EPISODE_RESULT_BYTES` (RV5 V9), so it is sized below that.
 - **Head-of-line case (A1):** one episode recording 1 MiB results while others make small calls, reported separately.
-- **What the logs hold today (2026-11-06).** The tool log has `tool_us`, so the agent-side gate can subtract the tool's own time. `pep_us` runs from the decision to the end of the leg, and `broker_us` from arrival to the log line, so neither is yet the residence formula above, which subtracts the upstream leg. The latency harness adds that.
+- **As built (2026-11-06).** `pep_us` and `broker_us` are now the formula above. `http::Request` keeps the instant of the first byte read, and `upstream::LegTimer` marks the first byte written upstream and the last byte read back, so a residence is the whole time less that leg. The PEP's has its own log record, written after the reply's last byte, and the broker's is on its `forwarded` line; a leg that never ended has `broker_us: null`, so a timeout never counts as residence. `tool_us` runs from the handler's start, lock wait included, to just before the tool writes its log line, so that write, in a stub, counts against the gate.
+- **The harness (`compose/latency.py`, `compose/load.yaml`, `stub-load`, config in `config/load`).** 44 episodes and 4 spare, one live per intent, each sending a call every 250 ms: 176 calls a second in all, under the limit of 5 an episode. Each of `PEP_LOAD_RUNS` runs (5) starts from empty volumes, because one run misled: three of the first were 21,855, 138 and 43 ms on the same tree that later gave 10 ms. Threads beside the load, in no PEP code, record how late a 1 ms sleep wakes, how long a `sync_data` of a rewritten file takes and how long an append takes, each with its time, and the report lays them against every stretch over 25 ms.
+- **Results (2026-11-06), `reports/Gate1 latency report.md`.** On 10,016 measured calls a run:
+  - the last 13 runs all met G4, at p99 10.2 to 18.0 ms, with a median run of 10.8 ms, and every call succeeded. PEP plus broker residence in the median run: p50 5.38, p99 8.37. Payments at the gate: p50 8.05, p99 11.78.
+  - **Of all 25 runs on this journal, 19 met it and 6 did not** (p99 21,855.71, 552.06, 138.48, 68.58, 55.76 and 42.88 ms), and two of those had failed calls, 400 and 66. Each was one stretch of a run, up to about 5 s; medians did not move. The failures in the 66 fell inside the stretch and failed closed: 45 payments arrived before their delayed lookup was recorded (`ProvenanceMissing`), and 21 reads got `PEP_UNAVAILABLE`.
+  - **The cause of those six is not proven.** The time was mostly outside both residences and `tool_us`, in the gap where the stub tool writes its log line on the journal's disk. The worst sleep delay in the 552 ms run was 69 ms, so the CPU alone does not explain it. The disk probes arrived later, and no large stall has happened with them on. Smaller stalls of 30 to 100 ms remain, a few per run: some line up with a slow `sync_data` and others with nothing. They touch p99.9, not p99.
+  - **Whether G4 is met is the owner's call on that record:** it holds on a quiet machine, and 6 of 25 runs on this shared WSL2 VM say it does not always.
+  - Measured apart: 1 MiB requests p50 110, max 233; small calls beside an episode reading 900 KiB results p50 6.68, max 24.44.
 - **Crypto cost:** on this machine (AMD Ryzen 3 5300U, release, Rust 1.97.1, 2026-11-03), ES256 takes about 0.57 ms to sign and 0.56 ms to verify (mean). So each payment spends about 1.1 ms on crypto across the PEP and the broker.
 - **Exclusions:** step-up calls are excluded, since they wait for a human. 1 MiB requests are measured separately, because hashing cost grows with bytes × depth.
 - **Method (AP):** 10,000 calls after 500 warm-up calls. Report p50, p99, p99.9 and max.
@@ -806,7 +815,7 @@ The unsigned lockfile v1 payload is also the config's `pins` section from step 7
   | 9 | A missing standard header | 400, -32020 |
   | 10 | A missing `_meta` field, or `clientCapabilities` not an object | 400, -32602 |
   | 11 | A header that differs from the body or `_meta` (`Pep-Episode` included), or any `Mcp-Param-*` header | 400, -32020 |
-  | 12 | A present but unsupported version | 400, -32022 |
+  | 12 | A present but unsupported version | 400, -32022, with `data` of `requested` and `supported`: the one error with `data`, which MCP requires of it (found by the conformance suite, 2026-11-06) |
   | 13 | An unknown method | 404, -32601 |
   | 14 | A missing, invalid, expired, idle or ended Episode Token, on a method that needs one (M1) | 200, `PEP_DENIED` |
   | 15 | The episode's rate limit | 200, `PEP_UNAVAILABLE` |
@@ -1023,7 +1032,7 @@ The order follows RV2: p256, peer identity and the lock file come before the bin
 | `journal` | `path`, `lock` (R1) |
 | `log` | `path` (on `pep-log`), `max_bytes` (RV3 B4) |
 | `intents` | name → `PepIntent` plus its `SeqPolicy`; the Week 2 stand-in for RAR. The name is the ledger key (R1, RV4 #5), and an invoice intent must set `per_entity_max_uses: 1` (RV4 #1) |
-| `limits` | `connections`, `control_connections` (H1), `header_bytes`, `body_bytes`, `read_timeout_ms`, `upstream_timeout_ms` (10,000), `step_up_timeout_ms` (45,000; the two together ≤ 55,000, checked at load, P1), `episode_idle_ms`, `episodes`, `call_burst`, `call_rate_per_s`, `clock_skew_ms`, `replay_cache_entries`, `drift_poll_ms`, `drift_poll_deadline_ms` (L1) |
+| `limits` | `connections`, `control_connections` (H1), `header_bytes`, `body_bytes`, `read_timeout_ms`, `upstream_timeout_ms` (10,000), `step_up_timeout_ms` (45,000; the two together ≤ 55,000, checked at load, P1), `episode_idle_ms`, `episode_lifetime_ms` (8 h, the token's ceiling, and from 1 s; added in step 9 so `exp` can be tested in Compose), `episodes`, `call_burst`, `call_rate_per_s`, `clock_skew_ms`, `replay_cache_entries`, `drift_poll_ms`, `drift_poll_deadline_ms` (L1) |
 | `pins` | The unsigned lockfile v1 payload (L1). Step 10 replaces it with the signed lockfile at `lockfile.path` |
 
 **Config and lockfile payload as built (step 7).** L1 fixed what the payload holds; this is its shape (`src/lockfile.rs`, `src/config.rs`).
@@ -1042,7 +1051,7 @@ The order follows RV2: p256, peer identity and the lock file come before the bin
   - Load runs the engine's checks: `validate_pins` on the pins alone, and `validate_config` per intent.
 - **Limits:** the P1 and L1 defaults apply when a field is absent. `header_bytes` and `body_bytes` may not exceed the HTTP subset's caps, and apply to the agent socket. A drift poll's deadline must be below its interval. Boot refuses limits beyond `RLIMIT_NOFILE`: `4 × connections + 2 × control_connections + 64 × episodes + 128` (RV5 V8, V10b).
 - **Intent limits:** `max_declines` is required, from 1 to `max_calls` (RV5 D6). An invoice id may appear in several intents, under one spelling only: ids that differ only by case are a load error.
-- **Lockfile lint:** no sink, payment or destination is cleared for `secret`, and a read tool with `data` arguments is only if it reads a pinned store (RV5 D4).
+- **Lockfile lint:** no sink, payment or destination is cleared for `secret`, and a read tool with `data` arguments is only if it reads a pinned store (RV5 D4). As built, `check_secret_stays_home` adds the case that rule alone leaves open: every tool that outputs `secret` must share a server with any tool cleared for `secret` with `data` arguments, or a secret could leave through another server's cleared read.
 - **Step 10** still adds the strict argument schema and per-tool `step_up_over_minor`.
 
 **Journal as built (step 7, `src/journal.rs`).**
@@ -1125,7 +1134,8 @@ The order follows RV2: p256, peer identity and the lock file come before the bin
   - a credential checked against a SHA-256 verifier in constant time;
   - payments deduped on `Idempotency-Key` in a fsynced store, with `executed`, `declined` or `pending` from its invoice table;
   - an execution log.
-  The misbehaviour modes come with steps 9 and 10.
+  - misbehaviour, on one entity or store key (`misbehave`, as built in step 9): `wrong_id`, `two_responses`, `oversized`, `slow_drip`, `input_required`, `forged_outcome` and `delay_ms:N`. So one test's fault never reaches the next test's call.
+  - drift, behind a flag file (`drift`): `description`, `last_page` or `x_mcp_header`, for the rug-pull mutations. The timer that polls for it is step 10; the e2e test polls once by hand.
 - **`stub-operator`:** one control request per run; the reply body goes to stdout.
 - **The decision log** (`decision_log.rs`, at `log.path`, rotated to `.1` at `log.max_bytes`):
   - a decision for every `tools/call` (`allow`, `deny`, `step_up`, `unavailable`) and for the transport's refusals (`protocol_error`, refused tokens, the rate limit);
@@ -1188,9 +1198,10 @@ The order follows RV2: p256, peer identity and the lock file come before the bin
 | Log | Fields |
 |---|---|
 | PEP decision (written before any upstream write) | `ts_ms`, `eid`, `seq`, `peer_uid`, `method`, `tool`, `action_digest`, `verdict` (`allow`, `deny`, `step_up`, `unavailable` or `protocol_error`), `reason` (the guard or error variant; host-side only, never sent to the agent), `rid`, `amount_minor`, `currency`, `entity`, `jti`, `idempotency_key`, `upstream_id` |
-| PEP outcome (after the upstream leg) | `ts_ms`, `boot_ms`, `eid`, `upstream_id`, `jti`, `outcome` (`executed`, `refused`, `declined`, `unknown`, `released`, `abandoned` or `not_forwarded`), `pep_us` |
-| Broker | `ts_ms`, `jti`, `server_id`, `method`, `upstream_id`, `action_digest` (recomputed), `idempotency_key`, `entity_key`, `verdict` (`forwarding`, written before the upstream write, then `forwarded` or `rejected`), `reason`, `outcome`, `broker_us` |
-| Tool server | `ts_ms`, `server_id`, `upstream_id`, `tool`, `action_digest` (recomputed with the shared `jcs`), `idempotency_key`, `entity_key`, `executed` (`false` for a dedupe hit), `tool_us` |
+| PEP outcome (after the upstream leg) | `ts_ms`, `boot_ms`, `eid`, `upstream_id`, `jti`, `outcome` (`executed`, `refused`, `declined`, `unknown`, `released`, `abandoned` or `not_forwarded`) |
+| PEP residence (after the reply reached the agent) | `ts_ms`, `upstream_id`, `pep_us`. Its own record, because O1's second term ends at the last byte written to the agent, after the outcome is settled and logged |
+| Broker | `ts_ms`, `jti`, `server_id`, `method`, `upstream_id`, `action_digest` (recomputed), `idempotency_key`, `entity_key`, `verdict` (`forwarding`, written before the upstream write, then `forwarded` or `rejected`), `reason`, `outcome`, `broker_us` (O1's residence; `null` on `forwarding` lines and when a forwarded leg never ended, because a timeout would otherwise count as residence) |
+| Tool server | `ts_ms`, `server_id`, `upstream_id`, `tool`, `key` (the entity or store key a fault was aimed at), `action_digest` (recomputed with the shared `jcs`), `idempotency_key`, `entity_key`, `executed` (`false` for a dedupe hit), `tool_us` |
 
 No log ever holds raw tokens, proofs, keys, credentials, or argument values other than the bound entity, amount and currency.
 
@@ -1211,7 +1222,7 @@ No log ever holds raw tokens, proofs, keys, credentials, or argument values othe
   - for attacks that execute nothing (C-NET, C-PROC, C-LOCK, C-CRED, C-CTL), the attempt succeeding.
 
 ## 3. Gate 1 suite
-### Containment (60 attack tests count toward G1; 79 checks run in CI)
+### Containment (61 attack tests count toward G1; 79 checks run in CI)
 Only the attack column counts toward G1's ≥ 50, and only when run in Compose on this machine (RV2).
 - **Attacks** are bypass attempts whose success the oracle, or the attempt itself, would show: a call that executes but should not, money moving outside the intent, data reaching a sink it should not, or a containment boundary crossed.
   - The C-UID probes run from the `probe` service with group 20001, so each one passes the socket's 0660 mode and reaches `accept()`.
@@ -1236,9 +1247,11 @@ Only the attack column counts toward G1's ≥ 50, and only when run in Compose o
 | C-CRED | 2:<br>• the agent and the PEP cannot read any tool server's credential;<br>• a rug-pulled tool-b that captured its own credential cannot reach tool-a's network, and tool-a rejects that credential (RV4 #7) | 1:<br>• each tool server rejects calls without its own credential (from a probe on its network) |
 | C-CTL | 1:<br>• the agent cannot reach `/run/pep-ctl` | 6:<br>• an approval with any of (eid, rid, `action_digest`, amount) mismatched is refused;<br>• a declined step-up leaves the reservation `Released`, and the agent gets `PEP_DENIED`;<br>• an approval that arrives after the agent disconnected is refused;<br>• after `end_episode`, later calls are denied and in-flight legs finish;<br>• `start_episode` is refused while the intent has a live episode (E1, RV3 A2);<br>• `end_episode` lands promptly while the agent saturates its socket (H1, RV3 A11) |
 | C-OUT | 9:<br>• an agent disconnect after the point of forwarding never releases the reservation;<br>• a `notifications/cancelled` naming a forwarded payment's id never releases the reservation;<br>• a retry after `Unknown` with a changed `/memo` (a new `action_digest`) → `PaymentPending`;<br>• a PEP restart mid-payment: the next episode of that intent starts with the reservation `NeedsReconcile` (R1 (a));<br>• with entity X unresolved, after a restart or after `end_episode` and `start_episode`, a payment to Y and then a retry of X → `PaymentPending` (R1 (a), RV3 A1);<br>• an agent write before a PEP restart is still tainted after it (R1 (a));<br>• read Secret data, end the episode, start the intent's next one, send to a Public sink → denied (R1 (a), RV3 A3);<br>• a burst over the per-episode bucket is refused and issues no Call Proof;<br>• read Secret data in one intent's episode, then try to send it to a Public sink from another intent's episode: the second runs in a fresh container, which holds neither the data nor a helper (RV4 #3) | 2:<br>• denials from every guard have identical wire bytes apart from the id;<br>• a disconnect before the point of forwarding, and a half-close, each release the reservation through `release_unforwarded`, which refuses a `Forwarded` one (RV4 #17) |
-| C-ENG | 18, end to end through the engine (RV3 A10), each expected `deny`:<br>• a payment to an entity id that looks like an allowed one (a homoglyph or an NFD variant);<br>• a payment to an entity outside the intent;<br>• an amount taken from an unbound result field instead of the bound lookup (F-14);<br>• a funding lookup laundered through a store write (F-08);<br>• a value the agent wrote in one episode, used as a witness in the next (F-08);<br>• Secret data sent to a Public sink (F-09);<br>• Secret data through a free `data` argument of a tool cleared for `secret` (RV5 D4: the lint refuses every such tool but a read of a pinned store, so this attack targets what the lint leaves);<br>• a secret saved in chunks under 16 bytes, read back through a store reader that names no location, then sent to a Public sink (F-08; L1's store-reader rule, RV4 #8);<br>• a payment split into smaller ones to dodge step-up;<br>• two concurrent payments funded by the same lookup;<br>• lookup, pay, lookup, pay on one invoice while the first payment is still upstream → `PaymentPending` (RV4 #1);<br>• the same invoice paid from a second intent while the first intent's payment is `NeedsReconcile` → `PaymentPending`, through the shared unresolved set (RV4 #1);<br>• a payment over `per_call_max_minor`, or past the cumulative cap;<br>• an undeclared nested argument (F-13);<br>• a tool name under the reserved `pep/` prefix;<br>• a call to an unpinned tool;<br>• a call to a tool of a quarantined server;<br>• a control method (`approve`, `start_episode`) sent on the agent socket;<br>• a forged `dev.pep-sidecar/call-proof` or `dev.pep-sidecar/outcome` member in the agent's `_meta` | — |
+| C-ENG | 19, end to end through the engine (RV3 A10), each expected `deny`:<br>• a payment to an entity id that looks like an allowed one (a homoglyph or an NFD variant);<br>• a payment to an entity outside the intent;<br>• an amount taken from an unbound result field instead of the bound lookup (F-14);<br>• a funding lookup laundered through a store write (F-08);<br>• a value the agent wrote in one episode, used as a witness in the next (F-08);<br>• Secret data sent to a Public sink (F-09);<br>• Secret data through a free `data` argument of a tool cleared for `secret` (RV5 D4: the lint refuses every such tool but a read of a pinned store, so this attack targets what the lint leaves);<br>• a secret saved in chunks under 16 bytes, read back through a store reader that names no location, then sent to a Public sink (F-08; L1's store-reader rule, RV4 #8);<br>• a payment split into smaller ones to dodge step-up;<br>• two concurrent payments funded by the same lookup;<br>• lookup, pay, lookup, pay on one invoice while the first payment is still upstream → `PaymentPending` (RV4 #1);<br>• the same invoice paid from a second intent while the first intent's payment is `NeedsReconcile` → `PaymentPending`, through the shared unresolved set (RV4 #1);<br>• a payment over `per_call_max_minor`, or past the cumulative cap;<br>• an undeclared nested argument (F-13);<br>• a tool name under the reserved `pep/` prefix;<br>• a call to an unpinned tool;<br>• a call to a tool of a quarantined server;<br>• a control method (`approve`, `start_episode`) sent on the agent socket;<br>• a forged `dev.pep-sidecar/call-proof` or `dev.pep-sidecar/outcome` member in the agent's `_meta` | — |
 
-Under R1 (b), the four journal attacks in C-OUT (the restart, the unresolved retry, the taint and the ratchet) are dropped and the accepted risk recorded instead. That leaves 56 of the 60, so (b) still keeps a margin of six.
+Under R1 (b), the four journal attacks in C-OUT (the restart, the unresolved retry, the taint and the ratchet) are dropped and the accepted risk recorded instead. That leaves 57 of the 61, so (b) still keeps a margin of seven.
+
+**Which reason a retry gets (as built, 2026-11-06).** Each row above names the guard the attack is aimed at, but an invoice intent has `per_entity_max_uses` of 1, and G_entity runs before G_budget. So a retry inside one intent is refused with `EntityUsesExceeded`, and `PaymentPending` is what a second intent gets. The kit accepts either for a same-intent retry, and requires `PaymentPending` for the cross-intent attack.
 
 ### Rug-pull mutations (G2: every one quarantined within T)
 Each mutation must quarantine the mutated server within T (L1). #26, a failed poll, suspends it instead, with the same observable (RV4 #9). The quarantine unit is the whole server (RV3 B2), so the observable is the same for every mutation:
@@ -1524,11 +1537,23 @@ networks:
 - **`net-probe`** (`compose/probe/net-probe.c`). Tries every family and three types through `syscall`, `int 0x80`, `socketcall` and the x32 ABI, each in its own child, because the profile kills a foreign ABI. It is C, in a test image, because raw syscalls cannot be written under `unsafe_code = "forbid"`.
 - **The kit** (`compose/kit.py`, on `check.py`'s helpers, run by CI's `compose` job). Each test declares what it expects before it runs, and holds only if its attempt failed as it should and the oracle found nothing.
 - **Controls first.** A real read must join, so the oracle is reading the right files. The stolen token must work from the rightful uid and gid. The sweep must make sockets under Docker's default profile, and its judge must flag that run.
-- **Attacks so far:** C-UID's 4, each with a stolen live token and a check that it reached `accept()`; C-NET's socket sweep; G3's verbatim class, with `call proof replayed` as the broker's own reason, so the replay cache is known to be what refused it. That is 5 of §3's 60.
+- **Attacks at the groundwork:** C-UID's 4, each with a stolen live token and a check that it reached `accept()`; C-NET's socket sweep; G3's verbatim class, with `call proof replayed` as the broker's own reason, so the replay cache is known to be what refused it.
 - **Confirmed here:** under Docker's default profile, `int 0x80`, `socketcall` and x32 each create an `AF_INET` socket with `network_mode: none` (RV4 #6). Under `seccomp-unix-only.json` all three die with SIGSYS, in every family.
 - **Proven able to fail.** A copy of the tree with `require_peer` and the replay cache disabled failed C-UID's 4 and G3's class, and the oracle flagged each execution on its own. With only `require_peer` gone, the wrong-uid probes were still denied, by the token's `peer_uid`; only the wrong-gid probe executed.
 - **A stale binary found that way.** The Dockerfile keeps `target/` in a cache mount, and `COPY` preserves mtimes, so cargo took a real source older than the altered copy as already built, and shipped the altered PEP in images built from the real tree. `check.py` passed all 138 checks on it, and only the kit caught it. The build stage now touches the sources first. CI builds without that cache, so it was never exposed.
-- **Left for step 9:** the other 55 attacks; G3's other classes and its 1,000 attempts; the latency harness, its load config and O1's residence timers; the tool servers' misbehaviour modes, which C-RES and the broker-timeout row need; the MCP conformance suite, if it can run.
+
+**Step 9, as built (2026-11-06).** Run on the final tree on this machine, with every command of the loop.
+- **G1.** All 61 attacks of §3 ran in `compose/kit.py`, 85 tests in all with the controls, and all held, with no bypass. The kit takes about 14 minutes. A test names the guard reason it expects, so a call refused for the wrong reason fails. The ratchet persists per intent, so each secret attack has its own intent.
+- **Not yet proven able to fail.** Five of the 61 have been: C-UID's 4 against a sabotaged PEP, and C-NET's sweep through its control. G3's verbatim class was sabotaged too. The other 56 attacks have passed but have not been shown to catch a broken guard. A sabotage run over C-ENG and C-OUT is the next check worth having.
+- **G3.** 0 of 1,012 attempts accepted, across 22 classes, 46 attempts a class.
+- **G4.** See O1's results, including the 6 of 25 runs that missed.
+- **Tool misbehaviour** (§2a's stub) is built, and `a_misbehaving_tool_cannot_settle_a_payment` and C-RES use it. The drift timer stays in step 10.
+- **MCP conformance suite: it runs** (`compose/conformance.py`, in CI's `compose` job, pinned by `package-lock.json`). Of the 178 checks in the 50 server scenarios 2026-07-28 requires, 96 pass, 72 fail, 5 warn, and 5 are skipped or informational. The 77 that fail or warn are listed in `compose/conformance/expected-failures.txt`, by reason: prompts, resources and completion, which the PEP does not serve; the suite's own fixture tools, which no lockfile pins; the Tasks extension; a server that asks the client for input; `x-mcp-header` tools (Week 2 refuses them); the deliberate 403 on any `Origin`; and a SHOULD on `serverInfo`.
+  - **It found one real defect:** -32022 had no `data`, and MCP requires `supported` and `requested`. Fixed (U1 row 12). C-MCP had checked only the code.
+  - **The baseline is by check, not by scenario,** which departs from the suite's own format. `server-stateless` has 4 fixture failures among 30 checks, and listing it whole would have hidden that defect. The run also fails if a listed check starts to pass.
+  - **The bridge spaces out calls.** Unspaced, the suite hit the episode's rate limit and tested only that.
+  - **A -32020 where -32601 would be more exact:** a method the PEP does not route gets -32020 if it carries `Mcp-Name`, because step 11 runs before the router. Either way it is refused, and nothing changes in the suite, so it stays.
+- **Still open from §3:** the 79 checks are not all in CI yet. Steps 10 and 11 are next.
 
 ## 5. Forward constraints (decided now so Week 2 does not paint later weeks into a corner)
 - **Week 3:**
@@ -1645,7 +1670,7 @@ networks:
   - **Cut list (RV3 D6),** in the order to apply it if the schedule slips, least Gate 1 impact first:
     1. the MCP conformance suite in CI (step 9) becomes optional;
     2. J1 moves to Week 4: the agent-facing result bytes keep RFC 8785 rounding, and J1 (b) lands before Gate 2. Drift hashing keeps exact digits even then, through the definition profile, so #23 stays detected (RV4 #19, #13);
-    3. if the journal's fixes (RV3 A1, A9, B5) cannot close in time, Gate 1 runs under R1 (b). Its four journal attacks are dropped and the risk is recorded. That leaves 56 attacks, so this cut uses four of G1's ten-attack margin.
+    3. if the journal's fixes (RV3 A1, A9, B5) cannot close in time, Gate 1 runs under R1 (b). Its four journal attacks are dropped and the risk is recorded. That leaves 57 attacks, so this cut uses four of G1's eleven-attack margin.
   - Week 3's SQLite store replaces the journal, so the journal is deliberately minimal.
 - **User namespaces.** Under userns-remap or rootless Docker, uids are translated, so `require_peer` must compare uids as the PEP's user namespace sees them. The cross-namespace test showed this: a peer with uid 1000 appeared as uid 0 to a listener in a user namespace that maps 1000 to 0 (Appendix A). Test on the actual runtime (AP's Q2).
 - **HTTP smuggling.** Only the strict parser stands between the agent and request smuggling. With one hop and F-16 forwarding only the PEP's own parse, a parser bug is a robustness failure rather than a bypass (RV3 A10), but it still blocks Gate 1, because the C-HTTP checks must pass.
@@ -1654,7 +1679,7 @@ networks:
   - Under R1 (a), a restart keeps budgets, taint and the ratchet, but voids every token, so the operator must start episodes again, each in a fresh agent container (E1).
   - Under R1 (b), a restart refunds every budget, forgets every `NeedsReconcile` and in-flight payment, forgets agent-write taint, and resets the confidentiality ratchet. That is an accepted Gate 1 risk, in those words.
 - **Step-up timeouts.** Approvals that take longer than 45 s fail in Week 2, because the step-up wait plus the upstream call must stay under the TypeScript SDK's 60 s (P1).
-- **Journal throughput.** One fsync per call, with group commit, puts disk latency on the payment and write path. G4 measures it (O1); if it breaks 25 ms, the fallback is `sync_data` (fdatasync) on a preallocated journal file, or a faster disk, never skipping the fsync. A larger group-commit window would raise each commit's latency instead (RV4 #15).
+- **Journal throughput.** One fsync per call, with group commit, puts disk latency on the payment and write path. G4 measures it (O1). The fallback named here is now built: `sync_data` on a preallocated journal file (R1), which took the wait from 3.1 to 1.2 ms, with the `reserve` and outcome records queued, so a payment waits for one commit. A faster disk is what remains, never skipping the fsync. A larger group-commit window would raise each commit's latency instead (RV4 #15). The disk under a WSL2 VM can still stall: see O1's results.
 - **Result fidelity.** JavaScript agents round big integers themselves, whatever J1 decides, and NFD strings cannot round-trip through the PEP (F-05).
 - **The seccomp profile.** Blocking non-`AF_UNIX` sockets may break an SDK, or a library in the PEP's image, that opens an inet socket at start-up. The profile returns `EAFNOSUPPORT`, so such failures are visible.
 - **Kernel drift.** CI's runner kernel (7.0, azure) is newer than this machine's (6.18.54) (Q1). Tests branch on version and record `uname -r`. `ubuntu-latest` moves to Ubuntu 26.04 in November 2026 [99]. CI pins `ubuntu-24.04`, so a kernel change there is a deliberate edit.
@@ -1917,8 +1942,9 @@ The stand-in, the clients and their pinned SDKs are in `spikes/d2-transport/`, a
 | Item | Why it is open | Settled at |
 |---|---|---|
 | Engines copying an image directory's owner and mode into an empty volume (RV, from moby [84][85]); `*-state` volumes taking the image's owner | Settled 2026-11-05 on Docker 29.9.2: the state volumes take the image directory's owner and mode, and the `nocopy` tmpfs volumes keep their `driver_opts` (§4, as built) | Step 8 (done) |
-| Whether the MCP conformance suite can run against the PEP | It takes an HTTP URL, its scenarios may need fixture tools, and the bridge must attach an Episode Token to `tools/list` and `tools/call` (RV3 D5) | Step 9 |
 | Source [65] | No reachable mirror; the plan does not rely on it | — |
+
+Settled in step 9 (2026-11-06) and removed from this table: whether the MCP conformance suite can run against the PEP. It can, through the bridge, and most scenarios do need fixture tools, so 77 of its 178 checks are listed with reasons (step 9, as built).
 
 Settled in step 3 (2026-11-03) and removed from this table: `cargo deny` on the real tree with p256. The tree adds the probe's 23 crates exactly; with BSD-3-Clause allowed it passes with no warnings, and before that only `subtle` is rejected (`reports/Week2 crypto crate check.md`).
 

@@ -48,9 +48,9 @@ use crate::tokens::{
     CallProofExpectations, Es256Verifier, ExpectedPayment, ReplayCache, TokenError, unix_now,
     verify_call_proof,
 };
-use crate::upstream::{Endpoint, Post, post};
+use crate::upstream::{Endpoint, LegTimer, Post, post, residence_us};
 
-use super::{answer, now_ms};
+use super::{answer_finally, now_ms};
 
 /// The prefix of every reserved `_meta` member.
 const RESERVED: &str = "dev.pep-sidecar/";
@@ -207,7 +207,7 @@ pub struct Broker {
 }
 
 /// How far a request got, for the log.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Phase {
     /// Verified, and about to be written upstream.
     Forwarding,
@@ -228,6 +228,7 @@ impl Phase {
 }
 
 /// What one request came to, for the log.
+#[derive(Debug)]
 struct Verdict {
     jti: Option<String>,
     action_digest: Option<String>,
@@ -236,21 +237,27 @@ struct Verdict {
     phase: Phase,
     reason: &'static str,
     outcome: Option<&'static str>,
+    /// The upstream leg, which O1's residence leaves out.
+    leg: Option<Duration>,
 }
 
 /// When a request arrived: the times its checks and its log lines use.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 struct When {
     now: u64,
     now_ms: u64,
     started: Instant,
 }
 
-impl When {
-    /// Microseconds since the request arrived, for the log (O1). Saturating: only a measurement.
-    fn broker_us(self) -> u64 {
-        u64::try_from(self.started.elapsed().as_micros()).unwrap_or(u64::MAX)
-    }
+/// A request's last log line, written once its reply has gone, because O1's residence runs to
+/// the last byte written.
+#[derive(Debug)]
+pub struct Closing {
+    server_id: String,
+    method: String,
+    upstream_id: String,
+    verdict: Verdict,
+    when: When,
 }
 
 /// One call's share of its route; given back on drop.
@@ -296,11 +303,22 @@ pub fn serve(
                 return;
             }
             let routes = |target: &str| broker.routes(target);
-            answer(&mut stream, &routes, READ_TIMEOUT, |request| {
-                observe(request);
-                let now = unix_now().unwrap_or(0);
-                broker.handle(request, now, now_ms())
-            });
+            answer_finally(
+                &mut stream,
+                &routes,
+                READ_TIMEOUT,
+                |request| {
+                    observe(request);
+                    let now = unix_now().unwrap_or(0);
+                    let (reply, closing) = broker.handle(request, now, now_ms());
+                    (reply, None, closing)
+                },
+                |closing| {
+                    if let Some(closing) = closing {
+                        broker.close(&closing);
+                    }
+                },
+            );
         },
         refuse_overflow,
     );
@@ -374,13 +392,14 @@ impl Broker {
             .is_some_and(|server_id| self.config.routes.contains_key(server_id))
     }
 
-    /// Answers one request from the PEP: the HTTP response bytes.
+    /// Answers one request from the PEP: the HTTP response bytes, and what [`Broker::close`]
+    /// needs once they have gone.
     #[must_use]
-    pub fn handle(&self, request: &Request, now: u64, now_ms: u64) -> Vec<u8> {
+    pub fn handle(&self, request: &Request, now: u64, now_ms: u64) -> (Vec<u8>, Option<Closing>) {
         let when = When {
             now,
             now_ms,
-            started: Instant::now(),
+            started: request.first_byte,
         };
         let Some((server_id, route)) = request
             .head
@@ -388,22 +407,22 @@ impl Broker {
             .strip_prefix("/mcp/")
             .and_then(|id| self.config.routes.get_key_value(id))
         else {
-            return response(Status::NotFound, None);
+            return (response(Status::NotFound, None), None);
         };
         if !request.head.is_post() {
-            return response(Status::MethodNotAllowed, None);
+            return (response(Status::MethodNotAllowed, None), None);
         }
         let Ok(message) = jcs::parse(&request.body) else {
-            return response(Status::BadRequest, None);
+            return (response(Status::BadRequest, None), None);
         };
         let (Some(id), Some(method)) = (
             message.get("id").and_then(JcsValue::as_str),
             message.get("method").and_then(JcsValue::as_str),
         ) else {
-            return response(Status::BadRequest, None);
+            return (response(Status::BadRequest, None), None);
         };
         if !known_shape(&message, method) {
-            return response(Status::BadRequest, None);
+            return (response(Status::BadRequest, None), None);
         }
         let proof = message
             .pointer("/params/_meta")
@@ -424,11 +443,39 @@ impl Broker {
                     phase: Phase::Rejected,
                     reason: "a proof-less request other than discover or list",
                     outcome: None,
+                    leg: None,
                 },
             ),
         };
-        self.write_log(server_id, method, id, &verdict, when);
-        response(Status::Ok, Some(("application/json", &body)))
+        let closing = Closing {
+            server_id: server_id.clone(),
+            method: method.to_owned(),
+            upstream_id: id.to_owned(),
+            verdict,
+            when,
+        };
+        (
+            response(Status::Ok, Some(("application/json", &body))),
+            Some(closing),
+        )
+    }
+
+    /// Writes a request's last log line, with its residence (O1), once its reply has gone.
+    pub fn close(&self, closing: &Closing) {
+        // A leg that never came back has no end to subtract, so no residence: the deadline it ran
+        // into is no time the broker spent.
+        let broker_us = match (closing.verdict.phase, closing.verdict.leg) {
+            (Phase::Forwarded, None) => None,
+            (_, leg) => Some(residence_us(closing.when.started, leg)),
+        };
+        self.write_log(
+            &closing.server_id,
+            &closing.method,
+            &closing.upstream_id,
+            &closing.verdict,
+            closing.when,
+            broker_us,
+        );
     }
 
     fn call(
@@ -454,6 +501,7 @@ impl Broker {
                     phase: Phase::Rejected,
                     reason,
                     outcome: payment.then_some("refused"),
+                    leg: None,
                 },
             )
         };
@@ -530,8 +578,10 @@ impl Broker {
                 phase: Phase::Forwarding,
                 reason: "",
                 outcome: None,
+                leg: None,
             },
             when,
+            None,
         );
         let mut extra = Vec::new();
         if let Some(key) = &key {
@@ -584,6 +634,7 @@ impl Broker {
         }
         headers.extend_from_slice(extra);
         let body = strip_params_meta(message).to_canonical_bytes();
+        let leg = LegTimer::default();
         let reply = post(&Post {
             endpoint: &route.endpoint,
             path: "/mcp",
@@ -593,6 +644,7 @@ impl Broker {
             timeout: self.config.upstream_timeout,
             max_body: jcs::MAX_DEFINITION_BYTES,
             peer: None,
+            timer: Some(&leg),
         });
         let verdict = |phase, reason| Verdict {
             jti: None,
@@ -602,6 +654,7 @@ impl Broker {
             phase,
             reason,
             outcome: None,
+            leg: leg.duration(),
         };
         match reply {
             Err(error) if error.not_delivered() => (
@@ -646,6 +699,7 @@ impl Broker {
         upstream_id: &str,
         verdict: &Verdict,
         when: When,
+        broker_us: Option<u64>,
     ) {
         let text = |value: Option<&str>| {
             value.map_or_else(
@@ -656,7 +710,7 @@ impl Broker {
         let line = format!(
             r#"{{"action_digest":{},"broker_us":{},"entity_key":{},"idempotency_key":{},"jti":{},"method":{},"outcome":{},"reason":{},"server_id":{},"ts_ms":{},"upstream_id":{},"v":1,"verdict":{}}}"#,
             text(verdict.action_digest.as_deref()),
-            when.broker_us(),
+            broker_us.map_or_else(|| "null".to_owned(), |us| us.to_string()),
             text(verdict.entity_key.as_deref()),
             text(verdict.idempotency_key.as_deref()),
             text(verdict.jti.as_deref()),

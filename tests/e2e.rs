@@ -62,6 +62,10 @@ struct World {
     broker_credential_b: String,
     /// Whether the broker is G3's capturing one.
     capture: bool,
+    /// Extra members for tool-a's config: its misbehaviour.
+    tool_a_extra: String,
+    /// The upstream deadline, for the PEP and the broker.
+    upstream_ms: u64,
 }
 
 impl Drop for World {
@@ -125,7 +129,7 @@ impl World {
         let pins = jcs::parse_with(pins_text.as_bytes(), &ParseOptions::definition())
             .unwrap()
             .value;
-        let world = Self {
+        Self {
             base,
             pins_text,
             pins,
@@ -135,9 +139,9 @@ impl World {
             broker_credential_b: credential_b
                 .map_or_else(|| "credential-b".to_owned(), str::to_owned),
             capture: false,
-        };
-        world.write_files();
-        world
+            tool_a_extra: String::new(),
+            upstream_ms: 5000,
+        }
     }
 
     /// Where the oracle finds this world's logs.
@@ -178,17 +182,29 @@ impl World {
         let invoices = r#"{"INV-1001":{"amount_due_minor":30000,"currency":"USD","status":"executed"},
             "INV-2002":{"amount_due_minor":60000,"currency":"USD","status":"executed"},
             "INV-3003":{"amount_due_minor":30000,"currency":"USD","status":"declined"},
-            "INV-4004":{"amount_due_minor":30000,"currency":"USD","status":"pending"}}"#;
+            "INV-4004":{"amount_due_minor":30000,"currency":"USD","status":"pending"},
+            "INV-6001":{"amount_due_minor":1000,"currency":"USD","status":"executed"},
+            "INV-6002":{"amount_due_minor":1000,"currency":"USD","status":"executed"},
+            "INV-6003":{"amount_due_minor":1000,"currency":"USD","status":"executed"},
+            "INV-6004":{"amount_due_minor":1000,"currency":"USD","status":"executed"},
+            "INV-6005":{"amount_due_minor":1000,"currency":"USD","status":"declined"},
+            "INV-6006":{"amount_due_minor":1000,"currency":"USD","status":"executed"},
+            "INV-6007":{"amount_due_minor":1000,"currency":"USD","status":"executed"}}"#;
         for server in ["a", "b"] {
             fs::write(
                 self.path(&format!("tool-{server}.json")),
                 format!(
-                    r#"{{"server_id":"{server}","listen":"unix:{}","verifier":"{}","pins":"{}","store":"{}","log":"{}","invoices":{invoices}}}"#,
+                    r#"{{"server_id":"{server}","listen":"unix:{}","verifier":"{}","pins":"{}","store":"{}","log":"{}","invoices":{invoices}{}}}"#,
                     p(&format!("tool-{server}/tool.sock")),
                     p(&format!("secrets/verifier-{server}")),
                     p("pins.json"),
                     p(&format!("state/dedupe-{server}.jsonl")),
                     p(&format!("logs/tool-{server}.jsonl")),
+                    if server == "a" {
+                        self.tool_a_extra.as_str()
+                    } else {
+                        ""
+                    },
                 ),
             )
             .unwrap();
@@ -198,7 +214,7 @@ impl World {
             format!(
                 r#"{{"socket":"{}","pep":{{"uid":{uid},"gid":{gid}}},"pep_key":"{}","pins":"{}",
                 "routes":{{"a":{{"endpoint":"unix:{}","credential":"{}"}},"b":{{"endpoint":"unix:{}","credential":"{}"}}}},
-                "replay_cache_entries":1000,"clock_skew_ms":2000,"connections":16,"upstream_timeout_ms":5000,"log":"{}"}}"#,
+                "replay_cache_entries":1000,"clock_skew_ms":2000,"connections":16,"upstream_timeout_ms":{},"log":"{}"}}"#,
                 p("broker/broker.sock"),
                 p("pub/call-proof.pub"),
                 p("pins.json"),
@@ -206,14 +222,15 @@ impl World {
                 p("secrets/cred-a"),
                 p("tool-b/tool.sock"),
                 p("secrets/cred-b"),
+                self.upstream_ms,
                 p("logs/broker.jsonl"),
             ),
         )
         .unwrap();
         let digest = jcs::digest_value(&self.pins);
-        let intent = |kind: &str, ids: &str| {
+        let intent = |kind: &str, ids: &str, max_calls: u32| {
             format!(
-                r#"{{"release_epoch":7,"lockfile_digest":"{digest}","limits":{{"currency":"USD","per_call_max_minor":100000,"cumulative_max_minor":500000,"max_calls":5,"step_up_over_minor":50000,"max_declines":3}},
+                r#"{{"release_epoch":7,"lockfile_digest":"{digest}","limits":{{"currency":"USD","per_call_max_minor":100000,"cumulative_max_minor":500000,"max_calls":{max_calls},"step_up_over_minor":50000,"max_declines":3}},
                 "entities":{{"kind":"{kind}","ids":{ids},"per_entity_max_uses":1}},"seq":"unconstrained"}}"#
             )
         };
@@ -225,9 +242,9 @@ impl World {
                 "lockfile":{{"path":"/etc/pep/lockfile.dsse.json","min_accepted_epoch":7,"signers":[],"thresholds":{{}}}},
                 "journal":{{"path":"{}","lock":"{}"}},"log":{{"path":"{}","max_bytes":1048576}},
                 "limits":{{"connections":16,"control_connections":4,"header_bytes":16384,"body_bytes":1048576,"read_timeout_ms":5000,
-                  "upstream_timeout_ms":5000,"step_up_timeout_ms":{},"episode_idle_ms":600000,"episodes":4,"call_burst":50,"call_rate_per_s":50,
+                  "upstream_timeout_ms":{},"step_up_timeout_ms":{},"episode_idle_ms":600000,"episodes":4,"call_burst":50,"call_rate_per_s":50,
                   "clock_skew_ms":2000,"replay_cache_entries":1000}},
-                "intents":{{"pay":{},"notes":{}}},"pins":{}}}"#,
+                "intents":{{"pay":{},"notes":{},"chaos":{}}},"pins":{}}}"#,
                 p("pep/agent.sock"),
                 p("ctl/ctl.sock"),
                 p("broker/broker.sock"),
@@ -235,9 +252,15 @@ impl World {
                 p("state/journal.jsonl"),
                 p("state/journal.lock"),
                 p("logs/decisions.jsonl"),
+                self.upstream_ms,
                 self.step_up_ms,
-                intent("invoice", r#"["INV-1001","INV-2002","INV-3003","INV-4004"]"#),
-                intent("recipient", r#"["rcpt_A"]"#),
+                intent("invoice", r#"["INV-1001","INV-2002","INV-3003","INV-4004"]"#, 5),
+                intent("recipient", r#"["rcpt_A"]"#, 5),
+                intent(
+                    "invoice",
+                    r#"["INV-6001","INV-6002","INV-6003","INV-6004","INV-6005","INV-6006","INV-6007"]"#,
+                    10
+                ),
                 self.pins_text,
             ),
         )
@@ -255,6 +278,7 @@ impl World {
 
     /// Starts the tool servers and the broker, then the PEP.
     fn start(mut self) -> Self {
+        self.write_files();
         for server in ["a", "b"] {
             let mut child = Self::spawn(
                 env!("CARGO_BIN_EXE_stub-tool"),
@@ -363,8 +387,8 @@ impl World {
     }
 
     fn lines(&self, log: &str) -> Vec<JcsValue> {
-        fs::read_to_string(self.path(log))
-            .unwrap_or_default()
+        let settled = self.settled(log);
+        settled
             .lines()
             .map(|line| {
                 jcs::parse_with(line.as_bytes(), &ParseOptions::definition())
@@ -372,6 +396,34 @@ impl World {
                     .value
             })
             .collect()
+    }
+
+    fn settled(&self, log: &str) -> String {
+        // The journal's `reserve` and `outcome` records are queued, not waited for, so they can
+        // reach the file a moment after the reply.
+        if log.contains("journal") {
+            // The file is preallocated, so its size says nothing: count up to the first NUL.
+            let path = self.path(log);
+            let size = || {
+                let bytes = fs::read(&path).unwrap_or_default();
+                bytes
+                    .iter()
+                    .position(|&byte| byte == 0)
+                    .unwrap_or(bytes.len())
+            };
+            let mut seen = size();
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(40));
+                let now = size();
+                if now == seen {
+                    break;
+                }
+                seen = now;
+            }
+        }
+        let text = fs::read_to_string(self.path(log)).unwrap_or_default();
+        text.split('\0').next().unwrap_or_default().to_owned()
     }
 }
 
@@ -958,6 +1010,7 @@ fn a_captured_proof_replays_to_nothing() {
     let mark = world.layout().mark().unwrap();
     let (uid, gid) = ids();
     let injector = Command::new(env!("CARGO_BIN_EXE_stub-injector"))
+        .arg("broker")
         .arg(world.path("broker/broker.sock"))
         .args([uid.to_string(), gid.to_string()])
         .arg(world.path("state/proofs.jsonl"))
@@ -974,4 +1027,110 @@ fn a_captured_proof_replays_to_nothing() {
         text(line, "/reason").as_deref() == Some("call proof replayed")
             && text(line, "/verdict").as_deref() == Some("rejected")
     }));
+}
+
+fn outcomes(world: &World) -> Vec<String> {
+    world
+        .lines("state/journal.jsonl")
+        .iter()
+        .filter_map(|line| text(line, "/result"))
+        .collect()
+}
+
+/// Every misbehaviour the tool server can be configured with (§2a). Whatever it answers, only an
+/// explicit status settles a payment, and a forged outcome member is never believed.
+#[test]
+fn a_misbehaving_tool_cannot_settle_a_payment() {
+    let mut world = World::new(10_000, None);
+    world.upstream_ms = 1200;
+    world.tool_a_extra = r#","misbehave":{"pay_invoice:INV-6001":"wrong_id","pay_invoice:INV-6002":"two_responses",
+        "pay_invoice:INV-6003":"oversized","pay_invoice:INV-6004":"input_required","pay_invoice:INV-6005":"forged_outcome",
+        "pay_invoice:INV-6006":"slow_drip","pay_invoice:INV-6007":"delay_ms:200"}"#
+        .to_owned();
+    let world = world.start();
+    let token = world.start_episode("chaos");
+    for (id, (invoice, expected)) in [
+        ("INV-6001", "unknown"),
+        ("INV-6002", "unknown"),
+        ("INV-6003", "unknown"),
+        ("INV-6004", "unknown"),
+        ("INV-6005", "declined"),
+        ("INV-6006", "unknown"),
+        ("INV-6007", "executed"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let id = u64::try_from(id).unwrap() * 2 + 1;
+        world.call(
+            id,
+            "get_invoice",
+            &format!(r#"{{"invoice_id":"{invoice}"}}"#),
+            &token,
+        );
+        let reply = world.call(
+            id + 1,
+            "pay_invoice",
+            &format!(r#"{{"invoice_id":"{invoice}","amount":1000,"currency":"USD"}}"#),
+            &token,
+        );
+        assert_eq!(
+            outcomes(&world).last().map(String::as_str),
+            Some(expected),
+            "{invoice}: {reply:?}"
+        );
+    }
+    // The forged member never reached the PEP's books, and the tool logged what really happened.
+    let journal = outcomes(&world);
+    assert_eq!(
+        journal.iter().filter(|o| *o == "executed").count(),
+        1,
+        "{journal:?}"
+    );
+    oracle_join(&world);
+    // O1's residence leaves the upstream leg out, so INV-6007's 200 ms at the tool is in neither
+    // hop's figure, and the slowest of all would show it if it were.
+    let slowest = |log: &str, field: &str| {
+        world
+            .lines(log)
+            .iter()
+            .filter_map(|line| line.get(field).and_then(JcsValue::as_i64))
+            .max()
+            .unwrap()
+    };
+    assert!(slowest("logs/decisions.jsonl", "pep_us") > 0);
+    assert!(slowest("logs/decisions.jsonl", "pep_us") < 150_000);
+    assert!(slowest("logs/broker.jsonl", "broker_us") > 0);
+    assert!(slowest("logs/broker.jsonl", "broker_us") < 150_000);
+}
+
+/// The drift modes, seen by the poll at boot. Step 10 runs the same poll on a timer.
+#[test]
+fn a_server_that_drifts_is_quarantined_at_the_next_poll() {
+    for (change, page_size) in [
+        ("description", ""),
+        ("last_page", r#","page_size":1"#),
+        ("x_mcp_header", ""),
+    ] {
+        let mut world = World::new(10_000, None);
+        let flag = world.path("state/drift");
+        world.tool_a_extra = format!(
+            r#"{page_size},"drift":{{"flag":"{}","change":"{change}"}}"#,
+            flag.display()
+        );
+        let mut world = world.start();
+        let token = world.start_episode("pay");
+        let read = world.call(1, "get_invoice", r#"{"invoice_id":"INV-1001"}"#, &token);
+        assert!(read.get("result").is_some(), "{change}: {read:?}");
+        fs::write(&flag, "").unwrap();
+        world.start_pep();
+        let token = world.start_episode("pay");
+        let read = world.call(2, "get_invoice", r#"{"invoice_id":"INV-1001"}"#, &token);
+        assert!(denied(&read), "{change}: {read:?}");
+        let quarantined = world
+            .lines("state/journal.jsonl")
+            .iter()
+            .any(|line| text(line, "/type").as_deref() == Some("quarantine"));
+        assert!(quarantined, "{change}");
+    }
 }

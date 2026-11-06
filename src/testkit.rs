@@ -172,6 +172,7 @@ pub(crate) fn kit(upstream: Arc<dyn Upstream>, agent_uid: u32) -> Kit {
         call_burst: 10,
         call_rate_per_s: 10,
         idle_secs: 1800,
+        lifetime_secs: crate::tokens::EPISODE_MAX_LIFETIME_SECS,
         skew_secs: 2,
     };
     let registry = Registry::new(

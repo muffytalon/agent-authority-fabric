@@ -21,8 +21,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions, Permissions};
-use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::io::{self, Read, Write};
+use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
@@ -637,10 +637,17 @@ fn ledger<'a>(ledgers: &'a mut BTreeMap<String, Ledger>, intent: &str) -> &'a mu
         .or_insert_with(Ledger::empty)
 }
 
+/// The zero-filled space the journal keeps ahead of its last record.
+const PREALLOCATED_BYTES: u64 = 1024 * 1024;
+
 /// The open journal file, held under its lock.
 #[derive(Debug)]
 pub struct Journal {
     file: File,
+    /// Where the next record goes.
+    end: u64,
+    /// How far the zero-filled space runs.
+    capacity: u64,
     _lock: File,
 }
 
@@ -659,14 +666,24 @@ impl Journal {
         let mut file = open_journal_file(path, euid)?;
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes)?;
-        let complete = match bytes.iter().rposition(|&byte| byte == b'\n') {
+        // The log ends at the first NUL, which no record holds: past it is preallocated space,
+        // or what is left of writes no fsync ever covered, and so nothing was forwarded on.
+        let used = bytes
+            .iter()
+            .position(|&byte| byte == 0)
+            .unwrap_or(bytes.len());
+        let complete = match bytes
+            .get(..used)
+            .unwrap_or_default()
+            .iter()
+            .rposition(|&byte| byte == b'\n')
+        {
             Some(last) => last.checked_add(1).ok_or(JournalError::Encoding)?,
             None => 0,
         };
-        if complete != bytes.len() {
-            file.set_len(u64::try_from(complete).map_err(|_| JournalError::Encoding)?)?;
-            file.sync_all()?;
-        }
+        let end = u64::try_from(complete).map_err(|_| JournalError::Encoding)?;
+        file.set_len(end)?;
+        let capacity = preallocate(&file, end, PREALLOCATED_BYTES)?;
         let mut records = Vec::new();
         for (index, line) in bytes
             .get(..complete)
@@ -685,9 +702,26 @@ impl Journal {
             }
             records.push(Record::parse(line).ok_or(malformed)?);
         }
-        file.seek(SeekFrom::End(0))?;
-        Ok((Self { file, _lock: lock }, records))
+        Ok((
+            Self {
+                file,
+                end,
+                capacity,
+                _lock: lock,
+            },
+            records,
+        ))
     }
+}
+
+/// Zero-fills `bytes` of the file from `from`, durably, and returns where that ends. An fsync of
+/// a file that grows must also commit its new size to the filesystem's own journal, which on this
+/// machine costs 3.1 ms against 1.2 ms (O1), and a payment's latency is mostly this wait.
+fn preallocate(file: &File, from: u64, bytes: u64) -> Result<u64, JournalError> {
+    let zeros = vec![0u8; usize::try_from(bytes).map_err(|_| JournalError::Encoding)?];
+    file.write_all_at(&zeros, from)?;
+    file.sync_all()?;
+    from.checked_add(bytes).ok_or(JournalError::Encoding)
 }
 
 /// Where the writer thread puts its batches: the journal, or a test double.
@@ -698,7 +732,18 @@ trait Sink: Send + 'static {
 
 impl Sink for Journal {
     fn write_batch(&mut self, bytes: &[u8], sync: bool) -> io::Result<()> {
-        self.file.write_all(bytes)?;
+        let length = u64::try_from(bytes.len()).map_err(|_| io::ErrorKind::InvalidInput)?;
+        let end = self
+            .end
+            .checked_add(length)
+            .ok_or(io::ErrorKind::InvalidInput)?;
+        if end > self.capacity {
+            let more = PREALLOCATED_BYTES.max(length);
+            self.capacity = preallocate(&self.file, self.capacity, more)
+                .map_err(|_| io::Error::other("the journal could not grow"))?;
+        }
+        self.file.write_all_at(bytes, self.end)?;
+        self.end = end;
         if sync {
             self.file.sync_data()?;
         }
@@ -754,7 +799,8 @@ fn open_journal_file(path: &Path, euid: u32) -> Result<File, JournalError> {
 struct Append {
     lines: Vec<u8>,
     sync: bool,
-    done: SyncSender<Result<(), JournalError>>,
+    /// Where to answer, if anyone is waiting.
+    done: Option<SyncSender<Result<(), JournalError>>>,
 }
 
 /// A handle every episode's actor uses to append. Cloning it is cheap.
@@ -784,19 +830,49 @@ impl JournalHandle {
         self.send(records, true)
     }
 
+    /// Queues `records` and returns: for `reserve` and `outcome`, which nothing has to wait for.
+    /// A `reserve` is covered by its `forwarded`, a commit behind it in the same queue, so it
+    /// reaches the file first; and losing an `outcome` replays its reservation as unresolved,
+    /// which fails closed (R1). Waiting here would cost a call a whole fsync cycle of someone
+    /// else's for nothing. A write that fails later latches the journal, so the next commit
+    /// reports it.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`JournalError`] if the queue is full or the writer has stopped.
+    pub fn enqueue(&self, records: &[Record]) -> Result<(), JournalError> {
+        let mut lines = Vec::new();
+        for record in records {
+            lines.extend(record.to_line()?);
+        }
+        self.push(Append {
+            lines,
+            sync: false,
+            done: None,
+        })
+    }
+
     fn send(&self, records: &[Record], sync: bool) -> Result<(), JournalError> {
         let mut lines = Vec::new();
         for record in records {
             lines.extend(record.to_line()?);
         }
         let (done, answer) = mpsc::sync_channel(1);
-        match self.queue.try_send(Append { lines, sync, done }) {
-            Ok(()) => {}
-            // A full queue fails closed rather than stalling the caller unboundedly.
-            Err(TrySendError::Full(_)) => return Err(JournalError::Failed),
-            Err(TrySendError::Disconnected(_)) => return Err(JournalError::Stopped),
-        }
+        self.push(Append {
+            lines,
+            sync,
+            done: Some(done),
+        })?;
         answer.recv().map_err(|_| JournalError::Stopped)?
+    }
+
+    fn push(&self, append: Append) -> Result<(), JournalError> {
+        match self.queue.try_send(append) {
+            Ok(()) => Ok(()),
+            // A full queue fails closed rather than stalling the caller unboundedly.
+            Err(TrySendError::Full(_)) => Err(JournalError::Failed),
+            Err(TrySendError::Disconnected(_)) => Err(JournalError::Stopped),
+        }
     }
 }
 
@@ -847,8 +923,10 @@ fn run_writer<S: Sink>(mut sink: S, appends: &Receiver<Append>) {
                 Ok(()) => Ok(()),
                 Err(_) => Err(JournalError::Failed),
             };
-            // A caller that stopped waiting has nothing to learn.
-            drop(append.done.send(answer));
+            // A caller that stopped waiting, or never did, has nothing to learn.
+            if let Some(done) = append.done {
+                drop(done.send(answer));
+            }
         }
     }
 }
@@ -1306,7 +1384,7 @@ mod tests {
         fs::write(dir.journal(), [complete.as_slice(), torn].concat()).unwrap();
         let (journal, records) = dir.open().unwrap();
         assert_eq!(records, vec![forwarded(EID, 1)]);
-        assert_eq!(fs::read(dir.journal()).unwrap(), complete);
+        assert_eq!(journal_text(&dir), complete);
         drop(journal);
         // A complete line that is not a record, or a blank line, stops the PEP.
         for (bytes, line) in [
@@ -1415,7 +1493,7 @@ mod tests {
         ));
         drop(handle);
         writer.join().unwrap();
-        assert!(fs::read(dir.journal()).unwrap().is_empty());
+        assert!(journal_text(&dir).is_empty());
     }
 
     /// Fails its first batch, then accepts every other.
@@ -1489,8 +1567,12 @@ mod tests {
         store.record_all(&[], entry).unwrap();
         drop((store, handle));
         writer.join().unwrap();
-        let text = fs::read_to_string(dir.journal()).unwrap();
-        assert_eq!(text.lines().count(), 1);
+        assert_eq!(
+            journal_text(&dir)
+                .split_inclusive(|&byte| byte == b'\n')
+                .count(),
+            1
+        );
         let (store, handle, writer) = labels(&dir, 10);
         assert_eq!(store.lookup(&location("k1")).unwrap(), Some(SECRET_WRITE));
         assert_eq!(store.lookup(&content()).unwrap(), Some(SECRET_WRITE));
@@ -1514,7 +1596,111 @@ mod tests {
         assert_eq!(store.lookup(&location("k1")).unwrap(), None);
         drop((store, handle));
         writer.join().unwrap();
-        assert!(fs::read(dir.journal()).unwrap().is_empty());
+        assert!(journal_text(&dir).is_empty());
+    }
+
+    /// The journal's records as text: everything before the zero-filled space.
+    fn journal_text(dir: &TempDir) -> Vec<u8> {
+        let bytes = fs::read(dir.journal()).unwrap();
+        let used = bytes
+            .iter()
+            .position(|&byte| byte == 0)
+            .unwrap_or(bytes.len());
+        bytes[..used].to_vec()
+    }
+
+    #[test]
+    fn the_journal_grows_and_a_new_boot_writes_where_it_ended() {
+        let dir = TempDir::new();
+        let (journal, _) = dir.open().unwrap();
+        let (handle, writer) = spawn_writer(journal).unwrap();
+        // Past the space the first boot set aside.
+        let line_bytes = reserve(EID, 1, "pay", "INV-1", 100)
+            .to_line()
+            .unwrap()
+            .len();
+        let count = PREALLOCATED_BYTES / u64::try_from(line_bytes).unwrap() * 3;
+        for rid in 1..=count {
+            handle
+                .enqueue(&[reserve(EID, rid, "pay", "INV-1", 100)])
+                .unwrap();
+        }
+        handle.commit(&[]).unwrap();
+        drop(handle);
+        writer.join().unwrap();
+        let (journal, records) = dir.open().unwrap();
+        assert_eq!(records.len(), usize::try_from(count).unwrap());
+        // The next boot goes on from the last record, not from the end of the file.
+        let (handle, writer) = spawn_writer(journal).unwrap();
+        handle
+            .commit(&[reserve(EID, count + 1, "pay", "INV-1", 100)])
+            .unwrap();
+        drop(handle);
+        writer.join().unwrap();
+        let (_, records) = dir.open().unwrap();
+        assert_eq!(records.len(), usize::try_from(count).unwrap() + 1);
+    }
+
+    #[test]
+    fn a_tear_in_the_zero_filled_space_is_a_torn_tail() {
+        let complete = reserve(EID, 1, "pay", "INV-1", 1).to_line().unwrap();
+        let later = reserve(EID, 2, "pay", "INV-2", 1).to_line().unwrap();
+        for (name, tail) in [
+            ("half a line, then zeros", [&later[..20], &[0; 64]].concat()),
+            (
+                "a hole, then a line no fsync covered",
+                [&[0u8; 64], later.as_slice()].concat(),
+            ),
+        ] {
+            let dir = TempDir::new();
+            drop(dir.open().unwrap());
+            fs::write(dir.journal(), [complete.as_slice(), &tail].concat()).unwrap();
+            let (_, records) = dir.open().unwrap();
+            assert_eq!(records, [reserve(EID, 1, "pay", "INV-1", 1)], "{name}");
+            assert_eq!(journal_text(&dir), complete, "{name}");
+        }
+    }
+
+    #[test]
+    fn what_is_queued_lands_before_a_later_commit() {
+        let dir = TempDir::new();
+        let (journal, _) = dir.open().unwrap();
+        let (handle, writer) = spawn_writer(journal).unwrap();
+        handle
+            .enqueue(&[reserve(EID, 1, "pay", "INV-1", 100)])
+            .unwrap();
+        handle.commit(&[forwarded(EID, 1)]).unwrap();
+        handle
+            .enqueue(&[outcome(EID, 1, OutcomeKind::Executed)])
+            .unwrap();
+        drop(handle);
+        writer.join().unwrap();
+        let (_, records) = dir.open().unwrap();
+        assert_eq!(
+            records,
+            [
+                reserve(EID, 1, "pay", "INV-1", 100),
+                forwarded(EID, 1),
+                outcome(EID, 1, OutcomeKind::Executed)
+            ]
+        );
+    }
+
+    #[test]
+    fn a_failed_write_nobody_waited_for_stops_the_next_commit() {
+        let dir = TempDir::new();
+        let (mut journal, _) = dir.open().unwrap();
+        journal.file = File::open(dir.journal()).unwrap();
+        let (handle, writer) = spawn_writer(journal).unwrap();
+        handle
+            .enqueue(&[reserve(EID, 1, "pay", "INV-1", 100)])
+            .unwrap();
+        assert!(matches!(
+            handle.commit(&[forwarded(EID, 1)]),
+            Err(JournalError::Failed)
+        ));
+        drop(handle);
+        writer.join().unwrap();
     }
 
     #[test]

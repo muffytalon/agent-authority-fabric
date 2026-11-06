@@ -171,7 +171,7 @@ jobs:
     # run with §4's snippet, and sudo gives them §4's owners. They guard nothing but the stubs.
     name: Compose topology, posture and flows
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -205,3 +205,6 @@ jobs:
 
       - name: compose/kit.py
         run: python3 compose/kit.py
+
+      - name: compose/conformance.py
+        run: python3 compose/conformance.py

@@ -26,10 +26,10 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     find Cargo.toml Cargo.lock src -type f -exec touch {} + \
  && cargo build --release --locked --target x86_64-unknown-linux-musl \
         --bin pep-sidecar --bin stub-broker --bin stub-operator --bin stub-agent --bin stub-oracle \
-        --bin stub-broker-capture --bin stub-injector \
+        --bin stub-broker-capture --bin stub-injector --bin stub-load \
  && cargo build --release --locked --bin stub-tool \
  && install -d /out \
- && for bin in pep-sidecar stub-broker stub-operator stub-agent stub-oracle stub-broker-capture stub-injector; do \
+ && for bin in pep-sidecar stub-broker stub-operator stub-agent stub-oracle stub-broker-capture stub-injector stub-load; do \
         install -m 0555 "target/x86_64-unknown-linux-musl/release/$bin" /out/; \
     done \
  && install -m 0555 target/release/stub-tool /out/
@@ -47,7 +47,8 @@ RUN set -eu; \
         install -d -m 0755 -o 0 -g 0 "/roots/$image/run" "/roots/$image/usr/local/bin" "/roots/$image/etc"; \
     done; \
     install -d -m 0700 -o 20002 -g 20002 /roots/pep/var/lib/pep; \
-    install -d -m 2750 -o 20003 -g 20007 /roots/broker/var/lib/broker
+    install -d -m 2750 -o 20003 -g 20007 /roots/broker/var/lib/broker; \
+    install -d -m 0700 -o 20001 -g 20001 /roots/probe/var/lib/load
 
 FROM scratch AS pep
 COPY --from=roots /roots/pep/ /
@@ -90,6 +91,9 @@ ENTRYPOINT ["/usr/local/bin/stub-broker-capture", "/var/lib/broker/proofs.jsonl"
 FROM scratch AS probe
 COPY --from=roots /roots/probe/ /
 COPY --from=build /out/stub-agent /usr/local/bin/stub-agent
+COPY --from=build /out/stub-operator /usr/local/bin/stub-operator
+COPY --from=build /out/stub-injector /usr/local/bin/stub-injector
+COPY --from=build /out/stub-load /usr/local/bin/stub-load
 COPY --from=net-probe /out/net-probe /usr/local/bin/net-probe
 USER 20009:20001
 ENTRYPOINT ["/usr/local/bin/stub-agent", "/run/pep/agent.sock"]
@@ -98,7 +102,7 @@ FROM scratch AS injector
 COPY --from=roots /roots/injector/ /
 COPY --from=build /out/stub-injector /usr/local/bin/stub-injector
 USER 20002:20002
-ENTRYPOINT ["/usr/local/bin/stub-injector", "/run/broker/broker.sock", "20003", "20003", "/var/lib/broker/proofs.jsonl"]
+ENTRYPOINT ["/usr/local/bin/stub-injector", "broker", "/run/broker/broker.sock", "20003", "20003", "/var/lib/broker/proofs.jsonl"]
 
 FROM debian:bookworm-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc AS tool
 ARG TOOL_UID

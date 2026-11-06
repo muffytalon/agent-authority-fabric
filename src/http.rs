@@ -130,6 +130,13 @@ pub struct Headers {
 }
 
 impl Headers {
+    /// Every field in order, names as sent.
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.fields
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+    }
+
     /// The first value of `name`, compared case-insensitively.
     #[must_use]
     pub fn get(&self, name: &str) -> Option<&str> {
@@ -188,6 +195,8 @@ pub struct Request {
     /// The body: exactly `Content-Length` bytes for a POST, and empty for any other method,
     /// whose body is never read (it gets 405).
     pub body: Vec<u8>,
+    /// When the first byte arrived: where O1's residence starts.
+    pub first_byte: Instant,
 }
 
 /// Absolute deadlines for one request, usually measured from `accept`.
@@ -351,7 +360,7 @@ fn read_request_with<S: TimedRead + ?Sized>(
     deadlines: Deadlines,
     caps: Caps,
 ) -> Result<Request, HttpError> {
-    let (buf, head_end) = read_head(stream, deadlines.head)?;
+    let (buf, head_end, first_byte) = read_head(stream, deadlines.head)?;
     let (head_bytes, rest) = buf.split_at_checked(head_end).ok_or(HttpError::Io)?;
     if head_bytes.len() > caps.head_bytes {
         return Err(Malformed::HeadTooLarge.into());
@@ -361,6 +370,7 @@ fn read_request_with<S: TimedRead + ?Sized>(
         return Ok(Request {
             head,
             body: Vec::new(),
+            first_byte,
         });
     }
     let length = head.content_length.ok_or(Malformed::MissingContentLength)?;
@@ -368,25 +378,31 @@ fn read_request_with<S: TimedRead + ?Sized>(
         return Err(Malformed::BodyTooLarge.into());
     }
     let body = read_body(stream, rest, length, deadlines.body)?;
-    Ok(Request { head, body })
+    Ok(Request {
+        head,
+        body,
+        first_byte,
+    })
 }
 
 /// Reads until a whole head has arrived. Returns the bytes read and the head's length.
 fn read_head<S: TimedRead + ?Sized>(
     stream: &mut S,
     deadline: Instant,
-) -> Result<(Vec<u8>, usize), HttpError> {
+) -> Result<(Vec<u8>, usize, Instant), HttpError> {
     let mut buf = Vec::with_capacity(READ_CHUNK);
     let mut scanned = 0;
+    let mut first_byte = None;
     loop {
         if let Some(end) = scan_head(&buf, &mut scanned)? {
-            return Ok((buf, end));
+            return Ok((buf, end, first_byte.unwrap_or_else(Instant::now)));
         }
         let room = MAX_HEAD_BYTES
             .checked_add(1)
             .and_then(|cap| cap.checked_sub(buf.len()))
             .ok_or(Malformed::HeadTooLarge)?;
         read_some(stream, &mut buf, deadline, room)?;
+        first_byte.get_or_insert_with(Instant::now);
     }
 }
 
@@ -683,7 +699,7 @@ pub fn read_response<S: TimedRead + ?Sized>(
     deadline: Instant,
     max_body: usize,
 ) -> Result<Response, HttpError> {
-    let (buf, head_end) = read_head(stream, deadline)?;
+    let (buf, head_end, _) = read_head(stream, deadline)?;
     let (head, rest) = buf.split_at_checked(head_end).ok_or(HttpError::Io)?;
     let (status, headers) = head_lines(head, parse_status_line)?;
     let length = content_length(&headers, max_body)?.ok_or(Malformed::MissingContentLength)?;

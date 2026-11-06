@@ -402,9 +402,32 @@ impl World {
         call_at(&self.path("pep/agent.sock"), id, tool, arguments, token)
     }
 
+    /// `log` up to its first NUL. The journal is preallocated, so its size says nothing, and its
+    /// `reserve` and `outcome` records are queued, not waited for, so they can reach the file a
+    /// moment after the reply: wait for it to stop growing.
+    fn settled(&self, log: &str) -> String {
+        let read = || {
+            let text = fs::read_to_string(self.path(log)).unwrap_or_default();
+            text.split('\0').next().unwrap_or_default().to_owned()
+        };
+        let mut seen = read();
+        if !log.contains("journal") {
+            return seen;
+        }
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(40));
+            let now = read();
+            if now == seen {
+                break;
+            }
+            seen = now;
+        }
+        seen
+    }
+
     fn lines(&self, log: &str) -> Vec<JcsValue> {
-        fs::read_to_string(self.path(log))
-            .unwrap_or_default()
+        self.settled(log)
             .lines()
             .map(|line| {
                 jcs::parse_with(line.as_bytes(), &ParseOptions::definition())

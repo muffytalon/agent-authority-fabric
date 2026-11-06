@@ -208,6 +208,7 @@ fn run(path: &Path) -> Result<(), String> {
             call_burst: limits.call_burst,
             call_rate_per_s: limits.call_rate_per_s,
             idle_secs: limits.episode_idle_ms.checked_div(1000).unwrap_or(0),
+            lifetime_secs: limits.episode_lifetime_ms.checked_div(1000).unwrap_or(0),
             skew_secs: limits.clock_skew_ms.checked_div(1000).unwrap_or(0),
         },
         episode_key,

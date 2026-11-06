@@ -21,8 +21,8 @@ use crate::control::{ControlError, PendingPayment};
 use crate::engine::{HostAuthority, Ledger, PepEngine, Shared, ToolPins, encode_ulid};
 use crate::jcs;
 use crate::tokens::{
-    EPISODE_MAX_LIFETIME_SECS, EpisodeClaims, EpisodeStates, Es256Signer, MAX_TOKEN_BYTES,
-    admit_minted_episode, mint_episode_token,
+    EpisodeClaims, EpisodeStates, Es256Signer, MAX_TOKEN_BYTES, admit_minted_episode,
+    mint_episode_token,
 };
 
 /// The Week 2 `client_id` claim (E1); Week 5's RAR replaces it.
@@ -51,6 +51,8 @@ pub struct RegistryConfig {
     pub call_rate_per_s: u32,
     /// An episode with no call for this long is over (T1).
     pub idle_secs: u64,
+    /// How long an Episode Token lasts.
+    pub lifetime_secs: u64,
     /// Clock skew allowed on token times.
     pub skew_secs: u64,
 }
@@ -232,7 +234,7 @@ impl Registry {
         )
         .map_err(|_| ControlError::Refused)?;
         let exp = now
-            .checked_add(EPISODE_MAX_LIFETIME_SECS)
+            .checked_add(self.config.lifetime_secs)
             .ok_or(ControlError::Unavailable)?;
         let claims = EpisodeClaims {
             eid,
@@ -513,6 +515,7 @@ mod tests {
     use crate::jcs::{self, ParseOptions};
     use crate::journal::{Journal, spawn_writer};
     use crate::lockfile::parse_payload;
+    use crate::tokens::EPISODE_MAX_LIFETIME_SECS;
     use crate::tokens::{os_entropy, unix_now};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::thread;
@@ -629,6 +632,7 @@ mod tests {
             call_burst,
             call_rate_per_s: 1,
             idle_secs,
+            lifetime_secs: EPISODE_MAX_LIFETIME_SECS,
             skew_secs: 2,
         };
         let registry = Registry::new(
@@ -736,6 +740,7 @@ mod tests {
                 .into_bytes(),
                 peer_uid: 0,
                 reply,
+                leg: Arc::default(),
             })
             .unwrap();
         // Let the call reach its worker before ending.

@@ -11,7 +11,7 @@ use std::time::Duration;
 use pep_sidecar::peercred::bind_safe_listener;
 use pep_sidecar::serve::accept_loop;
 use pep_sidecar::stubs::tool::{self, TOOL_ENDPOINT, ToolServer};
-use pep_sidecar::stubs::{answer, now_ms};
+use pep_sidecar::stubs::{answer_with, now_ms};
 use pep_sidecar::upstream::Endpoint;
 
 /// The deadline for one request.
@@ -63,7 +63,7 @@ fn run(path: &Path) -> Result<(), String> {
             let bound = bind_safe_listener(&socket).map_err(|error| error.to_string())?;
             log(&format!("stub-tool {server_id}: serving"));
             accept_loop(bound.listener(), CONNECTIONS, move |mut stream| {
-                answer(&mut stream, &accept, READ_TIMEOUT, |request| {
+                answer_with(&mut stream, &accept, READ_TIMEOUT, |request| {
                     server.handle(request, now_ms())
                 });
             });
@@ -75,7 +75,7 @@ fn run(path: &Path) -> Result<(), String> {
                 let Ok(mut stream) = stream else { break };
                 let server = Arc::clone(&server);
                 drop(thread::Builder::new().spawn(move || {
-                    answer(&mut stream, &accept, READ_TIMEOUT, |request| {
+                    answer_with(&mut stream, &accept, READ_TIMEOUT, |request| {
                         server.handle(request, now_ms())
                     });
                 }));

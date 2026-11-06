@@ -146,6 +146,7 @@ pub fn parse_payload(value: &JcsValue, path: &str) -> Result<Lockfile, LoadError
     for (tool, stores_read, reader_path) in &readers {
         check_reader(&pins, tool, stores_read, reader_path)?;
     }
+    check_secret_stays_home(&pins, path)?;
     Ok(Lockfile {
         digest: pins.lockfile_digest.clone(),
         release_epoch,
@@ -480,6 +481,33 @@ fn check_clearance(
             path,
             Problem::Invalid(
                 "a read tool with data arguments must read a pinned store to be cleared for secret",
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// `check_clearance` lets a read tool with `data` arguments keep `secret` clearance because its
+/// server already holds what its store's readers can see. That reasoning covers that server's
+/// secrets only: a secret read from another server could otherwise leave through such a tool's
+/// arguments, with `G_label` satisfied. So every tool that outputs `secret` must be on the same
+/// server as every such tool.
+fn check_secret_stays_home(pins: &ToolPins, path: &str) -> Result<(), LoadError> {
+    let cleared = pins.tools.values().find(|tool| {
+        tool.sink_clearance == Confidentiality::Secret
+            && tool.args.iter().any(|spec| spec.role == ArgRole::Data)
+    });
+    let Some(cleared) = cleared else {
+        return Ok(());
+    };
+    let elsewhere = pins.tools.values().any(|tool| {
+        tool.output_label.conf == Confidentiality::Secret && tool.server_id != cleared.server_id
+    });
+    if elsewhere {
+        return Err(LoadError::at(
+            path,
+            Problem::Invalid(
+                "a tool cleared for secret with data arguments shares a server with every tool that outputs secret",
             ),
         ));
     }

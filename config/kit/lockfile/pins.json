@@ -1,0 +1,397 @@
+{
+  "lockfile_version": 1,
+  "release_epoch": 1,
+  "servers": {
+    "a": {
+      "discover": {
+        "cacheScope": "public",
+        "capabilities": {
+          "tools": {}
+        },
+        "resultType": "complete",
+        "supportedVersions": [
+          "2026-07-28"
+        ],
+        "ttlMs": 0
+      },
+      "endpoint": "tcp:tool-a:8080",
+      "identity": "spiffe://corp.example/tools/a",
+      "protocol_version": "2026-07-28",
+      "tools": {
+        "get_invoice": {
+          "definition": {
+            "description": "Look up an invoice.",
+            "inputSchema": {
+              "additionalProperties": false,
+              "properties": {
+                "invoice_id": {
+                  "maxLength": 256,
+                  "type": "string"
+                }
+              },
+              "required": [
+                "invoice_id"
+              ],
+              "type": "object"
+            },
+            "name": "get_invoice"
+          },
+          "policy": {
+            "args": [
+              {
+                "pointer": "/invoice_id",
+                "role": "store_key"
+              }
+            ],
+            "effect": "read",
+            "max_result_bytes": 1048576,
+            "max_result_nodes": 8192,
+            "output_label": {
+              "conf": "internal",
+              "integ": "trusted"
+            },
+            "sink_clearance": "secret",
+            "store_uri": "billing://invoices",
+            "trusted_fields": [
+              "/structuredContent/amount_due_minor",
+              "/structuredContent/currency"
+            ]
+          }
+        },
+        "pay_invoice": {
+          "definition": {
+            "description": "Pay an invoice.",
+            "inputSchema": {
+              "additionalProperties": false,
+              "properties": {
+                "amount": {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "currency": {
+                  "maxLength": 3,
+                  "minLength": 3,
+                  "type": "string"
+                },
+                "invoice_id": {
+                  "maxLength": 256,
+                  "type": "string"
+                },
+                "memo": {
+                  "maxLength": 256,
+                  "type": "string"
+                }
+              },
+              "required": [
+                "invoice_id",
+                "amount",
+                "currency"
+              ],
+              "type": "object"
+            },
+            "name": "pay_invoice"
+          },
+          "policy": {
+            "amount_binding": {
+              "entity_arg_pointer": "/invoice_id",
+              "lookup_entity_pointer": "/invoice_id",
+              "lookup_tool": "get_invoice",
+              "result_amount_pointer": "/structuredContent/amount_due_minor",
+              "result_currency_pointer": "/structuredContent/currency"
+            },
+            "args": [
+              {
+                "kind": "invoice",
+                "pointer": "/invoice_id",
+                "role": "entity"
+              },
+              {
+                "pointer": "/amount",
+                "role": "amount"
+              },
+              {
+                "pointer": "/currency",
+                "role": "currency"
+              },
+              {
+                "pointer": "/memo",
+                "role": "data"
+              }
+            ],
+            "effect": "mutating_financial",
+            "max_result_bytes": 1048576,
+            "max_result_nodes": 8192,
+            "output_label": {
+              "conf": "internal",
+              "integ": "untrusted_external"
+            },
+            "sink_clearance": "internal"
+          }
+        },
+        "update_invoice": {
+          "definition": {
+            "description": "Annotate an invoice.",
+            "inputSchema": {
+              "additionalProperties": false,
+              "properties": {
+                "invoice_id": {
+                  "maxLength": 256,
+                  "type": "string"
+                },
+                "text": {
+                  "maxLength": 256,
+                  "type": "string"
+                }
+              },
+              "required": [
+                "invoice_id",
+                "text"
+              ],
+              "type": "object"
+            },
+            "name": "update_invoice"
+          },
+          "policy": {
+            "args": [
+              {
+                "pointer": "/invoice_id",
+                "role": "store_key"
+              },
+              {
+                "pointer": "/text",
+                "role": "store_write"
+              }
+            ],
+            "effect": "mutating_internal",
+            "max_result_bytes": 1048576,
+            "max_result_nodes": 8192,
+            "output_label": {
+              "conf": "internal",
+              "integ": "untrusted_external"
+            },
+            "sink_clearance": "secret",
+            "store_uri": "billing://invoices"
+          }
+        }
+      }
+    },
+    "b": {
+      "discover": {
+        "cacheScope": "public",
+        "capabilities": {
+          "tools": {}
+        },
+        "resultType": "complete",
+        "supportedVersions": [
+          "2026-07-28"
+        ],
+        "ttlMs": 0
+      },
+      "endpoint": "tcp:tool-b:8080",
+      "identity": "spiffe://corp.example/tools/b",
+      "protocol_version": "2026-07-28",
+      "tools": {
+        "fetch": {
+          "definition": {
+            "description": "Fetch a URL.",
+            "inputSchema": {
+              "additionalProperties": false,
+              "properties": {
+                "url": {
+                  "maxLength": 256,
+                  "type": "string"
+                }
+              },
+              "required": [
+                "url"
+              ],
+              "type": "object"
+            },
+            "name": "fetch"
+          },
+          "policy": {
+            "args": [
+              {
+                "pointer": "/url",
+                "role": "sink_destination"
+              }
+            ],
+            "destinations": {
+              "https://partner.example": "confidential"
+            },
+            "effect": "read",
+            "max_result_bytes": 1048576,
+            "max_result_nodes": 8192,
+            "output_label": {
+              "conf": "internal",
+              "integ": "untrusted_external"
+            },
+            "sink_clearance": "public"
+          }
+        },
+        "get_note": {
+          "definition": {
+            "description": "Read a note.",
+            "inputSchema": {
+              "additionalProperties": false,
+              "properties": {
+                "key": {
+                  "maxLength": 256,
+                  "type": "string"
+                }
+              },
+              "required": [
+                "key"
+              ],
+              "type": "object"
+            },
+            "name": "get_note"
+          },
+          "policy": {
+            "args": [
+              {
+                "pointer": "/key",
+                "role": "store_key"
+              }
+            ],
+            "effect": "read",
+            "max_result_bytes": 1048576,
+            "max_result_nodes": 8192,
+            "output_label": {
+              "conf": "internal",
+              "integ": "untrusted_external"
+            },
+            "sink_clearance": "secret",
+            "store_uri": "notes://agent"
+          }
+        },
+        "post_public": {
+          "definition": {
+            "description": "Post to a public page.",
+            "inputSchema": {
+              "additionalProperties": false,
+              "properties": {
+                "text": {
+                  "maxLength": 256,
+                  "type": "string"
+                }
+              },
+              "required": [
+                "text"
+              ],
+              "type": "object"
+            },
+            "name": "post_public"
+          },
+          "policy": {
+            "args": [
+              {
+                "pointer": "/text",
+                "role": "data"
+              }
+            ],
+            "effect": "external_sink",
+            "max_result_bytes": 1048576,
+            "max_result_nodes": 8192,
+            "output_label": {
+              "conf": "public",
+              "integ": "untrusted_external"
+            },
+            "sink_clearance": "public"
+          }
+        },
+        "save_note": {
+          "definition": {
+            "description": "Save a note.",
+            "inputSchema": {
+              "additionalProperties": false,
+              "properties": {
+                "key": {
+                  "maxLength": 256,
+                  "type": "string"
+                },
+                "text": {
+                  "maxLength": 4096,
+                  "type": "string"
+                }
+              },
+              "required": [
+                "key",
+                "text"
+              ],
+              "type": "object"
+            },
+            "name": "save_note"
+          },
+          "policy": {
+            "args": [
+              {
+                "pointer": "/key",
+                "role": "store_key"
+              },
+              {
+                "pointer": "/text",
+                "role": "store_write"
+              }
+            ],
+            "effect": "mutating_internal",
+            "max_result_bytes": 1048576,
+            "max_result_nodes": 8192,
+            "output_label": {
+              "conf": "internal",
+              "integ": "untrusted_external"
+            },
+            "sink_clearance": "secret",
+            "store_uri": "notes://agent"
+          }
+        },
+        "search_notes": {
+          "definition": {
+            "description": "Search the notes.",
+            "inputSchema": {
+              "additionalProperties": false,
+              "properties": {
+                "query": {
+                  "maxLength": 256,
+                  "type": "string"
+                }
+              },
+              "required": [
+                "query"
+              ],
+              "type": "object"
+            },
+            "name": "search_notes"
+          },
+          "policy": {
+            "args": [
+              {
+                "pointer": "/query",
+                "role": "data"
+              }
+            ],
+            "effect": "read",
+            "max_result_bytes": 1048576,
+            "max_result_nodes": 8192,
+            "output_label": {
+              "conf": "secret",
+              "integ": "untrusted_agent_write"
+            },
+            "reads_stores": [
+              "notes://agent"
+            ],
+            "sink_clearance": "secret"
+          }
+        }
+      }
+    }
+  },
+  "stores": {
+    "billing://invoices": {
+      "case_insensitive": true
+    },
+    "notes://agent": {
+      "case_insensitive": false
+    }
+  }
+}
