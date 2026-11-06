@@ -9,7 +9,7 @@ empty volumes (`down -v` first), so it never touches a `pep-gate1` stack. Then i
   2. every volume's and socket's owner and mode, as the containers left them (§4);
   3. C-POSTURE, apart from the probe service (step 9). The profile's socket and io_uring
      denials run natively, under the profile, from the glibc image's perl; the int 0x80 and
-     x32 routes are checked in the profile's text only (no bypass programs);
+     x32 routes are checked in the profile's text here, and run for real in step 9's C-NET;
   4. the step 7 flows: the router's rows, reads, payments, a step-up approved, declined and
      timed out, every broker outcome, a wrong credential, a refused Call Proof, a restart's
      replay, and server b over its own network;

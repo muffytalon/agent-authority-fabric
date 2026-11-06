@@ -1,6 +1,6 @@
 # WEEK2_PLAN.md: pep-sidecar Week 2 (Gate 1)
 
-Status: 2026-11-06. Steps 1–8 are done, and step 8's acceptance passed with the real credentials (§4, as built). RV4's findings are folded in (Appendix C). 17 of the 18 decisions in §1 are CLOSED: D2 before step 2, the 13 others that block steps 3–7 in step 2, N1 and O1 on 2026-11-04, each with its §6 SPEC wording applied, and B1 on 2026-11-05. S1 stays OPEN until just before step 9. This plan supersedes two earlier drafts:
+Status: 2026-11-06. Steps 1–8 are done, and step 8's acceptance passed with the real credentials (§4, as built). RV4's findings are folded in (Appendix C). All 18 decisions in §1 are CLOSED: D2 before step 2, the 13 others that block steps 3–7 in step 2, N1 and O1 on 2026-11-04, B1 on 2026-11-05 and S1 on 2026-11-06, each with its §6 SPEC wording applied. This plan supersedes two earlier drafts:
 - **AP:** the attached Week 2 plan, "pep-sidecar Week 2 Plan: Toolchain, MCP Transport and Gate 1 Readiness", in the parent folder;
 - **MG:** the 29 Oct merge notes.
 
@@ -27,7 +27,7 @@ RV2's repo claims were re-checked on 2026-11-03, and its p256 build was reproduc
   - `tokens.rs`.
 
   The crypto crate, peer identity, the lock file and `tokens.rs` come first (§2), so the binary is never built against placeholder security checks. The binary comes next, then Compose, so every later step is tested in the real topology.
-- **Decisions:** 18 (§1). 17 are CLOSED: D2 first, then the 13 that block steps 3–7, in step 2 (2026-11-03), then N1 and O1 (2026-11-04), then B1 (2026-11-05). S1 stays OPEN until just before step 9. The largest closed in step 2 are:
+- **Decisions:** 18 (§1), all CLOSED: D2 first, then the 13 that block steps 3–7, in step 2 (2026-11-03), then N1 and O1 (2026-11-04), then B1 (2026-11-05), then S1 (2026-11-06). The largest closed in step 2 are:
   - **M1:** the MCP 2026-07-28 surface beyond `tools/call`;
   - **M2:** results that are not `complete`;
   - **P1:** payment outcomes under MCP's rule that a disconnect is a cancellation;
@@ -101,11 +101,11 @@ Gate 1 is evaluated on the release profile in the Compose topology (§4), not in
 | G6 | Decisions | Every §1 decision CLOSED, with its rationale recorded |
 
 ## 1. Decision register
-Status: 17 of 18 are CLOSED. One stays OPEN until just before the step it blocks:
+Status: all 18 are CLOSED:
 - **Step 2** closed the 14 that block steps 3–7: D2 before it, and the other 13 in it. All 13 closed as recommended. Three needed a further choice, made in step 2: T1's Call Proof server binding, U1's two error codes and L1's signer rule.
 - **N1 and O1** closed on 2026-11-04, as recommended after RV4's amendments.
 - **B1** closed on 2026-11-05, before step 8.
-- **S1** closes before step 9.
+- **S1** closed on 2026-11-06, before step 9.
 
 RV2 had T1, L1 and Q1 closing after step 2. RV2's own reordering (§2) moves them into step 2: crypto, peer identity and tokens now come before the binary, and the config's `pins` section uses the lockfile v1 payload. "Recommendation" is a label, not a decision; each closed decision ends with a **Decision** block. RV3's questions for step 2 are listed at the end of this section, with where each is now answered.
 
@@ -115,7 +115,7 @@ RV2 had T1, L1 and Q1 closing after step 2. RV2's own reordering (§2) moves the
 | D2 | Agent-facing transport | Decided: (a) Streamable HTTP, as a POST/JSON subset over the Unix socket | 7 | CLOSED 2026-11-03 |
 | N1 | Network model | Decided: (a) `network_mode: none` for the agent, the PEP, the operator and the oracle, with the broker on one internal network per tool server; model egress through a Unix-socket proxy (Week 4), PEP egress through the broker (Week 5) | 8 | CLOSED 2026-11-04 |
 | Q1 | Peer identity across PID namespaces; peer gid | Decided: (i) cross-namespace pidfd mode, plus a gid check | 4 | CLOSED 2026-11-03 |
-| S1 | Deployment profiles in Gate 1 | Compose only | 9 | Before step 9 |
+| S1 | Deployment profiles in Gate 1 | Decided: Compose (runc) only, on this machine | 9 | CLOSED 2026-11-06 |
 | M1 | MCP 2026-07-28 surface | Decided: the PEP is a full 2026-07-28 server to the agent, assigns each request's JSON-RPC id itself, and builds every upstream request itself | 7 | CLOSED 2026-11-03 |
 | M2 | Results that are not `complete` | Decided: never recorded. A payment's reservation follows the broker's explicit outcome (P1) | 7 | CLOSED 2026-11-03 |
 | P1 | Payment outcome mapping | Decided: the table in P1, with a defined point of forwarding and a re-check just before it. The step-up wait plus the upstream timeout stays at or under 55 s | 7 | CLOSED 2026-11-03 |
@@ -286,6 +286,16 @@ RV2 had T1, L1 and Q1 closing after step 2. RV2's own reordering (§2) moves the
   - Five-Track §5.3 says "zero bypasses in at least 50 attempts per profile".
   - Five-Track §3.3 lists gVisor `runsc` as optional.
 - **Recommendation:** Gate 1 covers the Compose (runc) profile only, and SPEC §4 names it. Only attack tests that run in Compose on this machine count toward its ≥ 50 (§3). The same-host process deployment and `runsc` are recorded as deferred; each needs its own ≥ 50 when added.
+
+**Decision: CLOSED 2026-11-06, as recommended.**
+- **Decided:** Gate 1 covers the Compose (runc) profile only. Only attack tests that run in Compose on this machine count toward G1's ≥ 50 (§3). Conformance and robustness checks run separately and do not count.
+- **Why:**
+  - Compose is the profile steps 8 to 11 build and measure.
+  - Most containment attacks test what Compose provides: the uids, the seccomp profile and the network namespaces. A same-host process profile would need its own design for them, not a second run of the same kit.
+  - `runsc` is optional in Five-Track §3.3, and has not been tried on WSL2.
+- **Deferred:** the same-host process deployment and gVisor `runsc`. Each needs its own ≥ 50 when added.
+- **CI:** the `compose` job runs on the runner's engine and kernel, so it catches regressions, but its runs do not count toward G1.
+- **SPEC:** §4's Gate 1 criteria now name the Compose profile and the evaluation machine (*applied*).
 
 ### M1. MCP 2026-07-28 surface
 **Evidence:** MCP 2026-07-28 [1][66]–[73]:
@@ -853,7 +863,7 @@ The unsigned lockfile v1 payload is also the config's `pins` section from step 7
 - **SPEC:** none.
 
 ### RV3's questions for step 2
-Step 2 (2026-11-03) confirmed every answer whose decision it closed, and settled the two left open (5 and 6). Answers 10, 11 and 13 belong to S1, O1 and B1, and stand as recommendations until those close.
+Step 2 (2026-11-03) confirmed every answer whose decision it closed, and settled the two left open (5 and 6). Answers 10, 11 and 13 belonged to S1, O1 and B1, and each decision closed as its answer says.
 
 | # | Question | Recommended answer | Where |
 |---|---|---|---|
@@ -1461,7 +1471,7 @@ networks:
 - **The AF_UNIX-only seccomp profile** (`seccomp-unix-only.json`). Docker's default profile, minus every socket family except `AF_UNIX`. It applies to the agent, the PEP, the operator and the probe; the broker and the tool servers need inet and keep Docker's default. The denial returns `EAFNOSUPPORT` rather than killing the process, so SDKs fail cleanly.
   - **Compat syscalls (RV4 #6).** Docker's default profile allows `socketcall` unconditionally, and allows the x86 sub-architecture on x86_64. With only the families removed, a static 64-bit binary using `int 0x80` created AF_INET, AF_NETLINK and AF_VSOCK sockets under `network_mode: none`, as uid 20001 with no capabilities. AF_VSOCK is outside the network namespace: a connect to host CID 2 got `ECONNRESET` from the far side.
   - So the profile removes `socketcall`, and empties x86_64's `subArchitectures` (x86 and x32). The reviewer verified that `int 0x80` then dies with SIGSYS, and native families still get `EAFNOSUPPORT`.
-  - This machine's kernel has `CONFIG_IA32_EMULATION=y`, `CONFIG_X86_X32_ABI=y`, `CONFIG_VSOCKETS=y` and `CONFIG_HYPERV_VSOCKETS=y`, and `/dev/vsock` is mode 0666 (Appendix A). So the x32 ABI is a third route, which the empty `subArchitectures` also closes. C-NET sweeps all three.
+  - This machine's kernel has `CONFIG_IA32_EMULATION=y`, `CONFIG_X86_X32_ABI=y`, `CONFIG_VSOCKETS=y` and `CONFIG_HYPERV_VSOCKETS=y`, and `/dev/vsock` is mode 0666 (Appendix A). So the x32 ABI is a third route, which the empty `subArchitectures` also closes. C-NET sweeps all three. Confirmed 2026-11-06: step 9 runs them for real against the profile, from a test-only probe in a test image, never a release image. The text checks in `compose/check.py` stay alongside it.
 - **Agent limits.** `pids_limit`, `mem_limit` and a private, size-capped `/tmp` (RV2). The root filesystem stays read-only.
 - **Secrets:**
   - Compose ignores `uid`, `gid` and `mode` on file secrets [80], so each tool server's credential (`broker-credential-a`, `broker-credential-b`) is a host file that is already 0400 and owned by 20003, bind-mounted read-only into the broker only (RV4 #7). The broker refuses to start unless the file holds only base64 characters, with no trailing newline;
@@ -1491,7 +1501,7 @@ networks:
   - every flow of `tests/e2e.rs` over the real sockets, with their journal, tool-log and decision-log effects: M1's router rows (raw HTTP from the glibc image's perl, as the agent's uid), a read, a payment, a step-up approved, declined and timed out, the refused and unknown outcomes, server b over its own network, a wrong credential (tool-b recreated with a verifier nothing matches, then restored, and the drift poll sets it serving again), a Call Proof the broker refuses (the PEP's published key overwritten, as its uid, with the P-256 generator), and a restart that replays spend and an unresolved invoice;
   - pep-log across a `docker restart` and a `docker kill` of the PEP, that the new boot's key replaces the stranger's, and the oracle's join.
 - **Result (2026-11-06, with the real credentials from the snippet above):** all 129 checks pass, on the images built from the digests pinned here, and `check.py` exits 0. The step-up timeout answers after 47 s, and the join covers 16 executions. Run it with `PEP_SECRETS_DIR=~/.config/pep-gate1/secrets python3 compose/check.py`.
-- **CI:** the `compose` job builds every image and runs `check.py` on each push, on the runner's engine and kernel, with throwaway credentials that §4's snippet makes for that run. Step 9's "CI job that runs the checks" extends this job. `check.py` holds no attack from the kit yet; the int 0x80 and x32 routes stay out of it.
+- **CI:** the `compose` job builds every image and runs `check.py` on each push, on the runner's engine and kernel, with throwaway credentials that §4's snippet makes for that run. Step 9's "CI job that runs the checks" extends this job. `check.py` holds no attack from the kit yet; the `int 0x80` and x32 probes arrive with step 9.
 - **Image ownership in volumes (Appendix B), settled:** on Docker 29.9.2, a fresh on-disk volume takes the owner and mode of the image's directory (`pep-state` 20002:20002 0700, `broker-state` 20003:20007 2750, and the tool states). The tmpfs volumes, mounted with `nocopy` where the image has no directory, keep their `driver_opts`.
 
 ## 5. Forward constraints (decided now so Week 2 does not paint later weeks into a corner)
@@ -1513,7 +1523,7 @@ networks:
 - **Latency.** The worst-case 1 MiB request is measured separately (O1), because hashing cost grows with bytes × depth.
 
 ## 6. Proposed SPEC and CLAUDE.md wording
-- **SPEC.md:** step 2 (2026-11-03) applied every item whose decision closed, keeping CRLF; each is marked *applied*. Four items wait for N1, S1 or O1 and are marked with that decision. Where the applied text differs from the wording proposed here, the item says so.
+- **SPEC.md:** step 2 (2026-11-03) applied every item whose decision closed, keeping CRLF; each is marked *applied*. Four items waited for N1, S1 or O1, and each was applied as its decision closed. Where the applied text differs from the wording proposed here, the item says so.
 - **CLAUDE.md:** owned by you, also CRLF. At your request, the five ready items were applied on 2026-11-03 (branch `week2/claude-md-wording`), each marked *applied*, with three corrections you approved; the two later items are marked with their step. CLAUDE.md's §3 and §4 rules are written without backticks, so the applied text drops them.
 
 **SPEC.md:**
@@ -1561,7 +1571,7 @@ networks:
     - strict argument schemas;
     - the R1 journal.
   - **Gate 1:**
-    - "evaluated on the Compose profile, on the evaluation machine; ≥ 50 attack tests, with conformance checks run separately" (S1, G1). *Waits for S1.*
+    - "evaluated on the Compose profile, on the evaluation machine; ≥ 50 attack tests, with conformance checks run separately" (S1, G1). *Applied 2026-11-06* as S1 closed, with SPEC's ">=" and with "containment attack tests".
     - "quarantined within the detection window T" (G2). *Applied*, with T = 10 s.
     - "added latency of the PEP plus the broker" (O1, G4). *Applied 2026-11-04* as O1 closed: the agent-side time minus the tool server's own time.
   - **Week 3:** "SQLite replaces the Week 2 journal; reconciliation replaces the Week 2 `NeedsReconcile` entity check". *Applied.*
