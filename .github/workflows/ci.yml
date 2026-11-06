@@ -1,9 +1,11 @@
 # The CLAUDE.md §2 verification loop, run on GitHub.
 #
-# - `verify` runs the seven commands exactly as CLAUDE.md §2 writes them, with the same
+# - `verify` runs the first seven commands exactly as CLAUDE.md §2 writes them, with the same
 #   RUSTFLAGS, on the toolchain rust-toolchain.toml pins.
 # - `ignored-tests` runs the three #[ignore] peercred tests. Two need root, which
 #   GitHub-hosted runners give through passwordless sudo.
+# - `attacks` runs the eighth, RV5's attack suite, in a job of its own because it takes
+#   minutes, then the fuzz suite for longer than the short run in `verify`.
 # - `compose` builds every image and runs compose/check.py, with throwaway credentials.
 # - The weekly run catches new RustSec advisories against an unchanged Cargo.lock.
 #
@@ -137,7 +139,29 @@ jobs:
             "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" \
             "RUSTFLAGS=$RUSTFLAGS" \
             "CARGO_TERM_COLOR=$CARGO_TERM_COLOR" \
-            cargo test --locked -- --ignored --nocapture
+            cargo test --locked --lib -- --ignored --nocapture
+
+  attacks:
+    # CLAUDE.md §2's eighth command, and a longer fuzz, in release, because several attacks
+    # measure. Each attack starts its own PEP, broker and tools, so they run one at a time.
+    name: Attack and fuzz suites
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install the pinned toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
+
+      - name: Attacks
+        run: cargo test --locked --release --test rv5_attacks -- --ignored --nocapture --test-threads=1
+
+      - name: Fuzz, 30 seconds a target
+        env:
+          RV5_FUZZ_SECS: "30"
+        run: cargo test --locked --release --test rv5_fuzz -- --nocapture
 
   compose:
     # WEEK2_PLAN step 8: builds every image and runs compose/check.py on the runner's engine and
