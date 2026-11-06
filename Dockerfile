@@ -15,9 +15,14 @@ RUN rustup target add x86_64-unknown-linux-musl && rustc --version | grep -q '^r
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
+# The target cache outlives this layer, and cargo trusts mtimes, which COPY preserves. So a source
+# older than the cached build would ship the stale binary: found when a build of an altered tree
+# left its PEP in the images built next from the real one. This layer only runs when the sources
+# changed, so touching them rebuilds the crate then, and the dependencies stay cached.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
-    cargo build --release --locked --target x86_64-unknown-linux-musl \
+    find Cargo.toml Cargo.lock src -type f -exec touch {} + \
+ && cargo build --release --locked --target x86_64-unknown-linux-musl \
         --bin pep-sidecar --bin stub-broker --bin stub-operator --bin stub-agent --bin stub-oracle \
  && cargo build --release --locked --bin stub-tool \
  && install -d /out \
