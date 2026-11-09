@@ -13,14 +13,21 @@
 //! an optional `drop_after_ms`, to hang up that long after sending instead of reading the reply.
 //! One line per attempt, then a count of each kind of reply.
 //!
+//! `stub-injector wire SOCKET FILE`: for `compose/checks.py`, which must see exactly what a client
+//! sends and what comes back. Each line is `{"parts":[TEXT,...]}`, written on one connection, with
+//! an optional `gap_ms` between parts and an optional `half_close`, to shut down the write side
+//! after them. One line per connection: `{"ms":N,"reply":TEXT}`, all the bytes up to the close.
+//!
 //! `FILE` may be `-`, for stdin.
 
 use std::fs;
 use std::io::{self, Read, Write};
+use std::net::Shutdown;
+use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use pep_sidecar::forward::UpstreamRequest;
 use pep_sidecar::http::MAX_BODY_BYTES;
@@ -30,6 +37,8 @@ use pep_sidecar::upstream::BrokerClient;
 
 /// The deadline for one replay.
 const TIMEOUT: Duration = Duration::from_secs(10);
+/// How long `wire` waits for the PEP to close: longer than any deadline it is there to see.
+const WIRE_TIMEOUT: Duration = Duration::from_secs(20);
 
 fn log(message: &str) {
     let stderr = io::stderr();
@@ -98,6 +107,55 @@ fn replay_to_broker(socket: &str, uid: u32, gid: u32, text: &str) -> ExitCode {
     }
 }
 
+/// Writes one line's parts on one connection, and reads to the close.
+fn wire_once(socket: &str, item: &JcsValue) -> Option<String> {
+    let parts: Vec<&str> = item
+        .get("parts")?
+        .as_array()?
+        .iter()
+        .filter_map(JcsValue::as_str)
+        .collect();
+    let gap = item
+        .get("gap_ms")
+        .and_then(JcsValue::as_i64)
+        .and_then(|ms| u64::try_from(ms).ok())
+        .map_or(Duration::ZERO, Duration::from_millis);
+    let started = Instant::now();
+    let mut stream = UnixStream::connect(socket).ok()?;
+    for (index, part) in parts.iter().enumerate() {
+        if index > 0 {
+            thread::sleep(gap);
+        }
+        // The PEP may hang up partway through, which is often what is being tested.
+        if stream.write_all(part.as_bytes()).is_err() {
+            break;
+        }
+    }
+    if item.get("half_close").is_some() {
+        drop(stream.shutdown(Shutdown::Write));
+    }
+    drop(stream.set_read_timeout(Some(WIRE_TIMEOUT)));
+    let mut reply = Vec::new();
+    drop(stream.read_to_end(&mut reply));
+    let text = String::from_utf8_lossy(&reply).into_owned();
+    Some(format!(
+        r#"{{"ms":{},"reply":{}}}"#,
+        started.elapsed().as_millis(),
+        JcsValue::string(text.as_str()).to_canonical_string()
+    ))
+}
+
+fn wire_to_pep(socket: &str, text: &str) -> ExitCode {
+    for line in text.lines() {
+        let Some(row) = parsed(line).and_then(|item| wire_once(socket, &item)) else {
+            log("a line cannot be read, or the socket refused it");
+            return ExitCode::from(2);
+        };
+        print(&row);
+    }
+    ExitCode::SUCCESS
+}
+
 fn send_to_pep(socket: &str, text: &str) -> ExitCode {
     let kinds = [
         "accepted",
@@ -158,7 +216,7 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
     let usage = || {
-        log("usage: stub-injector broker SOCKET UID GID FILE | pep SOCKET FILE");
+        log("usage: stub-injector broker SOCKET UID GID FILE | pep SOCKET FILE | wire SOCKET FILE");
         ExitCode::from(2)
     };
     match refs.as_slice() {
@@ -171,6 +229,10 @@ fn main() -> ExitCode {
         }
         ["pep", socket, file] => match read_input(file) {
             Some(text) => send_to_pep(socket, &text),
+            None => usage(),
+        },
+        ["wire", socket, file] => match read_input(file) {
+            Some(text) => wire_to_pep(socket, &text),
             None => usage(),
         },
         _ => usage(),

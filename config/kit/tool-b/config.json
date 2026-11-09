@@ -1574,7 +1574,22 @@
       "currency": "USD",
       "status": "declined"
     },
+    "INV-R-INPUT": {
+      "amount_due_minor": 1000,
+      "currency": "USD",
+      "status": "executed"
+    },
+    "INV-R-NOTYPE": {
+      "amount_due_minor": 1000,
+      "currency": "USD",
+      "status": "executed"
+    },
     "INV-R-TWO": {
+      "amount_due_minor": 1000,
+      "currency": "USD",
+      "status": "executed"
+    },
+    "INV-R-TYPE": {
       "amount_due_minor": 1000,
       "currency": "USD",
       "status": "executed"
@@ -1683,6 +1698,56 @@
       "amount_due_minor": 1000,
       "currency": "USD",
       "status": "pending"
+    },
+    "INV-V001": {
+      "amount_due_minor": 60000,
+      "currency": "USD",
+      "status": "executed"
+    },
+    "INV-V002": {
+      "amount_due_minor": 60000,
+      "currency": "USD",
+      "status": "executed"
+    },
+    "INV-V003": {
+      "amount_due_minor": 60000,
+      "currency": "USD",
+      "status": "executed"
+    },
+    "INV-V004": {
+      "amount_due_minor": 60000,
+      "currency": "USD",
+      "status": "executed"
+    },
+    "INV-V005": {
+      "amount_due_minor": 60000,
+      "currency": "USD",
+      "status": "executed"
+    },
+    "INV-V006": {
+      "amount_due_minor": 60000,
+      "currency": "USD",
+      "status": "executed"
+    },
+    "INV-V007": {
+      "amount_due_minor": 60000,
+      "currency": "USD",
+      "status": "executed"
+    },
+    "INV-V008": {
+      "amount_due_minor": 60000,
+      "currency": "USD",
+      "status": "executed"
+    },
+    "INV-V009": {
+      "amount_due_minor": 60000,
+      "currency": "USD",
+      "status": "executed"
+    },
+    "INV-V010": {
+      "amount_due_minor": 60000,
+      "currency": "USD",
+      "status": "executed"
     }
   },
   "listen": "tcp:0.0.0.0:8080",

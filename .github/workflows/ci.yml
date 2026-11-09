@@ -75,6 +75,9 @@ jobs:
       - name: 3. cargo test
         run: cargo test -- --nocapture
 
+      - name: "§3's checks that need a Rust test: each must run and pass"
+        run: python3 compose/checks.py --cargo
+
       - name: 4. lenient-numbers clippy and test
         run: cargo clippy --all-targets --features lenient-numbers -- -D warnings && cargo test --features lenient-numbers
 
@@ -201,10 +204,16 @@ jobs:
           echo "PEP_SECRETS_DIR=$secrets" >> "$GITHUB_ENV"
 
       - name: compose/check.py
-        run: python3 compose/check.py
+        # Its output is the proof of C-POSTURE's checks, read by compose/checks.py below. A named
+        # shell turns on pipefail, so tee cannot hide a failure.
+        shell: bash
+        run: python3 compose/check.py | tee "$RUNNER_TEMP/check.log"
 
       - name: compose/kit.py
         run: python3 compose/kit.py
+
+      - name: "compose/checks.py: §3's checks on the live stack"
+        run: python3 compose/checks.py --check-log "$RUNNER_TEMP/check.log"
 
       - name: compose/conformance.py
         run: python3 compose/conformance.py

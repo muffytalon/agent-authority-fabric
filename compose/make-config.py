@@ -143,19 +143,23 @@ KIT_PLAIN = [f"INV-K{n:03}" for n in range(1, 301)]
 KIT_DECLINED = [f"INV-D{n:03}" for n in range(1, 11)]
 KIT_PENDING = [f"INV-U{n:03}" for n in range(1, 11)]
 KIT_SLOW = [f"INV-S{n:03}" for n in range(1, 11)]
-KIT_ODD = ["INV-R-WRONG-ID", "INV-R-TWO", "INV-R-FORGED"]
+KIT_ODD = ["INV-R-WRONG-ID", "INV-R-TWO", "INV-R-FORGED", "INV-R-TYPE", "INV-R-NOTYPE", "INV-R-INPUT"]
+KIT_STEP_UP = [f"INV-V{n:03}" for n in range(1, 11)]
 KIT_BIG = ["INV-B001"]
 KIT_SMALL = ["INV-M001", "INV-M002"]
-kit_ids = KIT_PLAIN + KIT_DECLINED + KIT_PENDING + KIT_SLOW + KIT_ODD + KIT_BIG + KIT_SMALL
+kit_ids = KIT_PLAIN + KIT_DECLINED + KIT_PENDING + KIT_SLOW + KIT_ODD + KIT_BIG + KIT_SMALL + KIT_STEP_UP
 def row(status="executed", amount=1000):
     return {"amount_due_minor": amount, "currency": "USD", "status": status}
 kit_invoices = {invoice: row() for invoice in KIT_PLAIN + KIT_SLOW + KIT_SMALL}
 kit_invoices.update({invoice: row("declined") for invoice in KIT_DECLINED})
 kit_invoices.update({invoice: row("pending") for invoice in KIT_PENDING})
-kit_invoices.update({"INV-R-WRONG-ID": row(), "INV-R-TWO": row(), "INV-R-FORGED": row("declined"), "INV-B001": row(amount=150000)})
-kit_misbehave = {f"pay_invoice:{invoice}": "delay_ms:1500" for invoice in KIT_SLOW}
+kit_invoices.update({"INV-R-WRONG-ID": row(), "INV-R-TWO": row(), "INV-R-FORGED": row("declined"), "INV-B001": row(amount=150000),
+                     "INV-R-TYPE": row(), "INV-R-NOTYPE": row(), "INV-R-INPUT": row()})
+kit_invoices.update({invoice: row(amount=60000) for invoice in KIT_STEP_UP})
+kit_misbehave = {f"pay_invoice:{invoice}": "delay_ms:2200" for invoice in KIT_SLOW}
 kit_misbehave.update({"pay_invoice:INV-R-WRONG-ID": "wrong_id", "pay_invoice:INV-R-TWO": "two_responses",
-                      "pay_invoice:INV-R-FORGED": "forged_outcome"})
+                      "pay_invoice:INV-R-FORGED": "forged_outcome", "get_invoice:INV-R-TYPE": "unknown_result",
+                      "get_invoice:INV-R-NOTYPE": "absent_result", "pay_invoice:INV-R-INPUT": "input_required"})
 
 def kit_intent(kind, ids, max_calls=500, per_call=100000, cumulative=50000000, declines=40, per_entity=1):
     return {"release_epoch": 1, "lockfile_digest": digest(kit_pins),
@@ -166,11 +170,13 @@ def kit_intent(kind, ids, max_calls=500, per_call=100000, cumulative=50000000, d
 KIT_SECRET_INTENTS = 8
 kit_intents = {"pay": kit_intent("invoice", kit_ids), "pay2": kit_intent("invoice", kit_ids),
                "small": kit_intent("invoice", KIT_SMALL, per_call=1000, cumulative=1500),
-               "notes": kit_intent("recipient", ["rcpt_A"], per_entity=2)}
+               "notes": kit_intent("recipient", ["rcpt_A"], per_entity=2),
+               "ordered": dict(kit_intent("invoice", KIT_PLAIN),
+                               seq={"transitions": [[None, "get_invoice"], ["get_invoice", "pay_invoice"]]})}
 kit_intents.update({f"secret-{n}": kit_intent("invoice", KIT_PLAIN) for n in range(1, KIT_SECRET_INTENTS + 1)})
 kit_pep = dict(pep, pins=kit_pins, intents=kit_intents, limits=dict(
     pep["limits"], connections=48, episodes=12, episode_idle_ms=12000, episode_lifetime_ms=25000,
-    upstream_timeout_ms=3000, step_up_timeout_ms=2000))
+    upstream_timeout_ms=3000, step_up_timeout_ms=8000))
 kit_pep["lockfile"] = dict(pep["lockfile"])
 kit_broker = dict(broker, upstream_timeout_ms=3000)
 def kit_tool(server):

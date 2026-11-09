@@ -1570,7 +1570,22 @@
       "currency": "USD",
       "status": "declined"
     },
+    "INV-R-INPUT": {
+      "amount_due_minor": 1000,
+      "currency": "USD",
+      "status": "executed"
+    },
+    "INV-R-NOTYPE": {
+      "amount_due_minor": 1000,
+      "currency": "USD",
+      "status": "executed"
+    },
     "INV-R-TWO": {
+      "amount_due_minor": 1000,
+      "currency": "USD",
+      "status": "executed"
+    },
+    "INV-R-TYPE": {
       "amount_due_minor": 1000,
       "currency": "USD",
       "status": "executed"
@@ -1679,24 +1694,77 @@
       "amount_due_minor": 1000,
       "currency": "USD",
       "status": "pending"
+    },
+    "INV-V001": {
+      "amount_due_minor": 60000,
+      "currency": "USD",
+      "status": "executed"
+    },
+    "INV-V002": {
+      "amount_due_minor": 60000,
+      "currency": "USD",
+      "status": "executed"
+    },
+    "INV-V003": {
+      "amount_due_minor": 60000,
+      "currency": "USD",
+      "status": "executed"
+    },
+    "INV-V004": {
+      "amount_due_minor": 60000,
+      "currency": "USD",
+      "status": "executed"
+    },
+    "INV-V005": {
+      "amount_due_minor": 60000,
+      "currency": "USD",
+      "status": "executed"
+    },
+    "INV-V006": {
+      "amount_due_minor": 60000,
+      "currency": "USD",
+      "status": "executed"
+    },
+    "INV-V007": {
+      "amount_due_minor": 60000,
+      "currency": "USD",
+      "status": "executed"
+    },
+    "INV-V008": {
+      "amount_due_minor": 60000,
+      "currency": "USD",
+      "status": "executed"
+    },
+    "INV-V009": {
+      "amount_due_minor": 60000,
+      "currency": "USD",
+      "status": "executed"
+    },
+    "INV-V010": {
+      "amount_due_minor": 60000,
+      "currency": "USD",
+      "status": "executed"
     }
   },
   "listen": "tcp:0.0.0.0:8080",
   "log": "/var/lib/tool/tool.jsonl",
   "misbehave": {
+    "get_invoice:INV-R-NOTYPE": "absent_result",
+    "get_invoice:INV-R-TYPE": "unknown_result",
     "pay_invoice:INV-R-FORGED": "forged_outcome",
+    "pay_invoice:INV-R-INPUT": "input_required",
     "pay_invoice:INV-R-TWO": "two_responses",
     "pay_invoice:INV-R-WRONG-ID": "wrong_id",
-    "pay_invoice:INV-S001": "delay_ms:1500",
-    "pay_invoice:INV-S002": "delay_ms:1500",
-    "pay_invoice:INV-S003": "delay_ms:1500",
-    "pay_invoice:INV-S004": "delay_ms:1500",
-    "pay_invoice:INV-S005": "delay_ms:1500",
-    "pay_invoice:INV-S006": "delay_ms:1500",
-    "pay_invoice:INV-S007": "delay_ms:1500",
-    "pay_invoice:INV-S008": "delay_ms:1500",
-    "pay_invoice:INV-S009": "delay_ms:1500",
-    "pay_invoice:INV-S010": "delay_ms:1500"
+    "pay_invoice:INV-S001": "delay_ms:2200",
+    "pay_invoice:INV-S002": "delay_ms:2200",
+    "pay_invoice:INV-S003": "delay_ms:2200",
+    "pay_invoice:INV-S004": "delay_ms:2200",
+    "pay_invoice:INV-S005": "delay_ms:2200",
+    "pay_invoice:INV-S006": "delay_ms:2200",
+    "pay_invoice:INV-S007": "delay_ms:2200",
+    "pay_invoice:INV-S008": "delay_ms:2200",
+    "pay_invoice:INV-S009": "delay_ms:2200",
+    "pay_invoice:INV-S010": "delay_ms:2200"
   },
   "pins": "/etc/lockfile/pins.json",
   "record": "/var/lib/tool/requests.jsonl",

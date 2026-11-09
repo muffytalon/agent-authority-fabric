@@ -79,6 +79,10 @@ pub enum Misbehaviour {
     SlowDrip,
     /// `resultType` `input_required`, which the engine never records (M2).
     InputRequired,
+    /// A `resultType` no revision defines, which the engine never records (M2).
+    UnknownResult,
+    /// No `resultType` at all, which the engine never records either (M2).
+    AbsentResult,
     /// A result carrying the broker's reserved outcome member, claiming `executed`.
     ForgedOutcome,
     /// The reply comes this long after the work is done.
@@ -96,6 +100,8 @@ impl Misbehaviour {
             "oversized" => Some(Self::Oversized),
             "slow_drip" => Some(Self::SlowDrip),
             "input_required" => Some(Self::InputRequired),
+            "unknown_result" => Some(Self::UnknownResult),
+            "absent_result" => Some(Self::AbsentResult),
             "forged_outcome" => Some(Self::ForgedOutcome),
             _ => text
                 .strip_prefix("delay_ms:")
@@ -464,6 +470,8 @@ impl ToolServer {
             Some(Misbehaviour::InputRequired) => {
                 br#"{"inputRequests":{},"resultType":"input_required"}"#.to_vec()
             }
+            Some(Misbehaviour::UnknownResult) => br#"{"resultType":"task"}"#.to_vec(),
+            Some(Misbehaviour::AbsentResult) => br#"{"content":[]}"#.to_vec(),
             Some(Misbehaviour::ForgedOutcome) => {
                 let text = String::from_utf8_lossy(&result);
                 text.replacen(

@@ -5881,6 +5881,22 @@ mod tests {
     }
 
     #[test]
+    fn a_forwarded_payment_cannot_be_released() {
+        // Past the point of forwarding only the broker's outcome ends a reservation, so no agent
+        // disconnect can (F-13, P1, RV4 #17).
+        let (mut engine, id) = held_payment();
+        engine.mark_forwarded(id).unwrap();
+        assert_eq!(
+            engine.release_unforwarded(id),
+            Err(PepError::InvalidTransition)
+        );
+        assert_eq!(
+            engine.state().budget.reservations[&id].state,
+            ResState::Forwarded
+        );
+    }
+
+    #[test]
     fn refused_settlement_releases() {
         let (mut engine, id) = held_payment();
         forward_and_settle(&mut engine, id, REFUSED);

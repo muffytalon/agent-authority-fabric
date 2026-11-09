@@ -16,7 +16,7 @@ A denial alone proves little, because a broken fixture is denied too. So a test 
 guard that must refuse it, and it fails if that guard's reason is not in the decision log.
 
 The controls run first. A sandbox that blocks nothing because the probe is broken, or an oracle
-that reads the wrong files, would otherwise look exactly like a clean result. `--only` runs the
+that reads the wrong files, would otherwise look exactly like a clean result. `--only`, which may repeat, runs the
 tests whose name holds TEXT. Exits 0 only if everything held. Tokens never reach the output.
 """
 import base64, json, os, re, subprocess, sys, time
@@ -121,6 +121,15 @@ def raw_request(method, params=None, token=None, name=None, request_id=1, header
     return "\r\n".join(head) + body
 
 
+def notification(method, params):
+    """A JSON-RPC notification: it has no `id`, which is all that makes it one."""
+    body = json.dumps({"jsonrpc": "2.0", "method": method, "params": params}, separators=(",", ":"))
+    head = ["POST /mcp HTTP/1.1", "Host: pep.local", "Accept: application/json, text/event-stream",
+            "Content-Type: application/json", "MCP-Protocol-Version: 2026-07-28",
+            f"Content-Length: {len(body.encode())}", "Connection: close", "", ""]
+    return "\r\n".join(head) + body
+
+
 def call_request(tool, arguments, token, **options):
     return raw_request("tools/call", {"name": tool, "arguments": arguments}, token, tool, **options)
 
@@ -208,6 +217,38 @@ class Agent:
     def close(self):
         self.end()
         run(["docker", "rm", "-f", self.name], check=False)
+
+
+class Reply:
+    """What came back on one connection, as `stub-injector wire` saw it."""
+
+    def __init__(self, row):
+        self.text, self.ms = row["reply"], row["ms"]
+        self.head, _, self.raw_body = self.text.partition("\r\n\r\n")
+        first = self.head.split("\r\n")[0].split()
+        self.status = int(first[1]) if len(first) > 1 and first[1].isdigit() else None
+        try:
+            self.json = json.loads(self.raw_body)
+        except ValueError:
+            self.json = None
+
+    @property
+    def code(self):
+        return pointer(self.json, "/error/code")
+
+    def __repr__(self):
+        return f"{self.status}, {self.raw_body[:120]!r}"
+
+
+def wire(agent, *parts, gap_ms=0, half_close=False):
+    """Exactly these bytes on one connection, and exactly what came back."""
+    item = dict(parts=list(parts), gap_ms=gap_ms)
+    if half_close:
+        item["half_close"] = True
+    out = agent.execute(f"{BIN}/stub-injector", "wire", SOCKET, "-", stdin=json.dumps(item) + "\n")
+    if not out.stdout.strip():
+        raise SystemExit(f"stub-injector wire said nothing: {out.stderr.strip()[:200]}")
+    return Reply(json.loads(out.stdout.splitlines()[0]))
 
 
 def denied(reply):
@@ -557,6 +598,19 @@ def recorded():
     return lines("oracle", "/logs/tool-a/requests.jsonl")
 
 
+def upstream_call(tool, invoice, within_s=5):
+    """The request for `tool` on `invoice`, once the tool has it. A fixed sleep here would let an
+    attack act before its payment is upstream, on nothing, and hold whatever the PEP did."""
+    deadline = time.time() + within_s
+    while time.time() < deadline:
+        for line in reversed(recorded()):
+            body = json.loads(line["body"])
+            if pointer(body, "/params/name") == tool and pointer(body, "/params/arguments/invoice_id") == invoice:
+                return body
+        time.sleep(0.05)
+    raise SystemExit(f"{tool} {invoice} never reached the tool")
+
+
 @attack("C-FWD", "no agent header reaches upstream", expected="allow:1")
 def fwd_headers(window):
     agent = window.agent("notes")
@@ -824,11 +878,11 @@ def out_cancelled(window):
     agent.lookup(invoice)
     window.begin()
     thread, box = in_background(agent.pay, invoice)
-    time.sleep(0.4)
-    upstream_id = json.loads(recorded()[-1]["body"])["id"]
-    cancel = [raw_request("notifications/cancelled", {"requestId": request_id}, agent.token)
-              for request_id in ("stub-agent-1", upstream_id)]
-    agent.send([{"request": text} for text in cancel])
+    upstream_id = upstream_call("pay_invoice", invoice)["id"]
+    for request_id in (upstream_id, "stub-agent-1"):
+        reply = wire(agent, notification("notifications/cancelled", {"requestId": request_id}))
+        if reply.status != 202:
+            return f"the notification got {reply!r}, so it was never taken for one"
     thread.join()
     if status(box.get("reply")) != "executed":
         return f"the payment was {box.get('reply')}"
@@ -861,7 +915,7 @@ def out_restart(window):
     agent.lookup(invoice)
     window.begin()
     thread, _ = in_background(agent.pay, invoice)
-    time.sleep(0.4)
+    upstream_call("pay_invoice", invoice)
     restart_pep()
     thread.join()
     agent.eid = None   # that episode died with the PEP
@@ -1079,7 +1133,7 @@ def eng_upstream(window):
     agent.lookup(invoice)
     window.begin()
     thread, box = in_background(agent.pay, invoice)
-    time.sleep(0.4)
+    upstream_call("pay_invoice", invoice)
     agent.lookup(invoice)
     window.expected_now = "allow:2"   # the second lookup runs too
     retried = agent.pay(invoice)
@@ -1111,12 +1165,23 @@ def eng_caps(window):
     small.lookup(first)
     small.lookup(second)
     window.begin()
-    over = agent.pay("INV-B001", amount=150000)
+    thread, box = in_background(agent.pay, "INV-B001", 150000)
+    # It is over step_up_over_minor as well, so without the cap it would wait for an operator, and
+    # time out, and look refused. A person can say yes, so here one does.
+    while thread.is_alive():
+        asked = pointer(operator({"call": "pending"}), "/result/approvals/0")
+        if asked:
+            operator({"call": "approve", "eid": asked["eid"], "rid": asked["rid"],
+                      "action_digest": asked["action_digest"], "amount_minor": 150000})
+        time.sleep(0.05)
+    thread.join()
     paid = small.pay(first)
     past = small.pay(second)
     if status(paid) != "executed":
         return f"the payment inside the cap was {paid}"
-    return pay_refused(over) or pay_refused(past)
+    if "PerCallMaxExceeded" not in window.reasons():
+        return f"no per-call refusal: the payment over the cap was {box.get('reply')}"
+    return pay_refused(box.get("reply")) or pay_refused(past)
 
 
 @attack("C-ENG", "an undeclared nested argument", reason="UndeclaredArgument")
@@ -1391,7 +1456,7 @@ def remove_parked():
 def main():
     arguments = sys.argv[1:]
     keep = "--keep" in arguments
-    only = arguments[arguments.index("--only") + 1] if "--only" in arguments else None
+    only = [arguments[index + 1] for index, argument in enumerate(arguments) if argument == "--only"]
     if not os.environ.get("PEP_SECRETS_DIR"):
         raise SystemExit("set PEP_SECRETS_DIR (WEEK2_PLAN §4)")
     dc(*PROFILES, "build")
@@ -1405,11 +1470,11 @@ def main():
             return 1
         for entry in ATTACKS:
             name = f"{entry['category']} {entry['title']}"
-            if only and only not in name:
+            if only and not any(text in name for text in only):
                 continue
             tally["attacks"] += 1
             run_test(name, entry["expected"], entry["reason"], entry["open_ok"], entry["function"])
-        if not only or only == "G3":
+        if not only or "G3" in only:
             g3_proofs()
             g3_tokens()
             print(f"note G3: {replays['accepted']} of {replays['attempts']} accepted, across {replays['classes']} classes "
