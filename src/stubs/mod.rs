@@ -4,6 +4,7 @@
 //! `stub-operator` and `stub-oracle`.
 
 pub mod broker;
+pub mod drift;
 pub mod oracle;
 pub mod tool;
 

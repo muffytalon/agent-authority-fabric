@@ -1,14 +1,19 @@
-//! The `pep-sidecar` binary (`WEEK2_PLAN` §2a): `pep-sidecar CONFIG`.
+//! The `pep-sidecar` binary (`WEEK2_PLAN` §2a): `pep-sidecar CONFIG`, its healthcheck
+//! `pep-sidecar --check CONFIG`, and `pep-sidecar lock-scan CONFIG DRAFT` (L1), which writes to
+//! stdout the payload of `DRAFT` with every server's discover result and definitions as the
+//! broker serves them now; it binds no socket and holds no host authority.
 //!
 //! Boot, in order:
-//! 1. load the config ([`pep_sidecar::config`]) and claim the host's authority;
+//! 1. load the config ([`pep_sidecar::config`]) and the signed lockfile it names, verified
+//!    with its signers (L1), and claim the host's authority;
 //! 2. take the journal's lock, truncate a torn tail and replay it (R1);
 //! 3. restore the label store, the quarantines of the loaded lockfile, and the PEP-wide set of
 //!    entities with an unresolved payment;
 //! 4. generate this boot's Episode Token and Call Proof keys, and publish the Call Proof key
 //!    for the broker;
 //! 5. poll every server once through the broker (RV4 #5): a match serves it, a difference
-//!    quarantines it, and a failure suspends it;
+//!    quarantines it, and a failure suspends it; then one poller thread per server repeats the
+//!    poll every `drift_poll_ms`, ±20%, so drift is found within T (L1);
 //! 6. serve the control socket, then, last, the agent socket.
 //!
 //! Logs go to stderr, one line each, and never carry a token, proof, key or credential.
@@ -30,14 +35,15 @@ use pep_sidecar::actor::Services;
 use pep_sidecar::config::{self, Config};
 use pep_sidecar::decision_log::DecisionLog;
 use pep_sidecar::engine::{
-    EntityClaims, EntityKind, HostAuthority, MAX_IN_FLIGHT, ServerStates, Shared,
+    EntityClaims, EntityKind, HostAuthority, MAX_IN_FLIGHT, ServerState, ServerStates, Shared,
     UnresolvedEntities, encode_ulid,
 };
 use pep_sidecar::http::Caps;
 use pep_sidecar::jcs;
-use pep_sidecar::journal::{Journal, JournaledLabels, Record, replay, spawn_writer};
+use pep_sidecar::journal::{Journal, JournalHandle, JournaledLabels, Record, replay, spawn_writer};
+use pep_sidecar::lockfile::{MAX_ENVELOPE_BYTES, PinnedServer};
 use pep_sidecar::peercred::bind_safe_listener;
-use pep_sidecar::poll::{PollOutcome, poll};
+use pep_sidecar::poll::{PollOutcome, Served, fetch, poll, scanned_payload};
 use pep_sidecar::registry::{Registry, RegistryConfig, connection_share, new_ulid};
 use pep_sidecar::serve::{AgentContext, ControlContext, accept_agents, accept_loop, serve_control};
 use pep_sidecar::tokens::{Es256Signer, os_entropy, unix_now};
@@ -60,8 +66,17 @@ fn main() -> ExitCode {
     let (check, path) = match args.as_slice() {
         [path] => (false, path),
         [flag, path] if flag == "--check" => (true, path),
+        [command, config, draft] if command == "lock-scan" => {
+            return match lock_scan(Path::new(config), Path::new(draft)) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => {
+                    log(&format!("pep-sidecar lock-scan: {error}"));
+                    ExitCode::FAILURE
+                }
+            };
+        }
         _ => {
-            log("usage: pep-sidecar [--check] CONFIG");
+            log("usage: pep-sidecar [--check] CONFIG | pep-sidecar lock-scan CONFIG DRAFT");
             return ExitCode::from(2);
         }
     };
@@ -179,6 +194,7 @@ fn run(path: &Path) -> Result<(), String> {
         jcs::MAX_DEFINITION_BYTES,
     ));
     first_polls(&config, &broker, &servers, &journal, &mut entropy)?;
+    spawn_pollers(&config, &broker, &servers, &journal)?;
 
     // 6. Serve.
     let decisions = Arc::new(
@@ -336,15 +352,66 @@ fn check_fd_budget(config: &Config) -> Result<(), String> {
     Ok(())
 }
 
-fn load_config(path: &Path) -> Result<Config, String> {
+/// A file's bytes, if it is no larger than `cap`.
+fn read_capped(path: &Path, cap: u64) -> Result<Vec<u8>, String> {
     let size = fs::metadata(path)
-        .map_err(|error| format!("config {}: {error}", path.display()))?
+        .map_err(|error| format!("{}: {error}", path.display()))?
         .len();
-    if size > MAX_CONFIG_BYTES {
-        return Err(format!("config {}: larger than 16 MiB", path.display()));
+    if size > cap {
+        return Err(format!("{}: larger than {cap} bytes", path.display()));
     }
-    let bytes = fs::read(path).map_err(|error| format!("config {}: {error}", path.display()))?;
-    config::load(&bytes).map_err(|error| format!("config {}: {error}", path.display()))
+    fs::read(path).map_err(|error| format!("{}: {error}", path.display()))
+}
+
+fn load_config(path: &Path) -> Result<Config, String> {
+    let bytes = read_capped(path, MAX_CONFIG_BYTES).map_err(|error| format!("config {error}"))?;
+    let envelope_cap = u64::try_from(MAX_ENVELOPE_BYTES).unwrap_or(u64::MAX);
+    config::load(&bytes, &|lockfile| read_capped(lockfile, envelope_cap).ok())
+        .map_err(|error| format!("config {}: {error}", path.display()))
+}
+
+/// `lock-scan CONFIG DRAFT` (L1): fetches every server the draft names through the broker the
+/// config names, with no Call Proof, and writes the filled payload to stdout. Only the config's
+/// `broker` and `limits` sections are read, so it runs before any lockfile is signed.
+fn lock_scan(config_path: &Path, draft_path: &Path) -> Result<(), String> {
+    let settings = config::scan_settings(&read_capped(config_path, MAX_CONFIG_BYTES)?)
+        .map_err(|error| format!("config {}: {error}", config_path.display()))?;
+    let draft_cap = u64::try_from(jcs::MAX_DEFINITION_BYTES).unwrap_or(u64::MAX);
+    let draft = jcs::parse_with(
+        &read_capped(draft_path, draft_cap)?,
+        &jcs::ParseOptions::definition(),
+    )
+    .map_err(|error| format!("draft {}: {error}", draft_path.display()))?
+    .value;
+    let broker = BrokerClient::new(
+        settings.broker.socket.clone(),
+        settings.broker.uid,
+        settings.broker.gid,
+        jcs::MAX_DEFINITION_BYTES,
+    );
+    let mut entropy = os_entropy().map_err(|error| format!("entropy: {error}"))?;
+    let mut next_id = || {
+        let now = unix_now().ok()?.checked_mul(1000)?;
+        new_ulid(&mut entropy, now).ok().map(encode_ulid)
+    };
+    let deadline = millis(settings.drift_poll_deadline_ms);
+    let mut served: BTreeMap<String, Served> = BTreeMap::new();
+    let servers = draft
+        .get("servers")
+        .and_then(jcs::JcsValue::as_object)
+        .ok_or("the draft has no servers object")?;
+    for (server_id, _) in servers.entries() {
+        let now = fetch(&broker, server_id.as_str(), &mut next_id, deadline)
+            .map_err(|_| format!("server {}: the scan did not complete", server_id.as_str()))?;
+        served.insert(server_id.as_str().to_owned(), now);
+    }
+    let payload = scanned_payload(&draft, &served)?;
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+    out.write_all(&payload)
+        .and_then(|()| out.write_all(b"\n"))
+        .and_then(|()| out.flush())
+        .map_err(|error| format!("stdout: {error}"))
 }
 
 /// Writes the Call Proof public key for the broker, which re-reads it per connection: to a
@@ -370,7 +437,7 @@ fn first_polls(
     config: &Config,
     broker: &BrokerClient,
     servers: &ServerStates,
-    journal: &pep_sidecar::journal::JournalHandle,
+    journal: &JournalHandle,
     entropy: &mut fs::File,
 ) -> Result<(), String> {
     let deadline = millis(config.limits.drift_poll_deadline_ms);
@@ -379,7 +446,7 @@ fn first_polls(
         new_ulid(entropy, now).ok().map(encode_ulid)
     };
     for (server_id, pinned) in &config.pins.servers {
-        if servers.state(server_id) == pep_sidecar::engine::ServerState::Quarantined {
+        if servers.state(server_id) == ServerState::Quarantined {
             log(&format!(
                 "pep-sidecar: server {server_id}: quarantined (journal)"
             ));
@@ -402,6 +469,104 @@ fn first_polls(
         };
         applied.map_err(|error| format!("server states: {error}"))?;
         log(&format!("pep-sidecar: server {server_id}: {outcome:?}"));
+    }
+    Ok(())
+}
+
+/// The fraction of `drift_poll_ms` a poller's wait may move by, either way (L1: ±20%).
+const JITTER_DIVISOR: u64 = 5;
+
+/// `interval`, moved by up to a fifth either way, from two bytes of `entropy`; `interval` itself
+/// if they cannot be read. The wait never affects a decision, only when the next poll runs.
+fn jittered(interval: u64, entropy: &mut fs::File) -> Duration {
+    use std::io::Read as _;
+    let mut bytes = [0_u8; 2];
+    if entropy.read_exact(&mut bytes).is_err() {
+        return millis(interval);
+    }
+    let span = interval.checked_div(JITTER_DIVISOR).unwrap_or(0);
+    let width = span.saturating_mul(2).saturating_add(1);
+    let offset = u64::from(u16::from_be_bytes(bytes))
+        .checked_rem(width)
+        .unwrap_or(0);
+    millis(interval.saturating_sub(span).saturating_add(offset))
+}
+
+/// One poller thread per server (L1, RV4 #9), each with its own connection, so one slow server
+/// cannot delay another's detection past T. A difference quarantines the server in memory at
+/// once, then is journaled, fsynced (RV4 #5); if that write fails the quarantine still holds
+/// for this boot, and the next boot polls the server again. A quarantined server is never polled again: only
+/// a lockfile with a different digest lifts it, and that means a restart.
+fn spawn_pollers(
+    config: &Config,
+    broker: &Arc<BrokerClient>,
+    servers: &Arc<ServerStates>,
+    journal: &JournalHandle,
+) -> Result<(), String> {
+    let interval = config.limits.drift_poll_ms;
+    let deadline = millis(config.limits.drift_poll_deadline_ms);
+    for (server_id, pinned) in &config.pins.servers {
+        let server_id = server_id.clone();
+        let pinned: PinnedServer = pinned.clone();
+        let broker = broker.clone();
+        let servers = servers.clone();
+        let journal = journal.clone();
+        let digest = config.pins.digest.clone();
+        let name = format!("poll-{server_id}");
+        thread::Builder::new()
+            .name(name)
+            .spawn(move || {
+                let Ok(mut entropy) = os_entropy() else {
+                    // With no entropy there are no request ids, so no polls: fail closed.
+                    // A poisoned lock already reads as quarantined.
+                    let _ = servers.suspend(&server_id);
+                    log(&format!(
+                        "pep-sidecar: server {server_id}: no entropy, suspended for good"
+                    ));
+                    return;
+                };
+                let mut last = servers.state(&server_id);
+                loop {
+                    thread::sleep(jittered(interval, &mut entropy));
+                    if servers.state(&server_id) == ServerState::Quarantined {
+                        return;
+                    }
+                    let mut next_id = || {
+                        let now = unix_now().ok()?.checked_mul(1000)?;
+                        new_ulid(&mut entropy, now).ok().map(encode_ulid)
+                    };
+                    let outcome = poll(&*broker, &server_id, &pinned, &mut next_id, deadline);
+                    let applied = match outcome {
+                        PollOutcome::Matches => servers.set_serving(&server_id),
+                        PollOutcome::Failed => servers.suspend(&server_id),
+                        PollOutcome::Differs => {
+                            // Refused at once, so no call is forwarded to it after detection
+                            // (G2), then made durable (RV4 #5). A crash between the two only
+                            // means the next boot polls it again.
+                            let applied = servers.quarantine(&server_id);
+                            let record = Record::Quarantine {
+                                server_id: server_id.clone(),
+                                lockfile_digest: digest.clone(),
+                            };
+                            if let Err(error) = journal.commit(&[record]) {
+                                log(&format!(
+                                    "pep-sidecar: server {server_id}: quarantine not journaled: {error}"
+                                ));
+                            }
+                            applied
+                        }
+                    };
+                    if let Err(error) = applied {
+                        log(&format!("pep-sidecar: server {server_id}: {error}"));
+                    }
+                    let now = servers.state(&server_id);
+                    if now != last {
+                        log(&format!("pep-sidecar: server {server_id}: {outcome:?}, {now:?}"));
+                        last = now;
+                    }
+                }
+            })
+            .map_err(|error| format!("poller thread: {error}"))?;
     }
     Ok(())
 }

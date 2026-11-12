@@ -93,9 +93,14 @@ SWITCHES = {
     "taint_recorded": [("src/engine.rs",
                         "if let Err(error) = self.labels.record_all(&taint_writes, entry) {",
                         f"if let Err(error) = (if {off('taint_recorded')} {{ Ok(()) }} else {{ self.labels.record_all(&taint_writes, entry) }}) {{")],
+    # Since step 10 an undeclared argument meets two checks, the args list and the strict
+    # schema (L1, F-13): the defence is both, so the switch removes both.
     "undeclared": [("src/engine.rs",
-                    "if strict_arguments(tool) && !only_declared(",
-                    f"if !{off('undeclared')} && strict_arguments(tool) && !only_declared(")],
+                    "    if !only_declared(arguments, &mut Vec::new(), &declared_paths(tool)) {",
+                    f"    if !{off('undeclared')} && !only_declared(arguments, &mut Vec::new(), &declared_paths(tool)) {{"),
+                   ("src/engine.rs",
+                    "        && !schema.accepts(arguments)\n",
+                    f"        && !schema.accepts(arguments)\n        && !{off('undeclared')}\n")],
     "reserved_meta": [("src/engine.rs",
                        ".any(|(key, _)| is_reserved_meta(key.as_str()))",
                        f".any(|(key, _)| is_reserved_meta(key.as_str()) && !{off('reserved_meta')})")],

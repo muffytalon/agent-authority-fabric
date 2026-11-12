@@ -523,7 +523,8 @@ mod tests {
     const PINS: &str = r#"{"lockfile_version":1,"release_epoch":7,"stores":{},
       "servers":{"a":{"endpoint":"http://a/mcp","identity":"spiffe://a","protocol_version":"2026-07-28","discover":{},"tools":{
         "get_ticket":{"definition":{"name":"get_ticket"},"policy":{"effect":"read","args":[{"pointer":"/id","role":"data"}],
-          "sink_clearance":"confidential","output_label":{"conf":"internal","integ":"untrusted_external"},"max_result_bytes":65536,"max_result_nodes":1024}}}}}}"#;
+          "sink_clearance":"confidential","output_label":{"conf":"internal","integ":"untrusted_external"},"max_result_bytes":65536,"max_result_nodes":1024,
+          "strict_schema":{"type":"object","additionalProperties":false,"properties":{"id":{"type":"string"}}}}}}}}}"#;
     const AGENT: u32 = 20_001;
 
     static COUNTER: AtomicUsize = AtomicUsize::new(0);

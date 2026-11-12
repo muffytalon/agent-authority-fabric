@@ -1752,6 +1752,7 @@
   },
   "listen": "tcp:0.0.0.0:8080",
   "log": "/var/lib/tool/tool.jsonl",
+  "page_size": 2,
   "pins": "/etc/lockfile/pins.json",
   "record": "/var/lib/tool/requests.jsonl",
   "server_id": "b",

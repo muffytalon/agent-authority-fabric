@@ -6,7 +6,10 @@
 //!   builds, so nothing the proof does not cover can reach a tool server (F-16); and any status
 //!   but 200 means nothing was forwarded (SPEC §3.4);
 //! - forwards a proof-less request only for `server/discover` and `tools/list` (drift polls);
-//! - verifies a `tools/call`'s Call Proof against its own lockfile: the server, the epoch, the
+//! - loads the same signed lockfile as the PEP, read-only, and verifies it with its own copy of
+//!   the signer keys and thresholds (L1), so a lockfile the release and security signers did
+//!   not sign never routes a call;
+//! - verifies a `tools/call`'s Call Proof against that lockfile: the server, the epoch, the
 //!   tool's pinned digest, the `action_digest` it recomputes from the forwarded body, and for
 //!   a payment the forwarded amount and currency; the proof's `jti` enters the replay cache
 //!   (T1). A refused proof gets `refused`, with no tool result;
@@ -18,7 +21,9 @@
 //!   The tool's `status` maps as P1 says: `executed`, `declined` to `refused`, and anything
 //!   else, or no answer, to `unknown`;
 //! - gives each route its own share of connections for calls, so one slow server cannot take a
-//!   healthy server's, and a call past its route's share is refused unsent;
+//!   healthy server's, and a call past its route's share is refused unsent; and keeps one
+//!   connection per route, at least two, out of every share for the PEP's drift polls, so calls
+//!   in flight cannot starve the poller that would quarantine their server (RV4 #9);
 //! - logs one line per request, and for a call a line before the upstream write as well, so an
 //!   execution always has a broker record, even if the broker dies mid-call (RV5 V12).
 
@@ -36,12 +41,12 @@ use std::time::{Duration, Instant};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
-use crate::config::{Fields, LoadError, Problem, is_plain_name};
+use crate::config::{Fields, LoadError, Problem, is_plain_name, lockfile_section};
 use crate::engine::{ArgRole, EffectClass, EntityKind, ToolPolicy, entity_key, idempotency_key};
 use crate::forward::{CALL_PROOF_META_KEY, OUTCOME_META_KEY, PROTOCOL_VERSION};
 use crate::http::{Request, Status, response};
 use crate::jcs::{self, JcsObject, JcsString, JcsValue, ParseOptions};
-use crate::lockfile::{Lockfile, MAX_SERVER_ID, parse_payload};
+use crate::lockfile::{Lockfile, MAX_SERVER_ID, load_signed};
 use crate::peercred::{bind_safe_listener, require_peer};
 use crate::serve::accept_loop_with;
 use crate::tokens::{
@@ -56,8 +61,9 @@ use super::{answer_finally, now_ms};
 const RESERVED: &str = "dev.pep-sidecar/";
 /// The header carrying a payment's [`entity_key`] to the tool server (RV5 D5).
 pub const ENTITY_KEY_HEADER: &str = "Pep-Entity-Key";
-/// Connections kept out of the routes' shares, for proof-less drift polls (RV4 #9).
-const POLL_RESERVE: usize = 2;
+/// Fewest connections kept out of the routes' shares for proof-less drift polls (RV4 #9). The
+/// reserve is one per route, the PEP's one poller per server, and never below this.
+const MIN_POLL_RESERVE: usize = 2;
 
 /// One route: where a server listens, and its credential.
 #[derive(Clone)]
@@ -87,7 +93,7 @@ pub struct BrokerConfig {
     pub pep: (u32, u32),
     /// The PEP's published Call Proof key, re-read per connection.
     pub pep_key: PathBuf,
-    /// The lockfile payload, the same as the PEP's.
+    /// The signed lockfile's payload, the same as the PEP's, verified with this config's signers.
     pub pins: Lockfile,
     /// The static routes, by `server_id`.
     pub routes: BTreeMap<String, Route>,
@@ -119,13 +125,7 @@ pub fn load(
     let pep_ids = (pep.u32("uid")?, pep.u32("gid")?);
     pep.done()?;
     let pep_key = fields.path("pep_key")?;
-    let pins_path = fields.path("pins")?;
-    let pins_bytes =
-        read(&pins_path).ok_or_else(|| LoadError::at("pins", Problem::Invalid("unreadable")))?;
-    let pins_value = jcs::parse_with(&pins_bytes, &ParseOptions::definition())
-        .map_err(|error| LoadError::at("pins", Problem::Json(error)))?
-        .value;
-    let pins = parse_payload(&pins_value, "pins")?;
+    let pins = load_signed(&lockfile_section(fields.object("lockfile")?)?, read)?;
     let mut routes = BTreeMap::new();
     let mut route_fields = fields.object("routes")?;
     for (server_id, value, path) in route_fields.members() {
@@ -357,7 +357,7 @@ impl Broker {
         let routes = config.routes.len().max(1);
         let route_limit = config
             .connections
-            .saturating_sub(POLL_RESERVE)
+            .saturating_sub(routes.max(MIN_POLL_RESERVE))
             .checked_div(routes)
             .unwrap_or(0)
             .max(1);
@@ -969,9 +969,11 @@ mod tests {
             std::process::id()
         ));
         format!(
-            r#"{{"socket":"/s","pep":{{"uid":1,"gid":1}},"pep_key":"/k","pins":"/pins",
+            r#"{{"socket":"/s","pep":{{"uid":1,"gid":1}},"pep_key":"/k",
+            "lockfile":{{"path":"/lockfile","min_accepted_epoch":1,{}}},
             "routes":{{"a":{{"endpoint":"{endpoint}","credential":"/c"}},"b":{{"endpoint":"unix:/b","credential":"/c"}}}},
             "replay_cache_entries":16,"clock_skew_ms":0,"connections":{connections},"upstream_timeout_ms":1000,"log":"{}"}}"#,
+            crate::lockfile::fixtures::signers_json(),
             log.display()
         )
     }
@@ -997,9 +999,10 @@ mod tests {
             server("a", "unix:/a"),
             server("b", "unix:/b"),
         );
+        let lockfile = crate::lockfile::fixtures::signed_lockfile(&pins);
         load(config_text(connections, endpoint).as_bytes(), &|path| {
-            Some(if path == Path::new("/pins") {
-                pins.clone().into_bytes()
+            Some(if path == Path::new("/lockfile") {
+                lockfile.clone()
             } else {
                 credential.to_vec()
             })

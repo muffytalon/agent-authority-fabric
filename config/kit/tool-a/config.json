@@ -1,4 +1,7 @@
 {
+  "drift": {
+    "flag": "/var/lib/tool/drift"
+  },
   "invoices": {
     "INV-B001": {
       "amount_due_minor": 150000,

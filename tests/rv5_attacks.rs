@@ -54,22 +54,54 @@ const PINS: &str = r#"{"lockfile_version":1,"release_epoch":7,
         "get_invoice":{"definition":{"name":"get_invoice","description":"Look up an invoice.","inputSchema":{"type":"object"}},
           "policy":{"effect":"read","args":[{"pointer":"/invoice_id","role":"store_key"}],"store_uri":"billing://invoices","sink_clearance":"secret",
             "output_label":{"conf":"internal","integ":"trusted"},"trusted_fields":["/structuredContent/amount_due_minor","/structuredContent/currency"],
-            "max_result_bytes":65536,"max_result_nodes":1024}},
+            "max_result_bytes":65536,"max_result_nodes":1024,
+            "strict_schema":{"type":"object","additionalProperties":false,"required":["invoice_id"],"properties":{"invoice_id":{"type":"string","maxLength":256}}}}},
         "pay_invoice":{"definition":{"name":"pay_invoice","description":"Pay an invoice.","inputSchema":{"type":"object"}},
           "policy":{"effect":"mutating_financial","args":[{"pointer":"/invoice_id","role":"entity","kind":"invoice"},{"pointer":"/amount","role":"amount"},{"pointer":"/currency","role":"currency"},{"pointer":"/memo","role":"data"}],
             "sink_clearance":"internal","output_label":{"conf":"internal","integ":"untrusted_external"},
             "amount_binding":{"lookup_tool":"get_invoice","entity_arg_pointer":"/invoice_id","lookup_entity_pointer":"/invoice_id",
               "result_amount_pointer":"/structuredContent/amount_due_minor","result_currency_pointer":"/structuredContent/currency"},
-            "max_result_bytes":65536,"max_result_nodes":1024}}}},
+            "max_result_bytes":65536,"max_result_nodes":1024,
+            "strict_schema":{"type":"object","additionalProperties":false,"required":["invoice_id","amount","currency"],"properties":{"invoice_id":{"type":"string","maxLength":256},"amount":{"type":"integer","minimum":0,"maximum":9007199254740991},"currency":{"type":"string","minLength":3,"maxLength":3},"memo":{"type":"string","maxLength":4096}}}}}}},
     "b":{"endpoint":"unix:b","identity":"spiffe://tools/b","protocol_version":"2026-07-28",
       "discover":{"cacheScope":"public","capabilities":{"tools":{}},"resultType":"complete","supportedVersions":["2026-07-28"],"ttlMs":0},
       "tools":{
         "save_note":{"definition":{"name":"save_note","inputSchema":{"type":"object"}},
           "policy":{"effect":"mutating_internal","args":[{"pointer":"/key","role":"store_key"},{"pointer":"/text","role":"store_write"}],"store_uri":"notes://agent",
-            "sink_clearance":"secret","output_label":{"conf":"internal","integ":"untrusted_external"},"max_result_bytes":4194304,"max_result_nodes":1024}},
+            "sink_clearance":"secret","output_label":{"conf":"internal","integ":"untrusted_external"},"max_result_bytes":4194304,"max_result_nodes":1024,
+            "strict_schema":{"type":"object","additionalProperties":false,"required":["key","text"],"properties":{"key":{"type":"string"},"text":{"type":"string"}}}}},
         "get_note":{"definition":{"name":"get_note","inputSchema":{"type":"object"}},
           "policy":{"effect":"read","args":[{"pointer":"/key","role":"store_key"}],"store_uri":"notes://agent",
-            "sink_clearance":"secret","output_label":{"conf":"internal","integ":"untrusted_external"},"max_result_bytes":4194304,"max_result_nodes":1024}}}}}}"#;
+            "sink_clearance":"secret","output_label":{"conf":"internal","integ":"untrusted_external"},"max_result_bytes":4194304,"max_result_nodes":1024,
+            "strict_schema":{"type":"object","additionalProperties":false,"required":["key"],"properties":{"key":{"type":"string"}}}}}}}}}"#;
+
+/// The test lockfile signers: a release key and a security key, at fixed secrets.
+fn signers() -> [pep_sidecar::tokens::Es256Signer; 2] {
+    [0x11_u8, 0x22]
+        .map(|byte| pep_sidecar::tokens::Es256Signer::from_secret_bytes(&[byte; 32]).unwrap())
+}
+
+/// The `signers` and `thresholds` members of a `lockfile` section that trusts [`signers`].
+fn signers_json() -> String {
+    use base64::Engine as _;
+    let [release, security] = signers();
+    let key = |signer: &pep_sidecar::tokens::Es256Signer| {
+        base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(signer.verifier().to_sec1_uncompressed())
+    };
+    format!(
+        r#""signers":[{{"role":"release","key":"{}"}},{{"role":"security","key":"{}"}}],"thresholds":{{"release":1,"security":1}}"#,
+        key(&release),
+        key(&security)
+    )
+}
+
+/// `pins`, canonical, in a DSSE envelope signed by both [`signers`] (L1).
+fn signed_lockfile(pins: &JcsValue) -> Vec<u8> {
+    let [release, security] = signers();
+    let once = pep_sidecar::lockfile::sign(&pins.to_canonical_bytes(), &release).unwrap();
+    pep_sidecar::lockfile::sign(&once, &security).unwrap()
+}
 
 const INVOICES: &str = r#"{"INV-1001":{"amount_due_minor":30000,"currency":"USD","status":"executed"},
     "INV-2002":{"amount_due_minor":60000,"currency":"USD","status":"executed"},
@@ -211,6 +243,10 @@ impl World {
             fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
         }
         fs::write(self.path("pins.json"), &self.pins_text).unwrap();
+        let pins = jcs::parse_with(self.pins_text.as_bytes(), &ParseOptions::definition())
+            .unwrap()
+            .value;
+        fs::write(self.path("lockfile.dsse.json"), signed_lockfile(&pins)).unwrap();
         for (server, credential) in [("a", "credential-a"), ("b", "credential-b")] {
             fs::write(
                 self.path(&format!("secrets/verifier-{server}")),
@@ -238,12 +274,14 @@ impl World {
         fs::write(
             self.path("broker.json"),
             format!(
-                r#"{{"socket":"{}","pep":{{"uid":{uid},"gid":{gid}}},"pep_key":"{}","pins":"{}",
+                r#"{{"socket":"{}","pep":{{"uid":{uid},"gid":{gid}}},"pep_key":"{}",
+                "lockfile":{{"path":"{}","min_accepted_epoch":7,{}}},
                 "routes":{{"a":{{"endpoint":"unix:{}","credential":"{}"}},"b":{{"endpoint":"unix:{}","credential":"{}"}}}},
                 "replay_cache_entries":32768,"clock_skew_ms":2000,"connections":{},"upstream_timeout_ms":{},"log":"{}"}}"#,
                 p("broker/broker.sock"),
                 p("pub/call-proof.pub"),
-                p("pins.json"),
+                p("lockfile.dsse.json"),
+                signers_json(),
                 p("tool-a/tool.sock"),
                 p("secrets/cred-a"),
                 p("tool-b/tool.sock"),
@@ -271,16 +309,18 @@ impl World {
             format!(
                 r#"{{"agent":{{"uid":{uid},"gid":{gid},"socket":"{}"}},"operator":{{"uid":{uid},"gid":{gid},"socket":"{}"}},
                 "broker":{{"uid":{uid},"gid":{gid},"socket":"{}"}},"pep":{{"spiffe_id":"spiffe://corp.example/pep","pubkey_dir":"{}"}},
-                "lockfile":{{"path":"/etc/pep/lockfile.dsse.json","min_accepted_epoch":7,"signers":[],"thresholds":{{}}}},
+                "lockfile":{{"path":"{}","min_accepted_epoch":7,{}}},
                 "journal":{{"path":"{}","lock":"{}"}},"log":{{"path":"{}","max_bytes":{}}},
                 "limits":{{"connections":{},"control_connections":4,"header_bytes":16384,"body_bytes":{},"read_timeout_ms":{},
                   "upstream_timeout_ms":{},"step_up_timeout_ms":10000,"episode_idle_ms":600000,"episodes":8,"call_burst":{},"call_rate_per_s":{},
                   "clock_skew_ms":2000,"replay_cache_entries":32768}},
-                "intents":{{"pay1":{},"pay2":{},"notes":{}}},"pins":{}}}"#,
+                "intents":{{"pay1":{},"pay2":{},"notes":{}}}}}"#,
                 p("pep/agent.sock"),
                 p("ctl/ctl.sock"),
                 p("broker/broker.sock"),
                 p("pub"),
+                p("lockfile.dsse.json"),
+                signers_json(),
                 p("state/journal.jsonl"),
                 p("state/journal.lock"),
                 p("logs/decisions.jsonl"),
@@ -294,7 +334,6 @@ impl World {
                 intent("invoice", invoices),
                 intent("invoice", invoices),
                 intent("recipient", r#"["rcpt_A"]"#),
-                self.pins_text,
             ),
         )
         .unwrap();
@@ -1875,9 +1914,11 @@ fn v15_the_store_reader_rule_sees_every_writer() {
     let pins = r#"{"lockfile_version":1,"release_epoch":7,"stores":{"notes://agent":{"case_insensitive":false}},
       "servers":{"b":{"endpoint":"unix:b","identity":"spiffe://tools/b","protocol_version":"2026-07-28","discover":{},"tools":{
         "publish_note":{"definition":{"name":"publish_note"},"policy":{"effect":"external_sink","args":[{"pointer":"/key","role":"store_key"},{"pointer":"/text","role":"store_write"}],"store_uri":"notes://agent",
-          "sink_clearance":"internal","output_label":{"conf":"internal","integ":"untrusted_external"},"max_result_bytes":65536,"max_result_nodes":1024}},
+          "sink_clearance":"internal","output_label":{"conf":"internal","integ":"untrusted_external"},"max_result_bytes":65536,"max_result_nodes":1024,
+          "strict_schema":{"type":"object","additionalProperties":false,"required":["key","text"],"properties":{"key":{"type":"string"},"text":{"type":"string"}}}}},
         "search_notes":{"definition":{"name":"search_notes"},"policy":{"effect":"read","args":[{"pointer":"/query","role":"data"}],"reads_stores":["notes://agent"],
-          "sink_clearance":"secret","output_label":{"conf":"internal","integ":"untrusted_external"},"max_result_bytes":65536,"max_result_nodes":1024}}}}}}"#;
+          "sink_clearance":"secret","output_label":{"conf":"internal","integ":"untrusted_external"},"max_result_bytes":65536,"max_result_nodes":1024,
+          "strict_schema":{"type":"object","additionalProperties":false,"properties":{"query":{"type":"string"}}}}}}}}}"#;
     let value = jcs::parse_with(pins.as_bytes(), &ParseOptions::definition())
         .unwrap()
         .value;

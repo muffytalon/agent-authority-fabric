@@ -211,7 +211,7 @@ fn parsers_never_panic_on_hostile_bytes() {
             &bytes,
             "01JBAE0Z1TFCQ9Y41W9NF6YYMB",
         ));
-        drop(config::load(&bytes));
+        drop(config::load(&bytes, &|_| Some(bytes.clone())));
         let wire = mutate(&mut rng, REQUEST);
         let at = Instant::now() + Duration::from_secs(1);
         let mut stream = Bytes {
@@ -337,6 +337,8 @@ fn tool(name: &str, effect: EffectClass, args: Vec<ArgSpec>) -> ToolPolicy {
         amount_binding: None,
         max_result_bytes: 4096,
         max_result_nodes: 256,
+        schema: None,
+        step_up_over_minor: None,
     }
 }
 

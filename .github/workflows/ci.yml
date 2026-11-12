@@ -174,11 +174,16 @@ jobs:
     # run with §4's snippet, and sudo gives them §4's owners. They guard nothing but the stubs.
     name: Compose topology, posture and flows
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+
+      - name: The configs and the signed lockfiles match their generator
+        # make-config.py signs only a payload that changed, so with no signer keys here it fails
+        # on any change the checked-in envelopes do not cover.
+        run: python3 compose/make-config.py && git diff --exit-code -- config/
 
       - name: Record the engine and the kernel
         run: |
@@ -217,3 +222,6 @@ jobs:
 
       - name: compose/conformance.py
         run: python3 compose/conformance.py
+
+      - name: "compose/mutations.py: G2's rug pulls, each found by the drift poller within T"
+        run: python3 compose/mutations.py

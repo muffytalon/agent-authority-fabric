@@ -2,20 +2,31 @@
 
 Usage: python3 compose/make-config.py   (from the repository root)
 
-- config/lockfile/pins.json: the unsigned lockfile v1 payload (L1), shared by the PEP, the
-  broker and the tool servers.
-- config/pep/config.json: the PEP's config, with that payload as `pins`, and intents bound to
-  its digest.
-- config/broker/config.json: the broker's own config (RV4 #12).
+- config/lockfile/pins.json: the lockfile v1 payload (L1), JCS-canonical, which the stub tool
+  servers serve from.
+- config/lockfile/lockfile.dsse.json: the same payload, signed (L1): what the PEP and the broker
+  load, each verifying it with the signer keys in its own config.
+- config/pep/config.json: the PEP's config, naming the signed lockfile and its signers, with
+  intents bound to its digest.
+- config/broker/config.json: the broker's own config (RV4 #12), with the same lockfile section.
 - config/tool-a/config.json, config/tool-b/config.json: the stub tool servers.
+
+Signing. The public signer keys are checked in, in config/signers/{release,security}.pub; their
+private halves never are. A payload that changed is signed with `pepctl lock sign`, first by the
+release key, then by the security key, from PEP_SIGNERS_DIR (~/.config/pep-gate1/signers, made
+with `pepctl keygen`). A payload that did not change keeps its signed lockfile, so this runs
+anywhere, CI included, without the keys. PEPCTL names the binary (default: the release build
+under CARGO_TARGET_DIR, else target/release/pepctl).
 
 Paths are the containers' (§4's mounts), and the uids are §4's: agent 20001, PEP 20002,
 broker 20003, operator 20004, tool-a 20005, tool-b 20008. The digest is JCS over ASCII
 data with integers only, which sorted, compact JSON reproduces.
 """
-import base64, copy, hashlib, json, os
+import base64, copy, hashlib, json, os, subprocess, sys, tempfile
 
 def canonical(value):
+    """JCS for this data: ASCII keys, safe integers and short decimal fractions, which sorted,
+    compact JSON reproduces; the PEP refuses a signed payload that is not exactly canonical."""
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
 def digest(value):
@@ -26,9 +37,23 @@ DISCOVER = {"cacheScope": "public", "capabilities": {"tools": {}}, "resultType":
             "supportedVersions": ["2026-07-28"], "ttlMs": 0}
 ROW = {"max_result_bytes": 1048576, "max_result_nodes": 8192}
 
-def tool(name, description, schema, policy):
-    return {name: {"definition": {"name": name, "description": description, "inputSchema": schema},
-                   "policy": dict(policy, **ROW)}}
+MAX_SAFE = 9007199254740991
+
+def strict_of(schema):
+    """The strict argument schema (L1, F-13) for an upstream inputSchema written here: the same
+    tree, without extension keywords, and with every integer bounded above at 2^53 - 1."""
+    strict = {key: copy.deepcopy(value) for key, value in schema.items() if not key.startswith("x-")}
+    if "properties" in strict:
+        strict["properties"] = {name: strict_of(child) for name, child in strict["properties"].items()}
+    if strict.get("type") == "integer":
+        strict.setdefault("maximum", MAX_SAFE)
+    return strict
+
+def tool(name, description, schema, policy, annotations=None):
+    definition = {"name": name, "description": description, "inputSchema": schema}
+    if annotations:
+        definition["annotations"] = annotations
+    return {name: {"definition": definition, "policy": dict(policy, strict_schema=strict_of(schema), **ROW)}}
 
 def obj(properties, required):
     return {"type": "object", "properties": properties, "required": required, "additionalProperties": False}
@@ -75,12 +100,20 @@ def intent(kind, ids, uses, max_calls):
                        "max_calls": max_calls, "step_up_over_minor": 50000, "max_declines": 3},
             "entities": {"kind": kind, "ids": ids, "per_entity_max_uses": uses}, "seq": "unconstrained"}
 
+def public_key(role):
+    with open(f"config/signers/{role}.pub") as f:
+        return f.read().strip()
+
+LOCKFILE_SECTION = {"path": "/etc/lockfile/lockfile.dsse.json", "min_accepted_epoch": 1,
+                    "signers": [{"role": role, "key": public_key(role)} for role in ("release", "security")],
+                    "thresholds": {"release": 1, "security": 1}}
+
 pep = {
     "agent": {"uid": 20001, "gid": 20001, "socket": "/run/pep/agent.sock"},
     "operator": {"uid": 20004, "gid": 20004, "socket": "/run/pep-ctl/ctl.sock"},
     "broker": {"uid": 20003, "gid": 20003, "socket": "/run/broker/broker.sock"},
     "pep": {"spiffe_id": "spiffe://corp.example/pep", "pubkey_dir": "/run/pep-pub"},
-    "lockfile": {"path": "/etc/lockfile/lockfile.dsse.json", "min_accepted_epoch": 1, "signers": [], "thresholds": {}},
+    "lockfile": LOCKFILE_SECTION,
     "journal": {"path": "/var/lib/pep/journal.jsonl", "lock": "/var/lib/pep/journal.lock"},
     "log": {"path": "/var/log/pep/decisions.jsonl", "max_bytes": 67108864},
     "limits": {"connections": 32, "control_connections": 4, "header_bytes": 16384, "body_bytes": 1048576,
@@ -89,11 +122,10 @@ pep = {
     # compose/check.py makes seven payments across the pay intent. Two are on INV-5005, which
     # an operator decline and then a step-up timeout each release; `calls` still counts them.
     "intents": {"pay": intent("invoice", ["INV-1001", "INV-2002", "INV-3003", "INV-4004", "INV-5005"], 1, 8),
-                "notes": intent("recipient", ["rcpt_A"], 2, 5)},
-    "pins": pins}
+                "notes": intent("recipient", ["rcpt_A"], 2, 5)}}
 broker = {
     "socket": "/run/broker/broker.sock", "pep": {"uid": 20002, "gid": 20002},
-    "pep_key": "/run/pep-pub/call-proof.pub", "pins": "/etc/lockfile/pins.json",
+    "pep_key": "/run/pep-pub/call-proof.pub", "lockfile": LOCKFILE_SECTION,
     "routes": {"a": {"endpoint": "tcp:tool-a:8080", "credential": "/run/credential-a"},
                "b": {"endpoint": "tcp:tool-b:8080", "credential": "/run/credential-b"}},
     "replay_cache_entries": 32768, "clock_skew_ms": 2000, "connections": 64,
@@ -114,7 +146,45 @@ def write(path, value):
         f.write(json.dumps(value, indent=2, sort_keys=True) + "\n")
     print("wrote", path)
 
-write("config/lockfile/pins.json", pins)
+def pepctl():
+    if os.environ.get("PEPCTL"):
+        return os.environ["PEPCTL"]
+    target = os.environ.get("CARGO_TARGET_DIR", "target")
+    return os.path.join(target, "release", "pepctl")
+
+def signed_payload(path):
+    """The payload inside the signed lockfile at `path`, or None."""
+    try:
+        with open(path) as f:
+            envelope = json.load(f)
+        return base64.b64decode(envelope["payload"])
+    except (OSError, ValueError, KeyError):
+        return None
+
+def write_lockfile(directory, payload):
+    """`payload` as directory/pins.json, canonical, and signed as directory/lockfile.dsse.json."""
+    os.makedirs(directory, exist_ok=True)
+    text = canonical(payload).encode()
+    with open(f"{directory}/pins.json", "wb") as f:
+        f.write(text + b"\n")
+    print("wrote", f"{directory}/pins.json")
+    envelope = f"{directory}/lockfile.dsse.json"
+    if signed_payload(envelope) == text:
+        print("unchanged", envelope)
+        return
+    signers = os.path.expanduser(os.environ.get("PEP_SIGNERS_DIR", "~/.config/pep-gate1/signers"))
+    keys = [f"{signers}/{role}.key" for role in ("release", "security")]
+    if not all(os.path.exists(key) for key in keys):
+        sys.exit(f"{envelope}: the payload changed, and signing it needs {keys} (pepctl keygen)")
+    with tempfile.TemporaryDirectory() as work:
+        step = f"{work}/release.dsse.json"
+        subprocess.run([pepctl(), "lock", "sign", keys[0], f"{directory}/pins.json", step], check=True)
+        subprocess.run([pepctl(), "lock", "sign", keys[1], step, envelope], check=True)
+    if signed_payload(envelope) != text:
+        sys.exit(f"{envelope}: the signed payload is not the one written")
+    print("signed", envelope)
+
+write_lockfile("config/lockfile", pins)
 write("config/pep/config.json", pep)
 write("config/broker/config.json", broker)
 write("config/tool-a/config.json", tool_config("a"))
@@ -127,15 +197,31 @@ write("config/tool-b/config.json", tool_config("b"))
 # PEP and the ratchet never falls within an intent: so every attack takes invoices of its own,
 # and every attack that reads a secret takes an intent of its own.
 kit_a, kit_b = copy.deepcopy(server_a), copy.deepcopy(server_b)
+# Fixtures for step 10's rug pulls (§3): hints to flip (#13 to #15), an integer past 2^53 that
+# only an exact reader sees change (#23), and a fraction to respell as 0.50 (a negative).
+lookup = kit_a["get_invoice"]["definition"]
+lookup["annotations"] = {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False}
+lookup["inputSchema"]["x-max-invoice-number"] = 9007199254740993
+kit_b["search_notes"]["definition"]["inputSchema"]["x-score-floor"] = 0.5
 pay_tool = kit_a["pay_invoice"]
 pay_tool["definition"]["inputSchema"]["properties"]["memo"] = STRING
 pay_tool["policy"]["args"].append({"pointer": "/memo", "role": "data"})
+pay_tool["policy"]["strict_schema"] = strict_of(pay_tool["definition"]["inputSchema"])
 kit_a.update(tool("update_invoice", "Annotate an invoice.", obj({"invoice_id": STRING, "text": STRING}, ["invoice_id", "text"]), {
     "effect": "mutating_internal", "args": [{"pointer": "/invoice_id", "role": "store_key"}, {"pointer": "/text", "role": "store_write"}],
     "store_uri": "billing://invoices", "sink_clearance": "secret", "output_label": {"conf": "internal", "integ": "untrusted_external"}}))
 kit_b.update(tool("post_public", "Post to a public page.", obj({"text": STRING}, ["text"]), {
     "effect": "external_sink", "args": [{"pointer": "/text", "role": "data"}], "sink_clearance": "public",
     "output_label": {"conf": "public", "integ": "untrusted_external"}}))
+# #28: a payment on b whose amount is witnessed by a's lookup, so a can drift under it (RV4 #2).
+kit_b.update(tool("settle_invoice", "Settle an invoice from the notes ledger.", obj({"invoice_id": STRING,
+    "amount": {"type": "integer", "minimum": 0}, "currency": {"type": "string", "minLength": 3, "maxLength": 3}},
+    ["invoice_id", "amount", "currency"]), {
+    "effect": "mutating_financial", "args": [{"pointer": "/invoice_id", "role": "entity", "kind": "invoice"},
+        {"pointer": "/amount", "role": "amount"}, {"pointer": "/currency", "role": "currency"}],
+    "sink_clearance": "internal", "output_label": {"conf": "internal", "integ": "untrusted_external"},
+    "amount_binding": {"lookup_tool": "get_invoice", "entity_arg_pointer": "/invoice_id", "lookup_entity_pointer": "/invoice_id",
+        "result_amount_pointer": "/structuredContent/amount_due_minor", "result_currency_pointer": "/structuredContent/currency"}}))
 kit_pins = dict(pins, servers={
     "a": dict(pins["servers"]["a"], tools=kit_a), "b": dict(pins["servers"]["b"], tools=kit_b)})
 
@@ -174,7 +260,7 @@ kit_intents = {"pay": kit_intent("invoice", kit_ids), "pay2": kit_intent("invoic
                "ordered": dict(kit_intent("invoice", KIT_PLAIN),
                                seq={"transitions": [[None, "get_invoice"], ["get_invoice", "pay_invoice"]]})}
 kit_intents.update({f"secret-{n}": kit_intent("invoice", KIT_PLAIN) for n in range(1, KIT_SECRET_INTENTS + 1)})
-kit_pep = dict(pep, pins=kit_pins, intents=kit_intents, limits=dict(
+kit_pep = dict(pep, intents=kit_intents, limits=dict(
     pep["limits"], connections=48, episodes=12, episode_idle_ms=12000, episode_lifetime_ms=25000,
     upstream_timeout_ms=3000, step_up_timeout_ms=8000))
 kit_pep["lockfile"] = dict(pep["lockfile"])
@@ -183,11 +269,16 @@ def kit_tool(server):
     extra = {"invoices": kit_invoices, "record": "/var/lib/tool/requests.jsonl"}
     if server == "a":
         extra["misbehave"] = kit_misbehave
+        # compose/mutations.py names a rug pull in the flag file; empty, it serves the pins.
+        extra["drift"] = {"flag": "/var/lib/tool/drift"}
     else:
+        # The kit touches an empty flag (C-ENG); compose/mutations.py names other changes. Two
+        # tools a page, so #24 changes a page after the first.
         extra["drift"] = {"flag": "/var/lib/tool/drift", "change": "description"}
+        extra["page_size"] = 2
     return dict(tool_config(server), **extra)
 
-write("config/kit/lockfile/pins.json", kit_pins)
+write_lockfile("config/kit/lockfile", kit_pins)
 write("config/kit/pep/config.json", kit_pep)
 write("config/kit/broker/config.json", kit_broker)
 write("config/kit/tool-a/config.json", kit_tool("a"))

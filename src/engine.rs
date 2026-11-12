@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use crate::jcs::{self, JcsError, JcsObject, JcsValue, OriginRef, ParseOptions};
+use crate::schema::ArgSchema;
 
 /// Agent-visible code for every denial.
 pub const PEP_DENIED: &str = "PEP_DENIED";
@@ -129,6 +130,9 @@ pub enum PolicyError {
     /// An argument that the tool policy does not declare.
     #[error("undeclared argument")]
     UndeclaredArgument,
+    /// The arguments do not satisfy the tool's pinned strict schema (L1, F-13).
+    #[error("arguments violate the strict schema")]
+    SchemaViolation,
     /// The JSON-RPC id is already in flight or recorded.
     #[error("duplicate call id")]
     DuplicateCallId,
@@ -859,6 +863,12 @@ pub struct ToolPolicy {
     pub max_result_bytes: usize,
     /// Maximum number of values in a result.
     pub max_result_nodes: usize,
+    /// The strict argument schema every call must satisfy (L1, F-13). The lockfile requires
+    /// one for every tool, declaring exactly the pointers of `args`; `None` is for engine tests.
+    pub schema: Option<ArgSchema>,
+    /// A payment tool's own step-up threshold. The effective threshold is the smaller of this
+    /// and the intent's `step_up_over_minor` (L1).
+    pub step_up_over_minor: Option<u64>,
 }
 
 /// The pinned tool set (filled from the lockfile in Week 2).
@@ -2128,7 +2138,7 @@ impl PepEngine {
         let input = g_label(&*self.labels, state, tool, &canon, witness.as_ref())?;
 
         // 9. G_stepup (cannot deny)
-        let payment = payment.map(|plan| g_stepup(&intent.limits, plan));
+        let payment = payment.map(|plan| g_stepup(&intent.limits, tool, plan));
 
         let prov = witness.as_ref().map(witness_prov).unwrap_or_default();
         Ok(Plan {
@@ -2948,9 +2958,16 @@ fn g_canon<'a>(
         }
     }
     // Every member must be declared, at every depth: checking only the top-level keys would let
-    // `{"to": {"recipient": ..., "override_account": ...}}` through next to `/to/recipient`.
-    if strict_arguments(tool) && !only_declared(arguments, &mut Vec::new(), &declared_paths(tool)) {
+    // `{"to": {"recipient": ..., "override_account": ...}}` through next to `/to/recipient`. This
+    // holds for every tool (L1): an undeclared flag on a read could still change which record it
+    // returns, and the strict schema pins every argument a tool takes.
+    if !only_declared(arguments, &mut Vec::new(), &declared_paths(tool)) {
         return Err(fail(PolicyError::UndeclaredArgument));
+    }
+    if let Some(schema) = &tool.schema
+        && !schema.accepts(arguments)
+    {
+        return Err(fail(PolicyError::SchemaViolation));
     }
     if state.in_flight.contains_key(&call_id) || state.recorded_call_ids.contains(&call_id) {
         return Err(fail(PolicyError::DuplicateCallId));
@@ -2971,29 +2988,6 @@ fn g_canon<'a>(
 /// the Episode Token, so that no agent can forge a member the PEP adds or the broker verifies.
 fn is_reserved_meta(key: &str) -> bool {
     key.starts_with(RESERVED_META_PREFIX) && key != EPISODE_META_KEY
-}
-
-/// Whether every argument of a call must be declared. Only a read-only tool whose output is
-/// never trusted, that is not a sink and whose declared arguments are all free `Data` may take
-/// extra arguments (an optional flag such as `verbose`): no guard looks at its arguments. For
-/// any other tool an undeclared argument could change what the call does, which record a
-/// trusted or taint-labelled read returns (`invoice_number` next to the declared `invoice_id`),
-/// slip past a checked argument (`recipient_id` next to the checked `recipient`), or redirect
-/// its data (a proxy or callback URL).
-fn strict_arguments(tool: &ToolPolicy) -> bool {
-    tool.effect != EffectClass::ReadOnly
-        || is_sink(tool)
-        || !tool.trusted_fields.is_empty()
-        || tool.args.iter().any(|spec| spec.role != ArgRole::Data)
-}
-
-/// Whether a tool can carry data to a destination cleared below `Secret`.
-fn is_sink(tool: &ToolPolicy) -> bool {
-    tool.sink_clearance < Confidentiality::Secret
-        || tool
-            .args
-            .iter()
-            .any(|spec| spec.role == ArgRole::SinkDestination)
 }
 
 fn g_prov<'s>(
@@ -3349,8 +3343,14 @@ fn g_label(
     Ok(input)
 }
 
-fn g_stepup(limits: &Limits, mut payment: PaymentPlan) -> PaymentPlan {
-    payment.needs_approval = payment.amount > limits.step_up_over_minor;
+/// Step-up applies above the smaller of the intent's threshold and the tool's own (L1).
+fn g_stepup(limits: &Limits, tool: &ToolPolicy, mut payment: PaymentPlan) -> PaymentPlan {
+    let threshold = tool
+        .step_up_over_minor
+        .map_or(limits.step_up_over_minor, |own| {
+            own.min(limits.step_up_over_minor)
+        });
+    payment.needs_approval = payment.amount > threshold;
     payment
 }
 
@@ -3624,6 +3624,8 @@ mod tests {
             amount_binding: None,
             max_result_bytes: 1_048_576,
             max_result_nodes: 8192,
+            schema: None,
+            step_up_over_minor: None,
         }
     }
 
@@ -4679,9 +4681,14 @@ mod tests {
             denied(engine.evaluate_raw(&raw)),
             (GuardId::Canon, PolicyError::UndeclaredArgument)
         );
-        allow(
-            &mut engine,
-            &request(2, "get_ticket", r#"{"ticket_id":"T-1","verbose":true}"#),
+        // Every tool is strict now, a read-only one with only free data included (L1).
+        assert_eq!(
+            denied(engine.evaluate_raw(&request(
+                2,
+                "get_ticket",
+                r#"{"ticket_id":"T-1","verbose":true}"#
+            ))),
+            (GuardId::Canon, PolicyError::UndeclaredArgument)
         );
     }
 
@@ -5729,6 +5736,79 @@ mod tests {
         pending(pay(&mut engine, 4, "INV-1002", 50_001));
     }
 
+    /// The default engine, with its pins changed by `change` first.
+    fn engine_with_pins(change: impl FnOnce(&mut ToolPins)) -> PepEngine {
+        let mut pins = pins();
+        change(&mut pins);
+        PepEngine::new(
+            &HostAuthority::for_tests(),
+            intent(invoices(), limits("USD")),
+            pins,
+            SeqPolicy::Unconstrained,
+            serving(store()),
+            Ledger::empty(),
+        )
+        .unwrap()
+    }
+
+    fn pay_invoice_pin(pins: &mut ToolPins) -> &mut ToolPolicy {
+        pins.tools.get_mut("pay_invoice").unwrap()
+    }
+
+    #[test]
+    fn a_tool_step_up_threshold_lowers_the_intents() {
+        // The smaller of the intent's threshold (50,000) and the tool's applies (L1).
+        let mut engine =
+            engine_with_pins(|pins| pay_invoice_pin(pins).step_up_over_minor = Some(20_000));
+        lookup(&mut engine, 1, "INV-1001", "20000", "USD");
+        allowed(pay(&mut engine, 2, "INV-1001", 20_000));
+        lookup(&mut engine, 3, "INV-1002", "20001", "USD");
+        pending(pay(&mut engine, 4, "INV-1002", 20_001));
+        // A tool threshold above the intent's never raises it.
+        let mut engine =
+            engine_with_pins(|pins| pay_invoice_pin(pins).step_up_over_minor = Some(90_000));
+        lookup(&mut engine, 1, "INV-1001", "50001", "USD");
+        pending(pay(&mut engine, 2, "INV-1001", 50_001));
+    }
+
+    #[test]
+    fn arguments_must_satisfy_the_strict_schema() {
+        let schema = ArgSchema::parse(
+            &jcs::parse(
+                br#"{"type":"object","additionalProperties":false,"required":["invoice_id","amount","currency"],
+                "properties":{"invoice_id":{"type":"string","maxLength":16},
+                "amount":{"type":"integer","minimum":1,"maximum":40000},
+                "currency":{"type":"string","minLength":3,"maxLength":3}}}"#,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let mut engine = engine_with_pins(|pins| pay_invoice_pin(pins).schema = Some(schema));
+        lookup(&mut engine, 1, "INV-1001", "30000", "USD");
+        for (id, arguments) in [
+            (
+                2,
+                r#"{"invoice_id":"INV-1001","amount":30000,"currency":"USDX"}"#,
+            ),
+            (
+                3,
+                r#"{"invoice_id":"INV-1001","amount":45000,"currency":"USD"}"#,
+            ),
+            (
+                4,
+                r#"{"invoice_id":"INV-1001-AND-MORE-TEXT","amount":30000,"currency":"USD"}"#,
+            ),
+        ] {
+            // G_canon, before any guard that reads the arguments' meaning.
+            assert_eq!(
+                denied(engine.evaluate_raw(&request(id, "pay_invoice", arguments))),
+                (GuardId::Canon, PolicyError::SchemaViolation),
+                "{arguments}"
+            );
+        }
+        allowed(pay(&mut engine, 5, "INV-1001", 30_000));
+    }
+
     #[test]
     fn awaiting_step_up_cannot_be_forwarded_or_settled() {
         // F-15: no forward, and no settlement, until a human approves.
@@ -6483,14 +6563,17 @@ mod tests {
         // get_ticket may return 1 MiB. Leave room for less than one more.
         engine.state.result_bytes_remaining = 512 * 1024;
         assert_eq!(
-            denied(engine.evaluate_raw(&request(1, "get_ticket", r#"{"id":"T-1"}"#))),
+            denied(engine.evaluate_raw(&request(1, "get_ticket", r#"{"ticket_id":"T-1"}"#))),
             (GuardId::Budget, PolicyError::RecordsExhausted)
         );
         // Room for one in flight, but not for two.
         engine.state.result_bytes_remaining = 3 * 1024 * 1024 / 2;
-        allow(&mut engine, &request(2, "get_ticket", r#"{"id":"T-1"}"#));
+        allow(
+            &mut engine,
+            &request(2, "get_ticket", r#"{"ticket_id":"T-1"}"#),
+        );
         assert_eq!(
-            denied(engine.evaluate_raw(&request(3, "get_ticket", r#"{"id":"T-1"}"#))),
+            denied(engine.evaluate_raw(&request(3, "get_ticket", r#"{"ticket_id":"T-1"}"#))),
             (GuardId::Budget, PolicyError::RecordsExhausted)
         );
         // A recorded result is charged by what it really took.
@@ -6504,7 +6587,10 @@ mod tests {
     fn only_a_lookups_arguments_are_kept() {
         let mut engine = engine();
         lookup(&mut engine, 1, "INV-1001", "30000", "USD");
-        allow(&mut engine, &request(2, "get_ticket", r#"{"id":"T-1"}"#));
+        allow(
+            &mut engine,
+            &request(2, "get_ticket", r#"{"ticket_id":"T-1"}"#),
+        );
         engine
             .record_result_raw("2", &complete(br#"{"content":[]}"#))
             .unwrap();
@@ -7569,10 +7655,15 @@ mod tests {
                 "{name}"
             );
         }
-        // A read-only tool with untrusted output, no location and no sink may still take flags.
-        allow(
-            &mut engine,
-            &request(2, "get_ticket", r#"{"ticket_id":"T-1","verbose":true}"#),
+        // Since step 10 a read-only tool with untrusted output, no location and no sink takes
+        // no extra flags either: its strict schema pins every argument (L1).
+        assert_eq!(
+            denied(engine.evaluate_raw(&request(
+                2,
+                "get_ticket",
+                r#"{"ticket_id":"T-1","verbose":true}"#
+            ))),
+            (GuardId::Canon, PolicyError::UndeclaredArgument)
         );
     }
 

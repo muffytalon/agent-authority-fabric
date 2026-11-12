@@ -334,6 +334,29 @@ impl Es256Signer {
         self.verifier.clone()
     }
 
+    /// The 32-byte big-endian secret scalar, for `pepctl` to store a signer key. Nothing else
+    /// may call it: per-boot keys never leave the process.
+    #[must_use]
+    pub fn secret_bytes(&self) -> [u8; SCALAR_BYTES] {
+        let mut bytes = [0_u8; SCALAR_BYTES];
+        bytes.copy_from_slice(self.key.to_bytes().as_ref());
+        bytes
+    }
+
+    /// Signs `message` (ECDSA over SHA-256) and returns the signature in ASN.1 DER, low-S: the
+    /// encoding DSSE signatures use (L1).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TokenError::Signing`] if signing fails.
+    pub fn sign_der(&self, message: &[u8]) -> Result<Vec<u8>, TokenError> {
+        let signature: Signature = self
+            .key
+            .try_sign(message)
+            .map_err(|_| TokenError::Signing)?;
+        Ok(signature.normalize_s().to_der().as_bytes().to_vec())
+    }
+
     /// Signs `claims` as a compact JWS of type `typ`, with a low-S signature.
     fn sign(&self, typ: &str, claims: JcsObject) -> Result<String, TokenError> {
         let header = object(vec![
@@ -413,6 +436,24 @@ impl Es256Verifier {
     #[must_use]
     pub fn kid(&self) -> &str {
         &self.kid
+    }
+
+    /// Checks an ASN.1 DER ECDSA signature over `message` (L1's DSSE signatures). The DER must
+    /// be strict, so one signature has one encoding; high-S is accepted, because DSSE signers
+    /// such as cosign do not normalize S, and a lockfile counts keys, not signatures.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TokenError::SignatureEncoding`] for anything that is not strict DER, and
+    /// [`TokenError::BadSignature`] if it does not verify.
+    pub fn verify_der(&self, message: &[u8], der: &[u8]) -> Result<(), TokenError> {
+        let signature = Signature::from_der(der).map_err(|_| TokenError::SignatureEncoding)?;
+        if signature.to_der().as_bytes() != der {
+            return Err(TokenError::SignatureEncoding);
+        }
+        self.key
+            .verify(message, &signature)
+            .map_err(|_| TokenError::BadSignature)
     }
 
     /// Checks a compact JWS of type `typ` against this key and returns its claims. The order

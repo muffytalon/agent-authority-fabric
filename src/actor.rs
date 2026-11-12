@@ -1109,15 +1109,18 @@ mod tests {
       "servers":{"a":{"endpoint":"http://a/mcp","identity":"spiffe://a","protocol_version":"2026-07-28","discover":{},"tools":{
         "get_invoice":{"definition":{"name":"get_invoice"},"policy":{"effect":"read","args":[{"pointer":"/invoice_id","role":"store_key"}],
           "store_uri":"billing://invoices","sink_clearance":"secret","output_label":{"conf":"internal","integ":"trusted"},
-          "trusted_fields":["/structuredContent/amount_due_minor","/structuredContent/currency"],"max_result_bytes":65536,"max_result_nodes":1024}},
+          "trusted_fields":["/structuredContent/amount_due_minor","/structuredContent/currency"],"max_result_bytes":65536,"max_result_nodes":1024,
+          "strict_schema":{"type":"object","additionalProperties":false,"required":["invoice_id"],"properties":{"invoice_id":{"type":"string"}}}}},
         "pay_invoice":{"definition":{"name":"pay_invoice"},"policy":{"effect":"mutating_financial",
           "args":[{"pointer":"/invoice_id","role":"entity","kind":"invoice"},{"pointer":"/amount","role":"amount"},{"pointer":"/currency","role":"currency"}],
           "sink_clearance":"internal","output_label":{"conf":"internal","integ":"untrusted_external"},
           "amount_binding":{"lookup_tool":"get_invoice","entity_arg_pointer":"/invoice_id","lookup_entity_pointer":"/invoice_id",
             "result_amount_pointer":"/structuredContent/amount_due_minor","result_currency_pointer":"/structuredContent/currency"},
-          "max_result_bytes":65536,"max_result_nodes":1024}},
+          "max_result_bytes":65536,"max_result_nodes":1024,
+          "strict_schema":{"type":"object","additionalProperties":false,"required":["invoice_id","amount","currency"],"properties":{"invoice_id":{"type":"string"},"amount":{"type":"integer","minimum":0,"maximum":9007199254740991},"currency":{"type":"string","minLength":3,"maxLength":3}}}}},
         "get_secret":{"definition":{"name":"get_secret"},"policy":{"effect":"read","args":[{"pointer":"/id","role":"data"}],
-          "sink_clearance":"confidential","output_label":{"conf":"secret","integ":"untrusted_external"},"max_result_bytes":65536,"max_result_nodes":1024}}}}}}"#;
+          "sink_clearance":"confidential","output_label":{"conf":"secret","integ":"untrusted_external"},"max_result_bytes":65536,"max_result_nodes":1024,
+          "strict_schema":{"type":"object","additionalProperties":false,"properties":{"id":{"type":"string"}}}}}}}}}"#;
 
     static COUNTER: AtomicUsize = AtomicUsize::new(0);
 

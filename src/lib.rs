@@ -4,6 +4,7 @@
 //! - [`jcs`] parses wire bytes with the JCS-strict-NFC profile and computes digests.
 //! - [`engine`] runs the nine-guard pipeline, the two-phase budget and the taint labels.
 //! - [`forward`] builds the only bytes the PEP sends upstream (F-16).
+//! - [`lockfile`] verifies the signed lockfile, and [`schema`] holds its strict argument schemas.
 //! - `peercred` (Linux and macOS) checks peer credentials and binds the socket safely.
 //! - [`tokens`] signs and verifies the Episode Token and the Call Proof, and keeps the replay
 //!   cache.
@@ -30,6 +31,7 @@ pub mod peercred;
 pub mod poll;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod registry;
+pub mod schema;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod serve;
 #[cfg(any(target_os = "linux", target_os = "macos"))]

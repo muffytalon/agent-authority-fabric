@@ -34,22 +34,54 @@ const PINS: &str = r#"{"lockfile_version":1,"release_epoch":7,
         "get_invoice":{"definition":{"name":"get_invoice","description":"Look up an invoice.","inputSchema":{"type":"object"}},
           "policy":{"effect":"read","args":[{"pointer":"/invoice_id","role":"store_key"}],"store_uri":"billing://invoices","sink_clearance":"secret",
             "output_label":{"conf":"internal","integ":"trusted"},"trusted_fields":["/structuredContent/amount_due_minor","/structuredContent/currency"],
-            "max_result_bytes":65536,"max_result_nodes":1024}},
+            "max_result_bytes":65536,"max_result_nodes":1024,
+            "strict_schema":{"type":"object","additionalProperties":false,"required":["invoice_id"],"properties":{"invoice_id":{"type":"string","maxLength":256}}}}},
         "pay_invoice":{"definition":{"name":"pay_invoice","description":"Pay an invoice.","inputSchema":{"type":"object"}},
           "policy":{"effect":"mutating_financial","args":[{"pointer":"/invoice_id","role":"entity","kind":"invoice"},{"pointer":"/amount","role":"amount"},{"pointer":"/currency","role":"currency"}],
             "sink_clearance":"internal","output_label":{"conf":"internal","integ":"untrusted_external"},
             "amount_binding":{"lookup_tool":"get_invoice","entity_arg_pointer":"/invoice_id","lookup_entity_pointer":"/invoice_id",
               "result_amount_pointer":"/structuredContent/amount_due_minor","result_currency_pointer":"/structuredContent/currency"},
-            "max_result_bytes":65536,"max_result_nodes":1024}}}},
+            "max_result_bytes":65536,"max_result_nodes":1024,
+            "strict_schema":{"type":"object","additionalProperties":false,"required":["invoice_id","amount","currency"],"properties":{"invoice_id":{"type":"string","maxLength":256},"amount":{"type":"integer","minimum":0,"maximum":9007199254740991},"currency":{"type":"string","minLength":3,"maxLength":3}}}}}}},
     "b":{"endpoint":"unix:b","identity":"spiffe://tools/b","protocol_version":"2026-07-28",
       "discover":{"cacheScope":"public","capabilities":{"tools":{}},"resultType":"complete","supportedVersions":["2026-07-28"],"ttlMs":0},
       "tools":{
         "save_note":{"definition":{"name":"save_note","inputSchema":{"type":"object"}},
           "policy":{"effect":"mutating_internal","args":[{"pointer":"/key","role":"store_key"},{"pointer":"/text","role":"store_write"}],"store_uri":"notes://agent",
-            "sink_clearance":"secret","output_label":{"conf":"internal","integ":"untrusted_external"},"max_result_bytes":65536,"max_result_nodes":1024}},
+            "sink_clearance":"secret","output_label":{"conf":"internal","integ":"untrusted_external"},"max_result_bytes":65536,"max_result_nodes":1024,
+            "strict_schema":{"type":"object","additionalProperties":false,"required":["key","text"],"properties":{"key":{"type":"string"},"text":{"type":"string"}}}}},
         "get_note":{"definition":{"name":"get_note","inputSchema":{"type":"object"}},
           "policy":{"effect":"read","args":[{"pointer":"/key","role":"store_key"}],"store_uri":"notes://agent",
-            "sink_clearance":"secret","output_label":{"conf":"internal","integ":"untrusted_external"},"max_result_bytes":65536,"max_result_nodes":1024}}}}}}"#;
+            "sink_clearance":"secret","output_label":{"conf":"internal","integ":"untrusted_external"},"max_result_bytes":65536,"max_result_nodes":1024,
+            "strict_schema":{"type":"object","additionalProperties":false,"required":["key"],"properties":{"key":{"type":"string"}}}}}}}}}"#;
+
+/// The test lockfile signers: a release key and a security key, at fixed secrets.
+fn signers() -> [pep_sidecar::tokens::Es256Signer; 2] {
+    [0x11_u8, 0x22]
+        .map(|byte| pep_sidecar::tokens::Es256Signer::from_secret_bytes(&[byte; 32]).unwrap())
+}
+
+/// The `signers` and `thresholds` members of a `lockfile` section that trusts [`signers`].
+fn signers_json() -> String {
+    use base64::Engine as _;
+    let [release, security] = signers();
+    let key = |signer: &pep_sidecar::tokens::Es256Signer| {
+        base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(signer.verifier().to_sec1_uncompressed())
+    };
+    format!(
+        r#""signers":[{{"role":"release","key":"{}"}},{{"role":"security","key":"{}"}}],"thresholds":{{"release":1,"security":1}}"#,
+        key(&release),
+        key(&security)
+    )
+}
+
+/// `pins`, canonical, in a DSSE envelope signed by both [`signers`] (L1).
+fn signed_lockfile(pins: &JcsValue) -> Vec<u8> {
+    let [release, security] = signers();
+    let once = pep_sidecar::lockfile::sign(&pins.to_canonical_bytes(), &release).unwrap();
+    pep_sidecar::lockfile::sign(&once, &security).unwrap()
+}
 
 /// One world: its directory, its processes, and how to reach them.
 struct World {
@@ -64,6 +96,8 @@ struct World {
     capture: bool,
     /// Extra members for tool-a's config: its misbehaviour.
     tool_a_extra: String,
+    /// Extra members for tool-b's config.
+    tool_b_extra: String,
     /// The upstream deadline, for the PEP and the broker.
     upstream_ms: u64,
 }
@@ -140,6 +174,7 @@ impl World {
                 .map_or_else(|| "credential-b".to_owned(), str::to_owned),
             capture: false,
             tool_a_extra: String::new(),
+            tool_b_extra: String::new(),
             upstream_ms: 5000,
         }
     }
@@ -160,15 +195,20 @@ impl World {
         self.base.join(name)
     }
 
-    fn write_files(&self) {
-        let (uid, gid) = ids();
+    fn make_dirs(&self) {
         for name in ["pep", "ctl", "broker", "tool-a", "tool-b"] {
             dir(&self.base, name, 0o750);
         }
         for name in ["pub", "state", "logs", "secrets"] {
             dir(&self.base, name, 0o700);
         }
+    }
+
+    /// Writes every config, the pins and the signed lockfile, replacing any already there.
+    fn write_files(&self) {
+        let (uid, gid) = ids();
         fs::write(self.path("pins.json"), &self.pins_text).unwrap();
+        fs::write(self.path("lockfile.dsse.json"), signed_lockfile(&self.pins)).unwrap();
         for (server, credential) in [("a", "credential-a"), ("b", "credential-b")] {
             fs::write(
                 self.path(&format!("secrets/verifier-{server}")),
@@ -203,7 +243,7 @@ impl World {
                     if server == "a" {
                         self.tool_a_extra.as_str()
                     } else {
-                        ""
+                        self.tool_b_extra.as_str()
                     },
                 ),
             )
@@ -212,12 +252,14 @@ impl World {
         fs::write(
             self.path("broker.json"),
             format!(
-                r#"{{"socket":"{}","pep":{{"uid":{uid},"gid":{gid}}},"pep_key":"{}","pins":"{}",
+                r#"{{"socket":"{}","pep":{{"uid":{uid},"gid":{gid}}},"pep_key":"{}",
+                "lockfile":{{"path":"{}","min_accepted_epoch":7,{}}},
                 "routes":{{"a":{{"endpoint":"unix:{}","credential":"{}"}},"b":{{"endpoint":"unix:{}","credential":"{}"}}}},
                 "replay_cache_entries":1000,"clock_skew_ms":2000,"connections":16,"upstream_timeout_ms":{},"log":"{}"}}"#,
                 p("broker/broker.sock"),
                 p("pub/call-proof.pub"),
-                p("pins.json"),
+                p("lockfile.dsse.json"),
+                signers_json(),
                 p("tool-a/tool.sock"),
                 p("secrets/cred-a"),
                 p("tool-b/tool.sock"),
@@ -239,16 +281,18 @@ impl World {
             format!(
                 r#"{{"agent":{{"uid":{uid},"gid":{gid},"socket":"{}"}},"operator":{{"uid":{uid},"gid":{gid},"socket":"{}"}},
                 "broker":{{"uid":{uid},"gid":{gid},"socket":"{}"}},"pep":{{"spiffe_id":"spiffe://corp.example/pep","pubkey_dir":"{}"}},
-                "lockfile":{{"path":"/etc/pep/lockfile.dsse.json","min_accepted_epoch":7,"signers":[],"thresholds":{{}}}},
+                "lockfile":{{"path":"{}","min_accepted_epoch":7,{}}},
                 "journal":{{"path":"{}","lock":"{}"}},"log":{{"path":"{}","max_bytes":1048576}},
                 "limits":{{"connections":16,"control_connections":4,"header_bytes":16384,"body_bytes":1048576,"read_timeout_ms":5000,
                   "upstream_timeout_ms":{},"step_up_timeout_ms":{},"episode_idle_ms":600000,"episodes":4,"call_burst":50,"call_rate_per_s":50,
                   "clock_skew_ms":2000,"replay_cache_entries":1000}},
-                "intents":{{"pay":{},"notes":{},"chaos":{}}},"pins":{}}}"#,
+                "intents":{{"pay":{},"notes":{},"chaos":{}}}}}"#,
                 p("pep/agent.sock"),
                 p("ctl/ctl.sock"),
                 p("broker/broker.sock"),
                 p("pub"),
+                p("lockfile.dsse.json"),
+                signers_json(),
                 p("state/journal.jsonl"),
                 p("state/journal.lock"),
                 p("logs/decisions.jsonl"),
@@ -261,7 +305,6 @@ impl World {
                     r#"["INV-6001","INV-6002","INV-6003","INV-6004","INV-6005","INV-6006","INV-6007"]"#,
                     10
                 ),
-                self.pins_text,
             ),
         )
         .unwrap();
@@ -278,6 +321,7 @@ impl World {
 
     /// Starts the tool servers and the broker, then the PEP.
     fn start(mut self) -> Self {
+        self.make_dirs();
         self.write_files();
         for server in ["a", "b"] {
             let mut child = Self::spawn(
@@ -309,6 +353,32 @@ impl World {
         ));
         self.start_pep();
         self
+    }
+
+    /// Signs a lockfile with a new digest (a pinned `instructions`), rewrites the configs bound
+    /// to it, and restarts the PEP on it.
+    fn relock(&mut self, instructions: &str) {
+        self.pins_text = self.pins_text.replacen(
+            r#"{"lockfile_version":1,"#,
+            &format!(r#"{{"lockfile_version":1,"instructions":"{instructions}","#),
+            1,
+        );
+        self.pins = jcs::parse_with(self.pins_text.as_bytes(), &ParseOptions::definition())
+            .unwrap()
+            .value;
+        self.write_files();
+        self.start_pep();
+    }
+
+    /// Restarts the PEP on an empty journal, so no quarantine carries over, and returns its
+    /// boot log.
+    fn restart_fresh(&mut self) -> Vec<String> {
+        if let Some(mut old) = self.pep.take() {
+            drop(old.kill());
+            drop(old.wait());
+        }
+        drop(fs::remove_file(self.path("state/journal.jsonl")));
+        self.start_pep()
     }
 
     /// Starts (or restarts) the PEP, and returns its boot log.
@@ -1133,4 +1203,249 @@ fn a_server_that_drifts_is_quarantined_at_the_next_poll() {
             .any(|line| text(line, "/type").as_deref() == Some("quarantine"));
         assert!(quarantined, "{change}");
     }
+}
+
+#[test]
+fn the_poller_quarantines_within_t_and_only_a_new_lockfile_lifts_it() {
+    // L1: one poller per server, every 5 s ±20% with a 3 s deadline, so T = 10 s; no restart.
+    const T: Duration = Duration::from_secs(10);
+    let mut world = World::new(10_000, None);
+    let flag = world.path("state/drift");
+    world.tool_a_extra = format!(
+        r#","drift":{{"flag":"{}","change":"description"}}"#,
+        flag.display()
+    );
+    let mut world = world.start();
+    let invoice = r#"{"invoice_id":"INV-1001"}"#;
+    let token = world.start_episode("pay");
+    let read = world.call(1, "get_invoice", invoice, &token);
+    assert!(read.get("result").is_some(), "{read:?}");
+    fs::write(&flag, "").unwrap();
+    let drifted = Instant::now();
+    let mut id = 2;
+    while !denied(&world.call(id, "get_invoice", invoice, &token)) {
+        assert!(drifted.elapsed() < T, "not quarantined within T");
+        id += 1;
+        thread::sleep(Duration::from_millis(250));
+    }
+    let detected = drifted.elapsed();
+    assert!(detected <= T, "{detected:?}");
+    // The whole server is hidden; the other server still serves.
+    let names = |list: &JcsValue| -> Vec<String> {
+        list.pointer("/result/tools")
+            .and_then(JcsValue::as_array)
+            .unwrap()
+            .iter()
+            .filter_map(|tool| {
+                tool.get("name")
+                    .and_then(JcsValue::as_str)
+                    .map(str::to_owned)
+            })
+            .collect()
+    };
+    let listed = names(&world.agent(id + 1, "tools/list", None, "", Some(&token)));
+    assert_eq!(listed, ["get_note", "save_note"], "{listed:?}");
+    let quarantines = |world: &World| {
+        world
+            .lines("state/journal.jsonl")
+            .iter()
+            .filter(|line| text(line, "/type").as_deref() == Some("quarantine"))
+            .count()
+    };
+    assert_eq!(quarantines(&world), 1);
+    // A revert after detection does not lift it (#27), nor does a restart on the same lockfile
+    // (RV4 #5): the journal keeps it, and the PEP does not poll that server again.
+    fs::remove_file(&flag).unwrap();
+    world.start_pep();
+    let token = world.start_episode("pay");
+    assert!(denied(&world.call(1, "get_invoice", invoice, &token)));
+    thread::sleep(T);
+    assert!(denied(&world.call(2, "get_invoice", invoice, &token)));
+    // A lockfile with a different digest does.
+    world.relock("re-reviewed after the rug pull");
+    let token = world.start_episode("pay");
+    let read = world.call(1, "get_invoice", invoice, &token);
+    assert!(read.get("result").is_some(), "{read:?}");
+    assert_eq!(quarantines(&world), 1);
+}
+
+/// Every mutation of `WEEK2_PLAN` §3, and the negative, as each server's first poll sees it: the
+/// stub serves the change its flag file names, and the PEP boots on an empty journal. The
+/// timer that finds the same within T is `the_poller_quarantines_within_t_…` here, and
+/// compose/mutations.py for each mutation in Compose.
+#[test]
+fn every_rug_pull_quarantines_its_server_and_the_negative_does_not() {
+    let mut world = World::new(10_000, None);
+    let flag_a = world.path("state/drift-a");
+    let flag_b = world.path("state/drift-b");
+    world.tool_a_extra = format!(
+        r#","page_size":1,"drift":{{"flag":"{}"}}"#,
+        flag_a.display()
+    );
+    world.tool_b_extra = format!(r#","drift":{{"flag":"{}"}}"#, flag_b.display());
+    let mut world = world.start();
+    let mutations = [
+        "description",
+        "hidden_instruction",
+        "important_tag",
+        "parameter_description",
+        "new_property",
+        "property_type",
+        "required",
+        "output_schema",
+        "tool_added",
+        "tool_removed",
+        "tool_renamed",
+        "name_collision",
+        "read_only_hint",
+        "destructive_hint",
+        "idempotent_hint",
+        "homoglyph",
+        "zero_width_joiner",
+        "bidi_override",
+        "x_mcp_header",
+        "list_changed",
+        "title_icon",
+        "default_value",
+        "big_integer",
+        "last_page",
+        "shadowing",
+        "discover",
+    ];
+    let outcome = |boot: &[String], server: &str| -> String {
+        boot.iter()
+            .find_map(|line| line.strip_prefix(&format!("pep-sidecar: server {server}: ")))
+            .unwrap_or("none")
+            .to_owned()
+    };
+    let invoice = r#"{"invoice_id":"INV-1001"}"#;
+    for (server, flag, other) in [("a", &flag_a, "b"), ("b", &flag_b, "a")] {
+        for name in mutations
+            .iter()
+            .chain(&["list_fails", "list_times_out", "respelled"])
+        {
+            // #12 is another server's name: on a, whose own tool it is, it is a duplicate.
+            fs::write(flag, name).unwrap();
+            let boot = world.restart_fresh();
+            let expected = match *name {
+                "list_fails" | "list_times_out" => "Failed",
+                "respelled" => "Matches",
+                _ => "Differs",
+            };
+            assert_eq!(
+                outcome(&boot, server),
+                expected,
+                "{server} {name}: {boot:?}"
+            );
+            assert_eq!(
+                outcome(&boot, other),
+                "Matches",
+                "{server} {name}: {boot:?}"
+            );
+            let journaled = world
+                .lines("state/journal.jsonl")
+                .iter()
+                .filter(|line| text(line, "/type").as_deref() == Some("quarantine"))
+                .filter_map(|line| text(line, "/server_id"))
+                .collect::<Vec<_>>();
+            let quarantined = expected == "Differs";
+            assert_eq!(
+                journaled,
+                if quarantined {
+                    vec![server.to_owned()]
+                } else {
+                    Vec::new()
+                },
+                "{server} {name}"
+            );
+            // Hidden from tools/list, and its calls denied: suspended or quarantined alike.
+            let token = world.start_episode("pay");
+            let listed: Vec<String> = world
+                .agent(1, "tools/list", None, "", Some(&token))
+                .pointer("/result/tools")
+                .and_then(JcsValue::as_array)
+                .unwrap()
+                .iter()
+                .filter_map(|tool| {
+                    tool.get("name")
+                        .and_then(JcsValue::as_str)
+                        .map(str::to_owned)
+                })
+                .collect();
+            let serving = expected == "Matches";
+            assert_eq!(
+                listed.contains(&"get_invoice".to_owned()),
+                server != "a" || serving,
+                "{server} {name}: {listed:?}"
+            );
+            assert_eq!(
+                listed.contains(&"get_note".to_owned()),
+                server != "b" || serving,
+                "{server} {name}: {listed:?}"
+            );
+            let call = if server == "a" {
+                world.call(2, "get_invoice", invoice, &token)
+            } else {
+                world.call(2, "get_note", r#"{"key":"k"}"#, &token)
+            };
+            assert_eq!(denied(&call), !serving, "{server} {name}: {call:?}");
+            fs::remove_file(flag).unwrap();
+        }
+    }
+}
+
+#[test]
+fn lock_scan_writes_the_payload_the_servers_serve() {
+    // L1's tooling: from a draft with every definition and discover result removed, lock-scan
+    // fetches each through the broker and writes the payload the servers serve: here, exactly the
+    // pinned one. It binds no socket and loads no lockfile.
+    let world = World::new(10_000, None).start();
+    let mut draft = world.pins_text.clone();
+    for definition in [
+        r#"{"name":"get_invoice","description":"Look up an invoice.","inputSchema":{"type":"object"}}"#,
+        r#"{"name":"pay_invoice","description":"Pay an invoice.","inputSchema":{"type":"object"}}"#,
+        r#"{"name":"save_note","inputSchema":{"type":"object"}}"#,
+        r#"{"name":"get_note","inputSchema":{"type":"object"}}"#,
+    ] {
+        draft = draft.replacen(&format!(r#""definition":{definition},"#), "", 1);
+    }
+    draft = draft.replace(
+        r#""discover":{"cacheScope":"public","capabilities":{"tools":{}},"resultType":"complete","supportedVersions":["2026-07-28"],"ttlMs":0},"#,
+        "",
+    );
+    assert!(
+        !draft.contains("definition") && !draft.contains("discover"),
+        "{draft}"
+    );
+    let scan = |draft: &str| {
+        fs::write(world.path("draft.json"), draft).unwrap();
+        Command::new(env!("CARGO_BIN_EXE_pep-sidecar"))
+            .arg("lock-scan")
+            .arg(world.path("pep.json"))
+            .arg(world.path("draft.json"))
+            .output()
+            .unwrap()
+    };
+    let out = scan(&draft);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let mut expected = world.pins.to_canonical_bytes();
+    expected.push(b'\n');
+    assert_eq!(
+        String::from_utf8(out.stdout).unwrap(),
+        String::from_utf8(expected).unwrap()
+    );
+    // A tool the server serves but the draft gives no policy is refused: pinning it later would
+    // be a review of text nobody read.
+    let missing = draft.replacen(r#""get_note":{"#, r#""get_note_unserved":{"#, 1);
+    let out = scan(&missing);
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("serves get_note, which the draft gives no policy"),
+        "{stderr}"
+    );
 }

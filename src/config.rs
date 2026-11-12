@@ -1,13 +1,13 @@
 //! The PEP's config file (`WEEK2_PLAN` §2a), parsed with `jcs`.
 //!
-//! The whole file is parsed once under the definition profile, because its `pins` section is
-//! the unsigned lockfile v1 payload, whose upstream definitions hold fractions and can be large
-//! (RV4 #13). Every other section admits only safe non-negative integers, which is what the
-//! request profile would admit. Unknown fields are load errors at every depth, and each error
-//! names the path of the field it is about.
+//! The lockfile is not in the config: `lockfile.path` names the signed lockfile, which
+//! [`lockfile::load_signed`] verifies with the section's signers before anything else reads it
+//! (L1). Its payload is reported under `lockfile.payload`. The config itself admits only safe
+//! non-negative integers, which is what the request profile would admit. Unknown fields are
+//! load errors at every depth, and each error names the path of the field it is about.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -17,6 +17,7 @@ use crate::engine::{
 };
 use crate::jcs::{self, JcsError, JcsObject, JcsValue, ParseOptions};
 use crate::lockfile::{self, Lockfile};
+use crate::schema::SchemaError;
 use crate::tokens::EPISODE_MAX_LIFETIME_SECS;
 use crate::tokens::Es256Verifier;
 
@@ -76,6 +77,12 @@ pub enum Problem {
     /// The engine refused an intent with these pins.
     #[error("refused by the engine: {0}")]
     Engine(ConfigError),
+    /// A strict argument schema is outside the allowed subset (L1).
+    #[error("strict schema: {0}")]
+    Schema(SchemaError),
+    /// The signed lockfile's envelope or signatures do not hold (L1).
+    #[error("signed lockfile: {0}")]
+    Signature(&'static str),
 }
 
 /// Reads the fields of one JSON object, and refuses any it was not asked for.
@@ -278,8 +285,8 @@ pub struct Signer {
     pub key: Es256Verifier,
 }
 
-/// The `lockfile` section. Step 7 loads its pins from the config; step 10 verifies the signed
-/// lockfile at `path` with these signers.
+/// The `lockfile` section: where the signed lockfile is, and who may sign it (L1). The broker's
+/// config has the same section.
 #[derive(Debug, Clone)]
 pub struct LockfileSection {
     /// The signed lockfile.
@@ -378,17 +385,17 @@ pub struct Config {
     pub intents: BTreeMap<String, IntentConfig>,
     /// Runtime limits.
     pub limits: RuntimeLimits,
-    /// The pins: the unsigned lockfile v1 payload (L1).
+    /// The pins: the payload of the signed lockfile, verified (L1).
     pub pins: Lockfile,
 }
 
-/// Loads a config from its bytes.
+/// Loads a config from its bytes. `read` reads the signed lockfile it names.
 ///
 /// # Errors
 ///
 /// Returns a [`LoadError`] naming the first field that is missing, unexpected, of the wrong
-/// type or not allowed.
-pub fn load(bytes: &[u8]) -> Result<Config, LoadError> {
+/// type or not allowed, or the lockfile's first problem.
+pub fn load(bytes: &[u8], read: &dyn Fn(&Path) -> Option<Vec<u8>>) -> Result<Config, LoadError> {
     let root = jcs::parse_with(bytes, &ParseOptions::definition())
         .map_err(|error| LoadError::at("", Problem::Json(error)))?
         .value;
@@ -401,17 +408,11 @@ pub fn load(bytes: &[u8]) -> Result<Config, LoadError> {
     let journal = journal_section(fields.object("journal")?)?;
     let log = log_section(fields.object("log")?)?;
     let limits = limits_section(fields.object("limits")?)?;
-    let pins_path = fields.path_of("pins");
-    let pins = lockfile::parse_payload(fields.value("pins")?, &pins_path)?;
-    if pins.release_epoch < lockfile_section.min_accepted_epoch {
-        return Err(LoadError::at(
-            &join(&pins_path, "release_epoch"),
-            Problem::Invalid("below lockfile.min_accepted_epoch"),
-        ));
-    }
     let intents_path = fields.path_of("intents");
-    let intents = intents_section(fields.value("intents")?, &intents_path, &pins)?;
+    let intents_value = fields.value("intents")?;
     fields.done()?;
+    let pins = lockfile::load_signed(&lockfile_section, read)?;
+    let intents = intents_section(intents_value, &intents_path, &pins)?;
     Ok(Config {
         agent,
         operator,
@@ -423,6 +424,38 @@ pub fn load(bytes: &[u8]) -> Result<Config, LoadError> {
         intents,
         limits,
         pins,
+    })
+}
+
+/// What `pep-sidecar lock-scan` reads from a config (L1): the broker, and a poll's deadline.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScanSettings {
+    /// The broker's socket, uid and gid.
+    pub broker: Peer,
+    /// The deadline for one server's scan.
+    pub drift_poll_deadline_ms: u64,
+}
+
+/// Reads only the `broker` and `limits` sections of a config, each checked as [`load`] checks
+/// it, so a scan can run before any lockfile is signed.
+///
+/// # Errors
+///
+/// Returns a [`LoadError`] if the file is not JSON, or either section is missing or malformed.
+pub fn scan_settings(bytes: &[u8]) -> Result<ScanSettings, LoadError> {
+    let root = jcs::parse_with(bytes, &ParseOptions::definition())
+        .map_err(|error| LoadError::at("", Problem::Json(error)))?
+        .value;
+    let section = |key: &str| {
+        root.get(key)
+            .ok_or_else(|| LoadError::at(key, Problem::Missing))
+            .and_then(|value| Fields::of(value, key))
+    };
+    let broker = peer(section("broker")?)?;
+    let limits = limits_section(section("limits")?)?;
+    Ok(ScanSettings {
+        broker,
+        drift_poll_deadline_ms: limits.drift_poll_deadline_ms,
     })
 }
 
@@ -453,7 +486,15 @@ fn pep_section(mut fields: Fields<'_>) -> Result<PepSection, LoadError> {
     Ok(section)
 }
 
-fn lockfile_section(mut fields: Fields<'_>) -> Result<LockfileSection, LoadError> {
+/// Parses a `lockfile` section: `path`, `min_accepted_epoch`, `signers` and `thresholds`. The
+/// roles are [`lockfile::RELEASE_ROLE`], which must have a threshold, and
+/// [`lockfile::SECURITY_ROLE`].
+///
+/// # Errors
+///
+/// Returns a [`LoadError`] for a malformed section, an unknown role, a key listed twice, more
+/// than [`lockfile::MAX_SIGNERS`] keys, or a threshold outside 1 to the role's key count.
+pub(crate) fn lockfile_section(mut fields: Fields<'_>) -> Result<LockfileSection, LoadError> {
     let path = fields.path("path")?;
     let min_accepted_epoch = fields.u64("min_accepted_epoch")?;
     let signers_path = fields.path_of("signers");
@@ -466,10 +507,16 @@ fn lockfile_section(mut fields: Fields<'_>) -> Result<LockfileSection, LoadError
         let entry_path = format!("{signers_path}[{index}]");
         let mut signer = Fields::of(entry, &entry_path)?;
         let role = signer.string("role")?;
-        if role.is_empty() {
+        if role != lockfile::RELEASE_ROLE && role != lockfile::SECURITY_ROLE {
             return Err(LoadError::at(
                 &signer.path_of("role"),
-                Problem::Invalid("empty role"),
+                Problem::Invalid("a role is release or security"),
+            ));
+        }
+        if index >= lockfile::MAX_SIGNERS {
+            return Err(LoadError::at(
+                &entry_path,
+                Problem::Invalid("at most 16 signer keys"),
             ));
         }
         let key_path = signer.path_of("key");
@@ -505,6 +552,12 @@ fn lockfile_section(mut fields: Fields<'_>) -> Result<LockfileSection, LoadError
         thresholds.insert(role.to_owned(), needed);
     }
     threshold_fields.done()?;
+    if !thresholds.contains_key(lockfile::RELEASE_ROLE) {
+        return Err(LoadError::at(
+            &join(&fields.path_of("thresholds"), lockfile::RELEASE_ROLE),
+            Problem::Missing,
+        ));
+    }
     if let Some(signer) = signers
         .iter()
         .find(|signer| !thresholds.contains_key(&signer.role))
@@ -857,29 +910,35 @@ mod tests {
               "definition": {"name": "get_invoice", "description": "Look up an invoice.", "inputSchema": {"type": "object", "properties": {"invoice_id": {"type": "string", "maxLength": 64}}, "required": ["invoice_id"], "additionalProperties": false}},
               "policy": {"effect": "read", "args": [{"pointer": "/invoice_id", "role": "store_key"}], "store_uri": "billing://invoices", "sink_clearance": "secret",
                 "output_label": {"conf": "internal", "integ": "trusted"}, "trusted_fields": ["/structuredContent/amount_due_minor", "/structuredContent/currency"],
-                "max_result_bytes": 1048576, "max_result_nodes": 8192}},
+                "max_result_bytes": 1048576, "max_result_nodes": 8192,
+                "strict_schema": {"type": "object", "additionalProperties": false, "required": ["invoice_id"], "properties": {"invoice_id": {"type": "string", "maxLength": 64}}}}},
             "pay_invoice": {
               "definition": {"name": "pay_invoice", "description": "Pay an invoice.", "inputSchema": {"type": "object"}},
               "policy": {"effect": "mutating_financial", "args": [{"pointer": "/invoice_id", "role": "entity", "kind": "invoice"}, {"pointer": "/amount", "role": "amount"}, {"pointer": "/currency", "role": "currency"}],
                 "sink_clearance": "internal", "output_label": {"conf": "internal", "integ": "untrusted_external"},
                 "amount_binding": {"lookup_tool": "get_invoice", "entity_arg_pointer": "/invoice_id", "lookup_entity_pointer": "/invoice_id", "result_amount_pointer": "/structuredContent/amount_due_minor", "result_currency_pointer": "/structuredContent/currency"},
-                "max_result_bytes": 65536, "max_result_nodes": 1024}}}},
+                "max_result_bytes": 65536, "max_result_nodes": 1024,
+                "strict_schema": {"type": "object", "additionalProperties": false, "required": ["invoice_id", "amount", "currency"], "properties": {"invoice_id": {"type": "string"},
+                  "amount": {"type": "integer", "minimum": 0, "maximum": 1000000}, "currency": {"type": "string", "minLength": 3, "maxLength": 3}}}}}}},
         "b": {"endpoint": "http://tools-b:8080/mcp", "identity": "spiffe://corp.example/tools/b", "protocol_version": "2026-07-28",
           "discover": {"cacheScope": "public", "capabilities": {"tools": {}}, "resultType": "complete", "supportedVersions": ["2026-07-28"], "ttlMs": 0},
           "tools": {
             "save_note": {
               "definition": {"name": "save_note", "inputSchema": {"type": "object"}},
               "policy": {"effect": "mutating_internal", "args": [{"pointer": "/key", "role": "store_key"}, {"pointer": "/text", "role": "store_write"}], "store_uri": "notes://agent",
-                "sink_clearance": "secret", "output_label": {"conf": "internal", "integ": "untrusted_external"}, "max_result_bytes": 65536, "max_result_nodes": 1024}},
+                "sink_clearance": "secret", "output_label": {"conf": "internal", "integ": "untrusted_external"}, "max_result_bytes": 65536, "max_result_nodes": 1024,
+                "strict_schema": {"type": "object", "additionalProperties": false, "required": ["key", "text"], "properties": {"key": {"type": "string"}, "text": {"type": "string"}}}}},
             "search_notes": {
               "definition": {"name": "search_notes", "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}, "score": {"type": "number", "minimum": 0.5}}}},
               "policy": {"effect": "read", "args": [{"pointer": "/query", "role": "data"}], "sink_clearance": "secret",
-                "output_label": {"conf": "secret", "integ": "untrusted_agent_write"}, "reads_stores": ["notes://agent"], "max_result_bytes": 65536, "max_result_nodes": 1024}},
+                "output_label": {"conf": "secret", "integ": "untrusted_agent_write"}, "reads_stores": ["notes://agent"], "max_result_bytes": 65536, "max_result_nodes": 1024,
+                "strict_schema": {"type": "object", "additionalProperties": false, "properties": {"query": {"type": "string", "maxLength": 512}}}}},
             "fetch": {
               "definition": {"name": "fetch", "inputSchema": {"type": "object"}},
               "policy": {"effect": "read", "args": [{"pointer": "/url", "role": "sink_destination"}], "sink_clearance": "public",
                 "destinations": {"https://partner.example": "confidential"},
-                "output_label": {"conf": "internal", "integ": "untrusted_external"}, "max_result_bytes": 65536, "max_result_nodes": 1024}}}}}
+                "output_label": {"conf": "internal", "integ": "untrusted_external"}, "max_result_bytes": 65536, "max_result_nodes": 1024,
+                "strict_schema": {"type": "object", "additionalProperties": false, "required": ["url"], "properties": {"url": {"type": "string"}}}}}}}}
     }"#;
 
     const CONFIG: &str = r#"{
@@ -936,8 +995,43 @@ mod tests {
         text.replacen(old, new, 1)
     }
 
+    /// The tests write the lockfile payload into the config text as `pins`, for brevity: here it
+    /// moves to the signed lockfile at `lockfile.path`, canonical and signed by both test keys
+    /// (security `[1; 32]`, release `[2; 32]`), and the rest of the config loads as written.
     fn load_str(text: &str) -> Result<Config, LoadError> {
-        load(text.as_bytes())
+        let (config, envelope) = split_pins(text);
+        load(&config, &|path| {
+            (path == Path::new("/etc/pep/lockfile.dsse.json")).then(|| envelope.clone())
+        })
+    }
+
+    /// The config text less `pins`, and the envelope around `pins`; for text that is not a JSON
+    /// object, the text and no envelope.
+    fn split_pins(text: &str) -> (Vec<u8>, Vec<u8>) {
+        let Ok(parsed) = jcs::parse_with(text.as_bytes(), &ParseOptions::definition()) else {
+            return (text.as_bytes().to_vec(), Vec::new());
+        };
+        let Some(root) = parsed.value.as_object() else {
+            return (text.as_bytes().to_vec(), Vec::new());
+        };
+        let payload = root
+            .get("pins")
+            .map(JcsValue::to_canonical_bytes)
+            .unwrap_or_default();
+        let rest = JcsObject::from_entries(
+            root.entries()
+                .iter()
+                .filter(|(key, _)| key.as_str() != "pins")
+                .cloned()
+                .collect(),
+        )
+        .unwrap();
+        let release = Es256Signer::from_secret_bytes(&[2; 32]).unwrap();
+        let security = Es256Signer::from_secret_bytes(&[1; 32]).unwrap();
+        (
+            JcsValue::Object(rest).to_canonical_bytes(),
+            lockfile::fixtures::envelope(&payload, &[&release, &security]),
+        )
     }
 
     /// The error for the config with `old` replaced by `new` (in the pins when `in_pins`).
@@ -1047,7 +1141,7 @@ mod tests {
                 r#""kind": "invoice", "why": 1}"#
             ),
             (
-                "pins.servers.a.tools.pay_invoice.policy.args[0].why".to_owned(),
+                "lockfile.payload.servers.a.tools.pay_invoice.policy.args[0].why".to_owned(),
                 Problem::Unexpected
             )
         );
@@ -1332,7 +1426,10 @@ mod tests {
                 r#""min_accepted_epoch": 7"#,
                 r#""min_accepted_epoch": 8"#
             ),
-            invalid("pins.release_epoch", "below lockfile.min_accepted_epoch")
+            invalid(
+                "lockfile.payload.release_epoch",
+                "below lockfile.min_accepted_epoch"
+            )
         );
     }
 
@@ -1345,7 +1442,7 @@ mod tests {
                 r#""definition": {"name": "fetch2""#
             ),
             invalid(
-                "pins.servers.b.tools.fetch.definition",
+                "lockfile.payload.servers.b.tools.fetch.definition",
                 "its name must equal the tool's key"
             )
         );
@@ -1358,7 +1455,7 @@ mod tests {
         assert_eq!(
             (error_text.path, error_text.problem),
             invalid(
-                "pins.servers.b.tools.fetch me.definition",
+                "lockfile.payload.servers.b.tools.fetch me.definition",
                 "a tool name is 1 to 128 characters of [A-Za-z0-9_.-]"
             )
         );
@@ -1372,7 +1469,7 @@ mod tests {
         assert_eq!(
             (error_text.path, error_text.problem),
             invalid(
-                "pins.servers.b.tools.get_invoice",
+                "lockfile.payload.servers.b.tools.get_invoice",
                 "a tool name may be pinned on one server only"
             )
         );
@@ -1395,13 +1492,16 @@ mod tests {
                 r#""identity": "spiffe://corp.example/tools/b", "protocol_version": "2025-11-25""#
             ),
             invalid(
-                "pins.servers.b.protocol_version",
+                "lockfile.payload.servers.b.protocol_version",
                 "the PEP speaks only 2026-07-28"
             )
         );
         assert_eq!(
             error(true, r#""lockfile_version": 1"#, r#""lockfile_version": 2"#),
-            invalid("pins.lockfile_version", "unsupported lockfile version")
+            invalid(
+                "lockfile.payload.lockfile_version",
+                "unsupported lockfile version"
+            )
         );
         assert_eq!(
             error(
@@ -1409,7 +1509,7 @@ mod tests {
                 r#""endpoint": "http://tools-b:8080/mcp""#,
                 r#""endpoint": """#
             ),
-            invalid("pins.servers.b.endpoint", "empty")
+            invalid("lockfile.payload.servers.b.endpoint", "empty")
         );
     }
 
@@ -1422,7 +1522,7 @@ mod tests {
                 r#""query": {"type": "string", "x-mcp-header": "Query"}"#
             ),
             invalid(
-                "pins.servers.b.tools.search_notes.definition",
+                "lockfile.payload.servers.b.tools.search_notes.definition",
                 "x-mcp-header is not supported in Week 2"
             )
         );
@@ -1434,7 +1534,7 @@ mod tests {
                 r#""definition": {"name": "fetch", "inputSchema": {"type": "object", "allOf": [{"properties": {"u": {"x-mcp-header": "U"}}}]}}"#
             ),
             invalid(
-                "pins.servers.b.tools.fetch.definition",
+                "lockfile.payload.servers.b.tools.fetch.definition",
                 "x-mcp-header is not supported in Week 2"
             )
         );
@@ -1454,7 +1554,7 @@ mod tests {
                     effect,
                     &effect.replace("\"read\"", &format!("\"{bad}\""))
                 ),
-                invalid("pins.servers.b.tools.fetch.policy.effect", why)
+                invalid("lockfile.payload.servers.b.tools.fetch.policy.effect", why)
             );
         }
         // A payment must declare its currency.
@@ -1465,7 +1565,7 @@ mod tests {
                 ""
             ),
             invalid(
-                "pins.servers.a.tools.pay_invoice.policy.args",
+                "lockfile.payload.servers.a.tools.pay_invoice.policy.args",
                 "a payment tool must declare a currency argument"
             )
         );
@@ -1476,7 +1576,7 @@ mod tests {
                 r#""role": "entity", "kind": "account""#
             ),
             invalid(
-                "pins.servers.a.tools.pay_invoice.policy.args[0].kind",
+                "lockfile.payload.servers.a.tools.pay_invoice.policy.args[0].kind",
                 "must be \"invoice\" or \"recipient\""
             )
         );
@@ -1487,7 +1587,7 @@ mod tests {
                 r#""role": "dynamic_sink""#
             ),
             invalid(
-                "pins.servers.b.tools.fetch.policy.args[0].role",
+                "lockfile.payload.servers.b.tools.fetch.policy.args[0].role",
                 "unknown role"
             )
         );
@@ -1498,14 +1598,14 @@ mod tests {
                 r#""sink_clearance": "top""#
             ),
             invalid(
-                "pins.servers.b.tools.fetch.policy.sink_clearance",
+                "lockfile.payload.servers.b.tools.fetch.policy.sink_clearance",
                 "must be public, internal, confidential or secret"
             )
         );
         assert_eq!(
             error(true, r#""integ": "trusted""#, r#""integ": "verified""#),
             invalid(
-                "pins.servers.a.tools.get_invoice.policy.output_label.integ",
+                "lockfile.payload.servers.a.tools.get_invoice.policy.output_label.integ",
                 "must be trusted, untrusted_external or untrusted_agent_write"
             )
         );
@@ -1516,7 +1616,7 @@ mod tests {
                 r#""https://partner.example": "open""#
             )
             .0,
-            "pins.servers.b.tools.fetch.policy.destinations.https://partner.example"
+            "lockfile.payload.servers.b.tools.fetch.policy.destinations.https://partner.example"
         );
         assert_eq!(
             error(
@@ -1525,7 +1625,7 @@ mod tests {
                 r#""/structuredContent/currency", "/structuredContent/currency"]"#
             ),
             invalid(
-                "pins.servers.a.tools.get_invoice.policy.trusted_fields[2]",
+                "lockfile.payload.servers.a.tools.get_invoice.policy.trusted_fields[2]",
                 "repeated"
             )
         );
@@ -1533,7 +1633,7 @@ mod tests {
         assert_eq!(
             error(true, r#""/structuredContent/currency"]"#, r#""/currency"]"#),
             (
-                "pins".to_owned(),
+                "lockfile.payload".to_owned(),
                 Problem::Engine(ConfigError::InvalidTrustedField)
             )
         );
@@ -1545,7 +1645,7 @@ mod tests {
                 r#""sink_clearance": "public", "role_contracts": {},"#
             ),
             (
-                "pins.servers.b.tools.fetch.policy.role_contracts".to_owned(),
+                "lockfile.payload.servers.b.tools.fetch.policy.role_contracts".to_owned(),
                 Problem::Unexpected
             )
         );
@@ -1568,7 +1668,7 @@ mod tests {
                     &format!(r#""output_label": {label}, "reads_stores""#)
                 ),
                 invalid(
-                    "pins.servers.b.tools.search_notes.policy",
+                    "lockfile.payload.servers.b.tools.search_notes.policy",
                     "a reader of a store agents write must carry output_label secret, untrusted_agent_write (RV4 #8)"
                 ),
                 "{label}"
@@ -1591,7 +1691,9 @@ mod tests {
             r#""save_note": {"#,
             r#""move_note": {"definition": {"name": "move_note"}, "policy": {"effect": "mutating_internal",
               "args": [{"pointer": "/store", "role": "store_uri"}, {"pointer": "/key", "role": "store_key"}, {"pointer": "/text", "role": "store_write"}],
-              "sink_clearance": "secret", "output_label": {"conf": "internal", "integ": "untrusted_external"}, "max_result_bytes": 1024, "max_result_nodes": 64}},
+              "sink_clearance": "secret", "output_label": {"conf": "internal", "integ": "untrusted_external"}, "max_result_bytes": 1024, "max_result_nodes": 64,
+              "strict_schema": {"type": "object", "additionalProperties": false, "required": ["store", "key", "text"],
+                "properties": {"store": {"type": "string"}, "key": {"type": "string"}, "text": {"type": "string"}}}}},
             "save_note": {"#,
         );
         assert_eq!(
@@ -1607,7 +1709,7 @@ mod tests {
                 r#""reads_stores": ["files://share"]"#
             ),
             invalid(
-                "pins.servers.b.tools.search_notes.policy",
+                "lockfile.payload.servers.b.tools.search_notes.policy",
                 "reads_stores names a store that is not pinned"
             )
         );
@@ -1618,7 +1720,7 @@ mod tests {
                 r#""effect": "external_sink", "args": [{"pointer": "/query", "role": "data"}], "sink_clearance": "internal""#
             ),
             invalid(
-                "pins.servers.b.tools.search_notes.policy",
+                "lockfile.payload.servers.b.tools.search_notes.policy",
                 "only a read tool declares reads_stores"
             )
         );
@@ -1691,7 +1793,7 @@ mod tests {
             r#""output_label": {"conf": "internal", "integ": "trusted"}"#,
             r#""output_label": {"conf": "secret", "integ": "trusted"}"#,
         );
-        assert_eq!(path, "pins");
+        assert_eq!(path, "lockfile.payload");
         assert_eq!(
             problem,
             Problem::Invalid(
@@ -1702,7 +1804,7 @@ mod tests {
 
     #[test]
     fn secret_clearance_is_only_for_tools_that_stay_with_the_data() {
-        let clearance = "pins.servers.b.tools.fetch.policy.sink_clearance";
+        let clearance = "lockfile.payload.servers.b.tools.fetch.policy.sink_clearance";
         // A read tool that reads a pinned store may keep it: its server holds that store.
         assert!(load_str(&config_with(PINS)).is_ok());
         // One that does not, may not: its `data` arguments would go out unchecked.
@@ -1736,7 +1838,7 @@ mod tests {
                 r#""sink_clearance": "secret", "output_label": {"conf": "internal", "integ": "untrusted_external"},"#
             ),
             invalid(
-                "pins.servers.a.tools.pay_invoice.policy.sink_clearance",
+                "lockfile.payload.servers.a.tools.pay_invoice.policy.sink_clearance",
                 "a sink or a payment cannot be cleared for secret"
             )
         );
