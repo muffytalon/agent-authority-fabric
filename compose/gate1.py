@@ -24,7 +24,7 @@ Writes `reports/Gate1 results.md`. Exits 0 only if every criterion is met and ev
 passed. Whether G4 is met when some runs miss is the owner's call (O1): the report gives every
 run, and the gate counts G4 met only if every run met it.
 """
-import datetime, os, re, subprocess, sys, time
+import datetime, hashlib, os, re, subprocess, sys, time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 REPORT = "reports/Gate1 results.md"
@@ -33,10 +33,24 @@ DECISIONS = {"D1", "D2", "N1", "Q1", "S1", "M1", "M2", "P1", "R1", "E1", "H1", "
 SUITES = ("check", "kit", "checks", "mutations", "conformance", "sabotage", "latency")
 
 
+def tree():
+    """The source tree as git sees it: the commit, plus a digest of any uncommitted change."""
+    head = subprocess.run(["git", "rev-parse", "--short", "HEAD"], capture_output=True, text=True, cwd=ROOT).stdout.strip()
+    changes = subprocess.run(["git", "status", "--porcelain", "--untracked-files=all"], capture_output=True,
+                             text=True, cwd=ROOT).stdout
+    if not changes:
+        return head or "unknown"
+    diff = subprocess.run(["git", "diff", "HEAD"], capture_output=True, cwd=ROOT).stdout
+    digest = hashlib.sha256(diff + changes.encode()).hexdigest()[:8]
+    return f"{head}+changes {digest}"
+
+
 def run(args, log, env=None, timeout=10800):
-    """Runs `args` with its output in `log` and its exit status in `log`.exit: (exit status,
-    output, seconds)."""
+    """Runs `args` with its output in `log`, its exit status in `log`.exit and the tree it ran on
+    in `log`.tree: (exit status, output, seconds)."""
     started = time.time()
+    with open(f"{log}.tree", "w") as f:
+        f.write(f"{tree()}, {datetime.date.today()}\n")
     with open(log, "w") as out:
         result = subprocess.run(args, stdout=out, stderr=subprocess.STDOUT, cwd=ROOT, timeout=timeout,
                                 env=dict(os.environ, **(env or {})))
@@ -45,6 +59,15 @@ def run(args, log, env=None, timeout=10800):
     with open(log) as f:
         text = f.read()
     return result.returncode, text, time.time() - started
+
+
+def ran_on(log):
+    """The tree a suite's log was made on, as `run` recorded it."""
+    try:
+        with open(f"{log}.tree") as f:
+            return f.read().strip()
+    except OSError:
+        return "not recorded"
 
 
 def previous(log):
@@ -191,6 +214,13 @@ def main():
     out += [f"| {name} | {'yes' if ok else 'NO'} | {summary.replace('|', '/')} |" for name, ok, summary in checks]
     out += ["", "G4 counts as met here only if every run met it. O1 leaves the call on a record with misses to the owner, "
             "and the latency report gives every run, its stalls, and what the machine was doing."]
+    now = tree()
+    names = ("check", "kit", "checks", "checks-cargo", "mutations", "conformance", "sabotage", "latency")
+    out += ["", "**Which tree each suite ran on.** `--skip` reuses a finished suite's log, so a report can join runs "
+            f"from more than one tree. This report was written on `{now}`.", "",
+            "| Suite | Ran on | Reused here |", "|---|---|---|"]
+    out += [f"| {name} | {ran_on(f'{directory}/{name}.log').replace('|', '/')} | {'yes' if name in skip else 'no'} |"
+            for name in names]
     with open(os.path.join(ROOT, REPORT), "w", newline="\n") as f:
         f.write("\n".join(out) + "\n")
     print(f"wrote {REPORT}: Gate 1 {'met' if gate else 'NOT met'}", flush=True)
