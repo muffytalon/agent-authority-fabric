@@ -1,7 +1,8 @@
 """Can the attacks fail? A sabotage run over C-ENG and C-OUT (WEEK2_PLAN §3, G1).
 
 Usage, from the root of the WSL-side clone:
-    PEP_SECRETS_DIR=~/.config/pep-gate1/secrets python3 compose/sabotage.py [--run TEXT] [--keep-going]
+    PEP_SECRETS_DIR=~/.config/pep-gate1/secrets python3 compose/sabotage.py [--run TEXT] [--resume]
+    python3 compose/sabotage.py --status
 
 An attack that passes says nothing until it has been seen to fail. This copies the tree to a
 temporary directory, wraps each defence in a switch read from `PEP_SABOTAGE`, and builds that copy
@@ -18,10 +19,23 @@ through compose/kit.py, judged by the same oracle.
 Writes `reports/Gate1 sabotage report.md`. Exits 0 only if the baseline held, every attack in C-ENG
 and C-OUT was caught, and no sabotage left its attack unmoved: each is aimed at one defence, so a
 survivor is a blind attack, even if another sabotage catches it. The substitutions fail loudly if
-the source moves. Takes about an hour. It never touches `src/` here, and no switch exists outside
+the source moves. Takes about 45 minutes. It never touches `src/` here, and no switch exists outside
 the temporary copy.
+
+Monitoring. A full run keeps its state in reports/gate1-logs/sabotage.state.json, rewritten
+atomically when a run starts and when it ends: the tree's fingerprint, the baseline, every result
+so far, the run in progress, and this process's pid. Each line it prints carries the time, the
+time since the start, and, at each run's start, its place and an ETA from the runs so far.
+- `--status` prints that state from any terminal: alive or not, how far, the run in progress and
+  for how long, the ETA, the results so far, and whether the state is for the tree as it is now.
+- `--resume` continues an unfinished state of the same tree, as a WSL shutdown leaves it, keeping
+  its baseline and its finished runs; anything else starts afresh. A finished state is never
+  reused, so a complete run always runs everything.
+- A watchdog stops a run that passes its limit (the baseline 40 minutes, a sabotage 15) and records
+  its attacks as "timed out", which fails the run, rather than letting one hung stack stall it.
+`--run TEXT` runs the baseline and the sabotage whose label holds TEXT, and keeps no state.
 """
-import datetime, os, re, shutil, subprocess, sys, tempfile
+import datetime, hashlib, json, os, re, shutil, subprocess, sys, tempfile, time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 REPORT = "reports/Gate1 sabotage report.md"
@@ -30,6 +44,15 @@ PROJECT = "pep-sabotage"
 GROUPS = ("C-ENG", "C-OUT")
 ALL_ATTACKS = 28
 RESULT = re.compile(r"^(ok  |FAIL) ((?:C-ENG|C-OUT) .+?) \[(.+?)\](?:: (.*))?$")
+STATE = "reports/gate1-logs/sabotage.state.json"
+BASELINE_LIMIT_S = 2400   # the whole of C-ENG and C-OUT, about 10 minutes
+RUN_LIMIT_S = 900         # one sabotage's attacks, about 75 seconds
+# What a run depends on: the images' build inputs (Dockerfile, .dockerignore), the stack and its
+# configs, and the Python that drives and judges it, this file's switches included. A change to
+# anything else, a document or a report, leaves an unfinished run resumable.
+HASHED = ("Cargo.toml", "Cargo.lock", "src", "compose/probe", "Dockerfile", ".dockerignore", "compose.yaml",
+          "compose/gate1.yaml", "config", "seccomp-unix-only.json", "compose/kit.py", "compose/check.py",
+          "compose/sabotage.py")
 
 
 def off(name):
@@ -291,12 +314,18 @@ def prepare(copy):
             f.write(text.replace(":dev", TAG))
 
 
-def run_kit(copy, shared, switches, attacks):
-    """Each attack's result: (held, detail), or None if the kit stopped before it."""
+def run_kit(copy, shared, switches, attacks, limit_s):
+    """Each attack's result: (held, detail); none for an attack the kit stopped before. Past
+    `limit_s` the kit is killed and every attack is "timed out" (the next kit's `down` clears the
+    stack it left)."""
     arguments = [item for attack in attacks for item in ("--only", attack)]
     env = dict(os.environ, PEP_SABOTAGE=",".join(switches), PEP_SHARED_TMP=shared)
-    out = subprocess.run(["python3", "compose/kit.py", *arguments], cwd=copy, env=env, capture_output=True,
-                         text=True, timeout=1800, check=False)
+    try:
+        out = subprocess.run(["python3", "compose/kit.py", *arguments], cwd=copy, env=env, capture_output=True,
+                             text=True, timeout=limit_s, check=False)
+    except subprocess.TimeoutExpired:
+        say(f"watchdog: the kit ran past {limit_s} s and was stopped")
+        return {attack: (None, f"timed out after {limit_s} s") for attack in attacks}
     results = {}
     for line in out.stdout.splitlines():
         match = RESULT.match(line)
@@ -308,6 +337,8 @@ def run_kit(copy, shared, switches, attacks):
 
 
 def verdict(held, detail):
+    if held is None:
+        return "timed out"
     if held:
         return "survived"
     parts = detail.split("; ")
@@ -346,42 +377,210 @@ def write_report(baseline, findings):
     return proven == ALL_ATTACKS and not unmoved
 
 
+# --- monitoring ---
+
+STARTED = time.time()
+
+
+def say(text):
+    """One line, with the time and the time since this process started."""
+    elapsed = int(time.time() - STARTED)
+    print(f"[{time.strftime('%H:%M:%S')} +{elapsed // 60:02}:{elapsed % 60:02}] {text}", flush=True)
+
+
+def fingerprint():
+    """SHA-256 over the path and contents of every file in HASHED."""
+    paths = []
+    for entry in HASHED:
+        full = os.path.join(ROOT, entry)
+        if os.path.isdir(full):
+            for directory, names, files in os.walk(full):
+                names[:] = sorted(name for name in names if name != "__pycache__")
+                paths += [os.path.join(directory, name) for name in files]
+        elif os.path.isfile(full):
+            paths.append(full)
+    digest = hashlib.sha256()
+    for path in sorted(paths):
+        if os.path.islink(path):
+            continue
+        digest.update(os.path.relpath(path, ROOT).encode() + b"\0")
+        with open(path, "rb") as f:
+            digest.update(hashlib.sha256(f.read()).digest())
+    return digest.hexdigest()
+
+
+def load_state():
+    try:
+        with open(os.path.join(ROOT, STATE)) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def save_state(state):
+    """Atomically: a reader never sees half a file, and a crash leaves the last whole one."""
+    state["updated"] = time.time()
+    path = os.path.join(ROOT, STATE)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path + ".tmp", "w") as f:
+        json.dump(state, f, indent=1)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(path + ".tmp", path)
+
+
+def alive(pid):
+    """Whether `pid` is a running sabotage.py."""
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            return b"sabotage.py" in f.read()
+    except OSError:
+        return False
+
+
+def eta(state):
+    """Seconds left, from the mean of the finished sabotage runs, or None before the first."""
+    durations = [run["seconds"] for run in state["done"].values()]
+    if not durations:
+        return None
+    left = state["total"] - len(durations) - (1 if state.get("current") else 0)
+    running = time.time() - state["current"]["started"] if state.get("current") else 0
+    mean = sum(durations) / len(durations)
+    return max(0, left * mean + max(0, mean - running))
+
+
+def status():
+    """--status: what a run in progress, or the last one, has done."""
+    state = load_state()
+    if not state:
+        print(f"no sabotage state at {STATE}")
+        return 1
+    now = time.time()
+    living = alive(state.get("pid", 0))
+    current = state.get("current")
+    rows = [row for run in state["done"].values() for row in run["rows"]]
+    unmoved = [row for row in rows if row["verdict"] != "caught"]
+    if state.get("finished"):
+        condition = "finished"
+    elif living:
+        condition = f"running (pid {state['pid']})"
+    else:
+        condition = "stopped before it finished: --resume continues it"
+    print(f"sabotage: {condition}")
+    print(f"  started {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(state['started']))}, "
+          f"updated {int(now - state['updated'])} s ago")
+    same = state.get("fingerprint") == fingerprint()
+    print(f"  tree: {'the same as now' if same else 'CHANGED since this run started; --resume would start afresh'}")
+    baseline = state.get("baseline")
+    if baseline is None:
+        print("  baseline: not finished")
+    else:
+        held = sum(1 for result in baseline.values() if result[0])
+        print(f"  baseline: {held} of {len(baseline)} held")
+    print(f"  runs: {len(state['done'])} of {state['total']} done; results {len(rows) - len(unmoved)} caught, "
+          f"{len(unmoved)} not")
+    for row in unmoved:
+        print(f"    {row['verdict']}: {row['label']}: {row['attack']}")
+    if current and living:
+        print(f"  now: {current['label']}, for {int(now - current['started'])} s "
+              f"(the watchdog stops it at {current['limit']} s)")
+    left = eta(state) if living else None
+    if left is not None:
+        print(f"  ETA: about {int(left // 60)} min")
+    return 0
+
+
 def main():
     arguments = sys.argv[1:]
+    if "--status" in arguments:
+        return status()
     only = arguments[arguments.index("--run") + 1] if "--run" in arguments else None
     if not os.environ.get("PEP_SECRETS_DIR"):
         raise SystemExit("set PEP_SECRETS_DIR (WEEK2_PLAN §4)")
+    runs = [run for run in RUNS if not only or only in run[0]]
+    tree = fingerprint()
+    state = None
+    if not only:
+        previous = load_state()
+        if "--resume" in arguments and previous and not previous.get("finished") \
+                and previous.get("fingerprint") == tree and not alive(previous.get("pid", 0)):
+            state = previous
+            say(f"resuming: {len(state['done'])} of {state['total']} runs and the baseline "
+                f"{'kept' if state.get('baseline') else 'still to run'}")
+        elif "--resume" in arguments and previous and not previous.get("finished"):
+            reason = ("another run is alive" if alive(previous.get("pid", 0))
+                      else "the tree changed" if previous.get("fingerprint") != tree else "")
+            if reason == "another run is alive":
+                raise SystemExit(f"not resuming: {reason} (pid {previous['pid']})")
+            say(f"not resuming: {reason}; starting afresh")
+        if state is None:
+            state = {"fingerprint": tree, "started": time.time(), "total": len(runs), "baseline": None,
+                     "done": {}, "current": None, "finished": False}
+        state["pid"] = os.getpid()
+        save_state(state)
+
+    def started(label, limit):
+        if state is not None:
+            state["current"] = {"label": label, "started": time.time(), "limit": limit}
+            save_state(state)
+
     with tempfile.TemporaryDirectory(prefix="pep-sabotage-") as work:
         copy = os.path.join(work, "tree")
         shared = os.path.join(work, "shared-tmp")
         os.mkdir(shared)
         os.chmod(shared, 0o1777)
         prepare(copy)
-        baseline = run_kit(copy, shared, [], list(GROUPS))
+        if state is not None and state.get("baseline"):
+            baseline = {attack: tuple(result) for attack, result in state["baseline"].items()}
+        else:
+            say("baseline: every switch off, all of C-ENG and C-OUT")
+            started("baseline", BASELINE_LIMIT_S)
+            baseline = run_kit(copy, shared, [], list(GROUPS), BASELINE_LIMIT_S)
+            if state is not None:
+                state["baseline"], state["current"] = baseline, None
+                save_state(state)
         held = sum(1 for result in baseline.values() if result[0])
-        print(f"baseline: {held} of {len(baseline)} held, every switch off", flush=True)
+        say(f"baseline: {held} of {len(baseline)} held, every switch off")
         if len(baseline) != ALL_ATTACKS or held != ALL_ATTACKS:
             print(sorted(name for name, result in baseline.items() if not result[0]))
+            if state is not None:
+                state["baseline"] = None   # a resume runs it again
+                save_state(state)
             raise SystemExit("the baseline did not hold, so nothing below would mean anything")
         findings = []
-        for label, switches, attacks in RUNS:
-            if only and only not in label:
+        for number, (label, switches, attacks) in enumerate(runs, 1):
+            if state is not None and label in state["done"]:
+                findings += state["done"][label]["rows"]
                 continue
-            results = run_kit(copy, shared, switches, attacks)
+            left = eta(state) if state is not None else None
+            say(f"start {number} of {len(runs)}: {label}"
+                + (f" (ETA about {int(left // 60)} min)" if left is not None else ""))
+            started(label, RUN_LIMIT_S)
+            begun = time.time()
+            results = run_kit(copy, shared, switches, attacks, RUN_LIMIT_S)
+            rows = []
             for attack in attacks:
                 if attack not in results:
                     row = dict(label=label, switches=switches, attack=attack, verdict="did not run", detail="")
                 else:
                     row = dict(label=label, switches=switches, attack=attack, verdict=verdict(*results[attack]),
                                detail=results[attack][1])
-                findings.append(row)
-                print(f"{row['verdict']:18} {label}: {attack}: {row['detail'][:140]}", flush=True)
+                rows.append(row)
+                say(f"{row['verdict']:18} {label}: {attack}: {row['detail'][:140]}")
+            findings += rows
+            if state is not None:
+                state["done"][label] = {"rows": rows, "seconds": time.time() - begun}
+                state["current"] = None
+                save_state(state)
     images = subprocess.run(["docker", "images", "--format", "{{.Repository}}:{{.Tag}}"], capture_output=True, text=True, check=False)
     tagged = [image for image in images.stdout.split() if image.endswith(TAG)]
     subprocess.run(["docker", "image", "rm", "-f", *tagged], capture_output=True, check=False)   # so none can be run by mistake
     if only:
         return 0 if all(row["verdict"] == "caught" for row in findings) else 1   # a part proves nothing about the whole
-    return 0 if write_report(baseline, findings) else 1
+    passed = write_report(baseline, findings)
+    state["finished"] = True
+    save_state(state)
+    return 0 if passed else 1
 
 
 if __name__ == "__main__":

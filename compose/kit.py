@@ -1193,18 +1193,24 @@ def eng_undeclared(window):
     return pay_refused(agent.pay(invoice, nested={"amount": 1}))
 
 
+# Arguments a pinned read tool (search_notes) would take, so nothing but G_pin can refuse the
+# call: since step 10 every tool refuses arguments its strict schema does not declare, which would
+# otherwise refuse these in G_canon even with G_pin broken (compose/sabotage.py's `pinned`).
+ANY_READ = {"query": "everything"}
+
+
 @attack("C-ENG", "a tool name under the reserved pep/ prefix", reason="ToolNotPinned")
 def eng_reserved(window):
     agent = window.agent("pay")
     window.begin()
-    return pay_refused(agent.call("pep/trusted-input", {"value": 1}))
+    return pay_refused(agent.call("pep/trusted-input", ANY_READ))
 
 
 @attack("C-ENG", "a call to an unpinned tool", reason="ToolNotPinned")
 def eng_unpinned(window):
     agent = window.agent("pay")
     window.begin()
-    return pay_refused(agent.call("delete_everything", {}))
+    return pay_refused(agent.call("delete_everything", ANY_READ))
 
 
 @attack("C-ENG", "a control method sent on the agent socket")
@@ -1302,7 +1308,9 @@ def replay_class(name, items, reason=None):
         if summary.get("accepted"):
             return f"{summary['accepted']} accepted"
         if reason:
-            reasons = {line.get("reason") for line in lines("oracle", BROKER_LOG)[before:]}
+            # Only the replayed calls: the PEP's drift polls (step 10) log proof-less lines too.
+            reasons = {line.get("reason") for line in lines("oracle", BROKER_LOG)[before:]
+                       if line.get("method") == "tools/call"}
             if reasons != {reason}:
                 return f"refused for {sorted(str(r) for r in reasons)}, not {reason}"
     replays["classes"] += 1

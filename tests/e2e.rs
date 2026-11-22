@@ -1449,3 +1449,83 @@ fn lock_scan_writes_the_payload_the_servers_serve() {
         "{stderr}"
     );
 }
+
+#[test]
+fn neither_the_pep_nor_the_broker_boots_on_a_lockfile_its_signers_did_not_sign() {
+    // L1, adversarially: whoever can write the lockfile's directory, but holds no signer key,
+    // tries a payload of their own under the real signatures, a payload signed by a key nobody
+    // trusts, and the real payload without its security signature. Each must stop the PEP and
+    // the broker at boot, before either serves anything.
+    use base64::Engine as _;
+    let world = World::new(10_000, None);
+    world.make_dirs();
+    world.write_files();
+    let good = fs::read(world.path("lockfile.dsse.json")).unwrap();
+    let envelope = jcs::parse(&good).unwrap();
+    let standard = base64::engine::general_purpose::STANDARD;
+    let real_payload = envelope
+        .get("payload")
+        .unwrap()
+        .as_str()
+        .unwrap()
+        .to_owned();
+    // 1. The attacker's payload, with every tool cleared for secret, under the real signatures.
+    let theirs = world.pins.to_canonical_string().replace(
+        r#""sink_clearance":"internal""#,
+        r#""sink_clearance":"secret""#,
+    );
+    let swapped = String::from_utf8(good.clone())
+        .unwrap()
+        .replace(&real_payload, &standard.encode(theirs.as_bytes()));
+    // 2. The real payload, signed by a key no config trusts, claiming the release key's id.
+    let stranger = pep_sidecar::tokens::Es256Signer::from_secret_bytes(&[0x5a; 32]).unwrap();
+    let [release, _] = signers();
+    let forged = pep_sidecar::lockfile::sign(&world.pins.to_canonical_bytes(), &stranger)
+        .map(|bytes| {
+            String::from_utf8(bytes)
+                .unwrap()
+                .replace(stranger.kid(), release.kid())
+        })
+        .unwrap();
+    // 3. The real payload, signed by the release key alone: it pins a payment.
+    let release_only = String::from_utf8(
+        pep_sidecar::lockfile::sign(&world.pins.to_canonical_bytes(), &release).unwrap(),
+    )
+    .unwrap();
+    for (name, bad) in [
+        ("swapped", swapped),
+        ("forged", forged),
+        ("release only", release_only),
+    ] {
+        fs::write(world.path("lockfile.dsse.json"), &bad).unwrap();
+        for (binary, config) in [
+            (env!("CARGO_BIN_EXE_pep-sidecar"), "pep.json"),
+            (env!("CARGO_BIN_EXE_stub-broker"), "broker.json"),
+        ] {
+            let mut child = Command::new(binary)
+                .arg(world.path(config))
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let status = loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    break status;
+                }
+                assert!(Instant::now() < deadline, "{name}: {binary} kept running");
+                thread::sleep(Duration::from_millis(20));
+            };
+            let mut stderr = String::new();
+            drop(child.stderr.take().unwrap().read_to_string(&mut stderr));
+            assert!(!status.success(), "{name}: {binary} exited cleanly");
+            assert!(
+                stderr.contains("signed lockfile"),
+                "{name}: {binary}: {stderr}"
+            );
+        }
+        // Neither socket was bound.
+        assert!(!world.path("pep/agent.sock").exists(), "{name}");
+        assert!(!world.path("broker/broker.sock").exists(), "{name}");
+    }
+}
