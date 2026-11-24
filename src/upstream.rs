@@ -12,7 +12,6 @@ use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, mpsc};
-use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::actor::{Upstream, UpstreamFailure};
@@ -20,6 +19,7 @@ use crate::forward::UpstreamRequest;
 use crate::http::{self, HttpError};
 use crate::mcp::is_json_content_type;
 use crate::peercred::{PeerError, require_peer};
+use crate::pool::Pool;
 
 /// Why an exchange with the broker produced no usable reply.
 #[derive(Debug, thiserror::Error)]
@@ -322,14 +322,12 @@ where
         return Err(UpstreamError::ConnectTimeout);
     }
     let (done, result) = mpsc::sync_channel(1);
-    let spawned = thread::Builder::new()
-        .name("upstream-connect".to_owned())
-        .spawn(move || {
-            let connected = connect();
-            PENDING_CONNECTS.fetch_sub(1, Ordering::SeqCst);
-            // Past the deadline no one is waiting, and the stream closes here.
-            drop(done.send(connected));
-        });
+    let spawned = CONNECTORS.spawn(move || {
+        let connected = connect();
+        PENDING_CONNECTS.fetch_sub(1, Ordering::SeqCst);
+        // Past the deadline no one is waiting, and the stream closes here.
+        drop(done.send(connected));
+    });
     if let Err(error) = spawned {
         PENDING_CONNECTS.fetch_sub(1, Ordering::SeqCst);
         return Err(UpstreamError::Connect(error));
@@ -343,6 +341,8 @@ where
 
 /// Connect helpers blocked at once.
 static PENDING_CONNECTS: AtomicUsize = AtomicUsize::new(0);
+/// The connect helpers' threads, reused rather than started per call (G4).
+static CONNECTORS: Pool = Pool::new("upstream-connect");
 /// The most connects that may block at once. Each holds a file descriptor, so the PEP's budget
 /// counts them.
 pub const MAX_PENDING_CONNECTS: usize = 64;

@@ -36,6 +36,7 @@ use crate::http::{self, Caps, Deadlines, HttpError, Status, time_left, write_by}
 use crate::lockfile::Lockfile;
 use crate::mcp::{self, AgentRequest, Inbound, Method, Reply};
 use crate::peercred::require_peer;
+use crate::pool::Pool;
 use crate::registry::{Admission, Registry};
 use crate::tokens::TokenError;
 use crate::upstream::{LegTimer, residence_us};
@@ -120,17 +121,20 @@ where
         }
         let serve = Arc::clone(&serve);
         let release = Arc::clone(&active);
-        let spawned = thread::Builder::new()
-            .name("connection".to_owned())
-            .spawn(move || {
-                serve(stream);
-                release.fetch_sub(1, Ordering::SeqCst);
-            });
+        let spawned = CONNECTIONS.spawn(move || {
+            serve(stream);
+            release.fetch_sub(1, Ordering::SeqCst);
+        });
         if spawned.is_err() {
             active.fetch_sub(1, Ordering::SeqCst);
         }
     }
 }
+
+/// The threads that serve connections, reused rather than started per connection (G4).
+static CONNECTIONS: Pool = Pool::new("connection");
+/// The threads that watch for an agent's disconnect (P1), reused the same way.
+static WATCHERS: Pool = Pool::new("disconnect-watcher");
 
 /// How long the accept thread waits after a failed `accept`, so running out of file descriptors
 /// is no busy loop: the connection stays in the backlog until one is free.
@@ -289,15 +293,13 @@ pub fn accept_agents(listener: &UnixListener, limit: usize, context: AgentContex
         let context = Arc::clone(&context);
         let tracked = Arc::clone(&readers);
         let release = Arc::clone(&active);
-        let spawned = thread::Builder::new()
-            .name("connection".to_owned())
-            .spawn(move || {
-                serve_agent_tracked(stream, &context, &|progress| {
-                    tracked.progress(ticket, progress)
-                });
-                tracked.done(ticket);
-                release.fetch_sub(1, Ordering::SeqCst);
+        let spawned = CONNECTIONS.spawn(move || {
+            serve_agent_tracked(stream, &context, &|progress| {
+                tracked.progress(ticket, progress)
             });
+            tracked.done(ticket);
+            release.fetch_sub(1, Ordering::SeqCst);
+        });
         if spawned.is_err() {
             readers.done(ticket);
             active.fetch_sub(1, Ordering::SeqCst);
@@ -598,17 +600,15 @@ fn watch(
         return;
     };
     drop(clone.set_read_timeout(None));
-    let spawned = thread::Builder::new()
-        .name("disconnect-watcher".to_owned())
-        .spawn(move || {
-            let mut byte = [0u8; 1];
-            // Any outcome of the read ends the watch; only one before the answer counts.
-            drop(clone.read(&mut byte));
-            if !answered.load(Ordering::SeqCst) {
-                // An actor that stopped has nothing left to release.
-                let _ = agent.send(AgentMessage::Disconnected { pep_id });
-            }
-        });
+    let spawned = WATCHERS.spawn(move || {
+        let mut byte = [0u8; 1];
+        // Any outcome of the read ends the watch; only one before the answer counts.
+        drop(clone.read(&mut byte));
+        if !answered.load(Ordering::SeqCst) {
+            // An actor that stopped has nothing left to release.
+            let _ = agent.send(AgentMessage::Disconnected { pep_id });
+        }
+    });
     // Without a watcher, a disconnect goes unseen; the call still ends on its own terms.
     drop(spawned);
 }

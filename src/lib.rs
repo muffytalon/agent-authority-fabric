@@ -29,6 +29,7 @@ pub mod mcp;
 pub mod peercred;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod poll;
+pub mod pool;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod registry;
 pub mod schema;

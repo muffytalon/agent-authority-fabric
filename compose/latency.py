@@ -20,8 +20,14 @@ PEP_LOAD_RUNS runs (5), each from empty volumes, and the report shows every one.
 
 Exits 0 only if every run's p99 is within G4's 25 ms and nothing failed. Tokens never reach the
 output.
+
+Diagnostic switches, none of them part of a G4 record:
+- PEP_LOAD_RAW=DIR writes each run's calls, probes and full logs to DIR, so a stall can be split
+  hop by hop (WEEK2_PLAN §4, Step 11, 2026-11-24).
+- PEP_LOAD_DISK_PROBE=0 leaves out the disk probe.
+- PEP_LOAD_EXTRA_COMPOSE=FILE[:FILE] layers compose overrides on top.
 """
-import datetime, json, os, platform, sys, time
+import datetime, gzip, json, os, platform, sys, time
 
 import check
 import kit
@@ -30,6 +36,8 @@ from kit import BIN, SOCKET, call_request, raw_request
 
 check.PROJECT = "pep-load"
 check.COMPOSE_FILES = ["compose.yaml", "compose/load.yaml"]
+# PEP_LOAD_EXTRA_COMPOSE=FILE[:FILE]: diagnostic overrides layered on top.
+check.COMPOSE_FILES += [name for name in os.environ.get("PEP_LOAD_EXTRA_COMPOSE", "").split(":") if name]
 PROFILES = ("--profile", "run", "--profile", "load")
 
 EPISODES = 44
@@ -48,7 +56,8 @@ EARLIER_RUNS = """Before this batch, 20 runs were made on 2026-11-06 with the jo
 - **What those stalls looked like.** One stretch of a run, not a general tail. In the 552 ms run calls were slow from 50.3 s to 55.5 s, every failure fell inside that stretch, and the worst call waited 1.58 s. Medians did not move.
 - **The failures were the stall's, and failed closed.** Of the 66, 45 were payments denied `ProvenanceMissing`, because a payment arrived before its delayed lookup was recorded. The other 21 were reads answered `PEP_UNAVAILABLE`. The 400 were not broken down the same way: 393 denied and 7 unavailable.
 - **Where the time went.** Mostly outside the PEP's and the broker's residence and outside `tool_us`, between the tool finishing that measure and the PEP having the reply. The stub tool writes its log line in that gap, on the same disk as the journal.
-- **The cause is not proven.** The worst scheduling delay in the 552 ms run was 69 ms, so the CPU alone does not explain it. The disk probes came later, and no large stall has happened with them running. Of the smaller stalls in the table above, some line up with a slow `sync_data` and others with nothing, so they are not explained either. The stall table will show which probe moves if a large stall comes back."""
+- **The cause is not proven.** The worst scheduling delay in the 552 ms run was 69 ms, so the CPU alone does not explain it. The disk probes came later, and no large stall has happened with them running. Of the smaller stalls in the table above, some line up with a slow `sync_data` and others with nothing, so they are not explained either. The stall table will show which probe moves if a large stall comes back.
+- **Explained on 2026-11-24.** The PEP, the broker, the tools and this harness started a thread per call, and in this VM a thread's start and exit costs about five times the CPU when many overlap, so a burst doubled the PEP's CPU per call and the backlog stopped draining; the generator's polling slot wait then took the CPUs the stack needed. Threads are now reused and the generator waits asleep (WEEK2_PLAN §4, Step 11)."""
 BIG_TEXT_BYTES = 900 * 1024
 LARGEST_TEXT_BYTES = 1024 * 1024 - 4096   # the cap holds the PEP's own `_meta` too (RV5 V2)
 
@@ -77,7 +86,7 @@ def plan_main(tokens):
                 tool, key, kind, request = "get_note", note, "read", call_request("get_note", {"key": note}, token)
             else:
                 tool, key, kind, request = None, None, "list", raw_request("tools/list", {}, token)
-            calls.append(dict(at_ms=at_ms, request=request, tool=tool, key=key, kind=kind))
+            calls.append(dict(at_ms=at_ms, request=request, tool=tool, key=key, kind=kind, episode=episode))
     calls.sort(key=lambda call: call["at_ms"])
     return calls
 
@@ -125,12 +134,46 @@ def logs():
     return executions, residence, broker
 
 
+RAW_RUNS = [0]
+
+
+def save_raw(started, calls, results, executions, residence, broker, probes):
+    """PEP_LOAD_RAW=DIR: every measured call of the run, with its parts, and the probes, as
+    DIR/run-N.json, for diagnosing a stall: `started` is the Unix time the plan's time 0 was."""
+    directory = os.environ.get("PEP_LOAD_RAW")
+    if not directory:
+        return
+    RAW_RUNS[0] += 1
+    rows = []
+    for call, result in zip(calls, results):
+        execution = executions.get((call["tool"], call["key"])) or {}
+        upstream_id = execution.get("upstream_id")
+        rows.append([call["at_ms"], call["kind"], call["tool"], call["key"], call["episode"], result["reply"],
+                     result["latency_us"], execution.get("tool_us"), residence.get(upstream_id),
+                     broker.get(upstream_id)])
+    os.makedirs(directory, exist_ok=True)
+    with open(os.path.join(directory, f"run-{RAW_RUNS[0]}.json"), "w") as f:
+        json.dump(dict(started=started, warm_up=WARM_UP,
+                       columns=["at_ms", "kind", "tool", "key", "episode", "reply", "latency_us", "tool_us",
+                                "pep_us", "broker_us"],
+                       rows=rows, probes=probes), f)
+    # Every log line, with its timestamps, so that a slow call can be split hop by hop.
+    with gzip.open(os.path.join(directory, f"run-{RAW_RUNS[0]}-logs.json.gz"), "wt") as f:
+        json.dump({name: lines("oracle", path) for name, path in (
+            ("decisions", "/logs/pep/decisions.jsonl"), ("broker", "/logs/broker/broker.jsonl"),
+            ("tool-a", "/logs/tool-a/tool.jsonl"), ("tool-b", "/logs/tool-b/tool.jsonl"))}, f)
+
+
 def main_run(generator, tokens):
     calls = plan_main(tokens)
     print(f"note: {len(calls)} calls over {len(tokens)} episodes, about {calls[-1]['at_ms'] // 1000} s", flush=True)
-    results, probes = drive(generator, calls, DISK)
+    started = time.time()
+    # PEP_LOAD_DISK_PROBE=0 leaves out the disk probe, whose ~80 fsyncs a second share the journal's disk.
+    probe_disk = (DISK,) if os.environ.get("PEP_LOAD_DISK_PROBE", "1") != "0" else ()
+    results, probes = drive(generator, calls, *probe_disk)
     measured = list(zip(calls, results))[WARM_UP:]
     executions, residence, broker = logs()
+    save_raw(started, calls, results, executions, residence, broker, probes)
     gate, gate_at, pep, hop, total = [], [], [], [], []
     per_kind, pep_kind, broker_kind = {}, {}, {}
     failed = {}
@@ -228,7 +271,7 @@ def write_report(runs):
         f"| {number} | {len(each['result']['gate'])} of {each['result']['count']} | {ms(percentile(each['result']['gate'], 0.5))} "
         f"| {each['p99_ms']:.2f} | {ms(percentile(each['result']['gate'], 0.999))} | {ms(max(each['result']['gate']))} "
         f"| {'met' if each['passed'] else 'NOT met'} | {ms(max(probe_values(each['result'], 'late')))} "
-        f"| {ms(max(probe_values(each['result'], 'sync')))} | {ms(max(probe_values(each['result'], 'append')))} |"
+        f"| {ms(max(probe_values(each['result'], 'sync'), default=0))} | {ms(max(probe_values(each['result'], 'append'), default=0))} |"
         for number, each in enumerate(runs, 1))
     stall_rows = "\n".join(
         f"| {number} | {stall['start'] / 1000:.1f} to {stall['end'] / 1000:.1f} | {stall['calls']} | {ms(stall['worst'])} "

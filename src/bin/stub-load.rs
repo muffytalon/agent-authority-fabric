@@ -4,7 +4,8 @@
 //! and sends each at its time, on its own connection, whatever the calls before it are doing: a
 //! closed loop would slow down with the PEP and hide its queueing. At most `CAP` calls are in
 //! flight, and a call that has to wait for one counts that wait, because latency runs from the
-//! time the plan says it should have gone.
+//! time the plan says it should have gone. Calls wait for a slot in plan order and asleep: the
+//! stack under test shares the CPUs, so waiting must cost none.
 //!
 //! One line per call on stdout, in plan order: `{"i":N,"latency_us":N,"reply":KIND}`, then one
 //! line of `{"late":[[AT_MS,US],...],"sync":[...],"append":[...]}`, from threads that touch no PEP
@@ -16,16 +17,18 @@ use std::io::{self, Read, Write};
 use std::os::unix::fs::FileExt;
 use std::path::Path;
 use std::process::ExitCode;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, mpsc};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use pep_sidecar::jcs::{self, JcsValue, ParseOptions};
+use pep_sidecar::pool::Pool;
 use pep_sidecar::stubs::raw_call;
 
-/// How often a call waiting for a slot looks again.
-const SLOT_WAIT: Duration = Duration::from_micros(200);
+/// The calls' threads, reused rather than started per call: the stack under test shares the CPUs.
+static CALLS: Pool = Pool::new("call");
+
 /// How long the jitter thread sleeps each time.
 const JITTER_SLEEP: Duration = Duration::from_millis(1);
 /// How long the disk probe rests between writes.
@@ -37,6 +40,48 @@ const DISK_FILE_BYTES: u64 = 1024 * 1024;
 
 /// One reading of a probe: milliseconds into the run, and microseconds it took.
 type Sample = (u128, u128);
+
+/// The calls in flight, at most `cap`. The dispatcher takes a slot before it starts a call and
+/// sleeps while none is free. Calls used to poll for one every 200 µs, each on its own thread:
+/// once a stall filled the cap, hundreds of polling threads took the CPUs the PEP needed to
+/// catch up, and the stall became a collapse with p99s of seconds.
+struct Slots {
+    held: Mutex<usize>,
+    freed: Condvar,
+    cap: usize,
+}
+
+impl Slots {
+    fn new(cap: usize) -> Self {
+        Self {
+            held: Mutex::new(0),
+            freed: Condvar::new(),
+            cap: cap.max(1),
+        }
+    }
+
+    /// Waits, asleep, for a free slot and takes it. `false` only if the count is poisoned.
+    fn acquire(&self) -> bool {
+        let Ok(held) = self.held.lock() else {
+            return false;
+        };
+        let Ok(mut held) = self.freed.wait_while(held, |held| *held >= self.cap) else {
+            return false;
+        };
+        // A count of threads, at most `cap`: saturating only satisfies the lint.
+        *held = held.saturating_add(1);
+        true
+    }
+
+    /// Gives a slot back, and wakes the dispatcher if it is waiting for one.
+    fn release(&self) {
+        if let Ok(mut held) = self.held.lock() {
+            // Never below zero: each release follows its own acquire.
+            *held = held.saturating_sub(1);
+            self.freed.notify_one();
+        }
+    }
+}
 
 /// How late each 1 ms sleep woke, until `stop`.
 fn jitter(start: Instant, stop: &AtomicBool) -> Vec<Sample> {
@@ -129,7 +174,7 @@ fn plan(text: &str) -> Option<Vec<Planned>> {
 
 fn run(socket: &str, cap: usize, planned: Vec<Planned>, directory: Option<String>) {
     let socket: Arc<str> = Arc::from(socket);
-    let in_flight = Arc::new(AtomicUsize::new(0));
+    let slots = Arc::new(Slots::new(cap));
     let (done, results) = mpsc::channel();
     let count = planned.len();
     let stop = Arc::new(AtomicBool::new(false));
@@ -145,24 +190,23 @@ fn run(socket: &str, cap: usize, planned: Vec<Planned>, directory: Option<String
     });
     for (index, call) in planned.into_iter().enumerate() {
         thread::sleep(call.at.saturating_sub(start.elapsed()));
+        // Past the cap, the plan's later calls queue behind this one, and every wait counts:
+        // latency runs from `call.at`.
+        if !slots.acquire() {
+            log("the slot count is poisoned");
+            break;
+        }
         let socket = Arc::clone(&socket);
-        let in_flight = Arc::clone(&in_flight);
+        let held = Arc::clone(&slots);
         let done = done.clone();
-        let spawned = thread::Builder::new().spawn(move || {
-            while in_flight
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |held| {
-                    (held < cap).then(|| held.saturating_add(1))
-                })
-                .is_err()
-            {
-                thread::sleep(SLOT_WAIT);
-            }
+        let spawned = CALLS.spawn(move || {
             let reply = raw_call(&socket, &call.request, None);
-            in_flight.fetch_sub(1, Ordering::SeqCst);
             let latency = start.elapsed().saturating_sub(call.at);
+            held.release();
             let _ = done.send((index, latency, reply));
         });
         if spawned.is_err() {
+            slots.release();
             log("a thread would not start");
         }
     }

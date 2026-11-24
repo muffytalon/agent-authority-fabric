@@ -38,11 +38,15 @@ use crate::engine::{
 use crate::forward::{self, BrokerOutcome, UpstreamReply, UpstreamRequest};
 use crate::jcs::JcsValue;
 use crate::journal::{JournalHandle, OutcomeKind, Record};
+use crate::pool::Pool;
 use crate::tokens::{
     CALL_PROOF_TTL_SECS, CallProofClaims, Es256Signer, PaymentClaims, TokenError, issue_call_proof,
     new_jti,
 };
 use crate::upstream::LegTimer;
+
+/// The threads that carry forwarded calls upstream, reused rather than started per call (G4).
+static UPSTREAM_WORKERS: Pool = Pool::new("upstream");
 
 /// How long past the upstream timeout the actor waits for a worker's report.
 const LEG_MARGIN: Duration = Duration::from_secs(1);
@@ -593,16 +597,14 @@ impl Actor {
         let timeout = self.services.upstream_timeout;
         let pep_id = call.pep_id.clone();
         let leg = Arc::clone(&call.leg);
-        let worker = thread::Builder::new()
-            .name("upstream".to_owned())
-            .spawn(move || {
-                let Ok(request) = ready.recv() else {
-                    return;
-                };
-                let body = upstream.call_timed(&request, timeout, &leg);
-                // An actor that stopped has no one to tell.
-                let _ = events.event(HostEvent::Upstream { pep_id, body });
-            });
+        let worker = UPSTREAM_WORKERS.spawn(move || {
+            let Ok(request) = ready.recv() else {
+                return;
+            };
+            let body = upstream.call_timed(&request, timeout, &leg);
+            // An actor that stopped has no one to tell.
+            let _ = events.event(HostEvent::Upstream { pep_id, body });
+        });
         if worker.is_err() {
             self.unforward(&call);
             answer(&call.reply, CallReply::Unavailable);

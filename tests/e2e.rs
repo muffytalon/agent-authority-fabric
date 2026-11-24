@@ -468,6 +468,20 @@ impl World {
             .collect()
     }
 
+    /// The lines of `log` once one is `wanted`, or after 5 s. The broker writes a call's line only
+    /// after its reply has gone (O1's residence runs to the last byte), so the line can land a
+    /// moment after the agent has its answer.
+    fn lines_with(&self, log: &str, wanted: impl Fn(&JcsValue) -> bool) -> Vec<JcsValue> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let lines = self.lines(log);
+            if lines.iter().any(&wanted) || Instant::now() >= deadline {
+                return lines;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     fn settled(&self, log: &str) -> String {
         // The journal's `reserve` and `outcome` records are queued, not waited for, so they can
         // reach the file a moment after the reply.
@@ -613,14 +627,12 @@ fn reads_payments_a_step_up_and_every_broker_outcome() {
     assert_eq!(payment.get("executed").unwrap().as_bool(), Some(true));
     let key = text(payment, "/idempotency_key").unwrap();
     assert!(key.starts_with("pep-"));
-    let broker = world.lines("logs/broker.jsonl");
-    let forwarded = broker
-        .iter()
-        .find(|line| {
-            text(line, "/idempotency_key").as_deref() == Some(key.as_str())
-                && text(line, "/verdict").as_deref() == Some("forwarded")
-        })
-        .unwrap();
+    let is_forwarded = |line: &JcsValue| {
+        text(line, "/idempotency_key").as_deref() == Some(key.as_str())
+            && text(line, "/verdict").as_deref() == Some("forwarded")
+    };
+    let broker = world.lines_with("logs/broker.jsonl", is_forwarded);
+    let forwarded = broker.iter().find(|line| is_forwarded(line)).unwrap();
     assert_eq!(text(forwarded, "/outcome").as_deref(), Some("executed"));
     assert!(text(forwarded, "/jti").is_some());
     // A step-up: the payment waits until the operator approves it.
@@ -921,12 +933,9 @@ fn a_refused_call_proof_executes_nothing() {
             .iter()
             .any(|line| text(line, "/tool").as_deref() == Some("pay_invoice"))
     );
-    let broker = world.lines("logs/broker.jsonl");
-    assert!(
-        broker
-            .iter()
-            .any(|line| text(line, "/reason").as_deref() == Some("call proof refused"))
-    );
+    let refused = |line: &JcsValue| text(line, "/reason").as_deref() == Some("call proof refused");
+    let broker = world.lines_with("logs/broker.jsonl", refused);
+    assert!(broker.iter().any(refused));
     let journal = world.lines("state/journal.jsonl");
     assert_eq!(
         text(journal.last().unwrap(), "/result").as_deref(),
@@ -984,11 +993,12 @@ fn a_lost_journal_cannot_pay_an_invoice_twice() {
     assert_eq!(keys.len(), 2);
     assert_ne!(keys[0].0, keys[1].0, "F-07's key differs per reservation");
     assert_eq!(keys[0].1, keys[1].1, "the invoice's does not");
-    let broker = world.lines("logs/broker.jsonl");
-    assert!(broker.iter().any(|line| {
+    let forwarded = |line: &JcsValue| {
         text(line, "/entity_key").as_deref() == Some(keys[0].1.as_str())
             && text(line, "/verdict").as_deref() == Some("forwarded")
-    }));
+    };
+    let broker = world.lines_with("logs/broker.jsonl", forwarded);
+    assert!(broker.iter().any(forwarded));
     assert!(broker.iter().all(|line| line.get("broker_us").is_some()));
     let tool_log = world.lines("logs/tool-a.jsonl");
     assert!(tool_log.iter().all(|line| line.get("tool_us").is_some()));
@@ -1077,6 +1087,10 @@ fn a_captured_proof_replays_to_nothing() {
     let token = world.start_episode("pay");
     world.call(1, "get_invoice", r#"{"invoice_id":"INV-1001"}"#, &token);
     world.call(2, "pay_invoice", PAY, &token);
+    // The payment's own broker line comes after its reply: let it land before the mark.
+    world.lines_with("logs/broker.jsonl", |line| {
+        text(line, "/outcome").as_deref() == Some("executed")
+    });
     let mark = world.layout().mark().unwrap();
     let (uid, gid) = ids();
     let injector = Command::new(env!("CARGO_BIN_EXE_stub-injector"))
@@ -1089,10 +1103,18 @@ fn a_captured_proof_replays_to_nothing() {
     let out = String::from_utf8(injector.stdout).unwrap();
     assert!(injector.status.success(), "{out}");
     assert!(out.ends_with("{\"accepted\":0,\"attempts\":2}\n"), "{out}");
-    let logs = world.layout().read_from(&mark).unwrap();
+    // Each refusal's broker line follows its reply too.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let logs = loop {
+        let logs = world.layout().read_from(&mark).unwrap();
+        if logs.broker.len() >= 2 || Instant::now() >= deadline {
+            break logs;
+        }
+        thread::sleep(Duration::from_millis(10));
+    };
     assert_eq!(oracle::judge(&logs, Expect::Deny).findings, []);
     // The replay cache refused each one, so the injector's requests reached it.
-    assert_eq!(logs.broker.len(), 2);
+    assert_eq!(logs.broker.len(), 2, "{:?}", logs.broker);
     assert!(logs.broker.iter().all(|line| {
         text(line, "/reason").as_deref() == Some("call proof replayed")
             && text(line, "/verdict").as_deref() == Some("rejected")
