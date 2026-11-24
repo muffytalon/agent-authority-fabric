@@ -34,3 +34,10 @@ services:
     profiles: [load]
     build: { context: ., target: probe }
     image: pep-gate1/probe:dev
+
+# The stub tool servers' state (dedupe store and log) on tmpfs: a real tool server does not share
+# the PEP's disk, and on it the stubs' per-payment fsync and log append after `tool_us` were
+# counted in G4 (WEEK2_PLAN §4, Step 11, decided 2026-11-24). Owners and modes as the images give.
+volumes:
+  tool-a-state: { driver: local, driver_opts: { type: tmpfs, device: tmpfs, o: "uid=20005,gid=20007,mode=2750" } }
+  tool-b-state: { driver: local, driver_opts: { type: tmpfs, device: tmpfs, o: "uid=20008,gid=20007,mode=2750" } }
