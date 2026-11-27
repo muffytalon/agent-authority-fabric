@@ -286,14 +286,27 @@ fn run(path: &Path) -> Result<(), String> {
         shared,
         services,
     );
-    if let Some(previous) = unclean {
+    let marker = journal::unsynced_marker(&config.journal.path);
+    // A symlink counts as the marker too: fail closed.
+    let unsynced = fs::symlink_metadata(&marker).is_ok();
+    let why = match (unclean, unsynced) {
+        (Some(previous), _) => Some((
+            format!("the run on kernel {previous} ended without a clean stop"),
+            previous,
+        )),
+        (None, true) => Some((
+            "a journal fsync failed in an earlier run".to_owned(),
+            "unsynced".to_owned(),
+        )),
+        (None, false) => None,
+    };
+    if let Some((why, previous)) = why {
         log(&format!(
-            "pep-sidecar: the run on kernel {previous} ended without a clean stop, so its last \
-             journal records may be lost; no episode starts until the operator checks its \
-             payments against the broker's log and its writes against the tools, then sends \
-             `resume`"
+            "pep-sidecar: {why}, so its last journal records may be lost; no episode starts \
+             until the operator checks its payments against the broker's log and its writes \
+             against the tools, then sends `resume`"
         ));
-        registry.hold_until_resumed(previous);
+        registry.hold_until_resumed(previous, unsynced.then_some(marker));
     }
     let read_timeout = millis(limits.read_timeout_ms);
 
@@ -411,13 +424,17 @@ fn spawn_signal_thread(
                 // Without a boot id every record was fsynced before its call went on.
                 None => journal.commit(&[]),
             };
-            if let Err(error) = closed {
-                log(&format!(
-                    "pep-sidecar: the clean stop could not be journaled, so a next run on \
-                     another kernel will wait for `resume`: {error}"
-                ));
-            }
-            let _ = stopped.send(Ending::Signalled(signal));
+            let ending = match closed {
+                Ok(()) => Ending::Signalled(signal),
+                Err(error) => {
+                    log(&format!(
+                        "pep-sidecar: the clean stop could not be journaled, so a next run on \
+                         another kernel will wait for `resume`: {error}"
+                    ));
+                    Ending::Failed("the clean stop could not be journaled")
+                }
+            };
+            let _ = stopped.send(ending);
         })
         .map(drop)
         .map_err(|error| format!("signal thread: {error}"))

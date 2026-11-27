@@ -29,7 +29,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions, Permissions};
 use std::io::{self, Read, Write};
 use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
@@ -763,6 +763,10 @@ pub struct Journal {
     end: u64,
     /// How far the zero-filled space runs.
     capacity: u64,
+    /// The marker a failed fsync behind leaves ([`unsynced_marker`]).
+    marker: PathBuf,
+    /// Whether a syncer fsyncs behind, so growing need not fsync on the writer's path.
+    synced_behind: bool,
     _lock: File,
 }
 
@@ -823,6 +827,8 @@ impl Journal {
                 file,
                 end,
                 capacity,
+                marker: unsynced_marker(path),
+                synced_behind: false,
                 _lock: lock,
             },
             records,
@@ -834,10 +840,43 @@ impl Journal {
 /// a file that grows must also commit its new size to the filesystem's own journal, which on this
 /// machine costs 3.1 ms against 1.2 ms (O1), and a payment's latency is mostly this wait.
 fn preallocate(file: &File, from: u64, bytes: u64) -> Result<u64, JournalError> {
+    let end = zero_fill(file, from, bytes)?;
+    file.sync_all()?;
+    Ok(end)
+}
+
+/// Zero-fills `bytes` of the file from `from`, not yet durably, and returns where that ends.
+fn zero_fill(file: &File, from: u64, bytes: u64) -> Result<u64, JournalError> {
     let zeros = vec![0u8; usize::try_from(bytes).map_err(|_| JournalError::Encoding)?];
     file.write_all_at(&zeros, from)?;
-    file.sync_all()?;
     from.checked_add(bytes).ok_or(JournalError::Encoding)
+}
+
+/// The file a failed fsync behind leaves beside the journal at `path`: `<journal>.unsynced`.
+/// After an fsync error the kernel may already have dropped the pages it could not write, so
+/// even a restart on the same kernel cannot trust them, and the next boot holds episodes until
+/// the operator's `resume`, which removes it (R1).
+#[must_use]
+pub fn unsynced_marker(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(".unsynced");
+    PathBuf::from(name)
+}
+
+/// Leaves the marker, durably if the disk still allows it. Best effort: the failure it marks is
+/// the disk's, so it may fail too, which the log line already reports.
+fn mark_unsynced(marker: &Path) {
+    let made = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(JOURNAL_MODE)
+        .custom_flags(nix::libc::O_NOFOLLOW)
+        .open(marker)
+        .and_then(|file| file.sync_all());
+    let parent = marker.parent().map(File::open);
+    if let (Ok(()), Some(Ok(directory))) = (made, parent) {
+        drop(directory.sync_all());
+    }
 }
 
 /// An fsync of everything written so far, run by the syncer thread.
@@ -850,15 +889,19 @@ trait Sink: Send + 'static {
 
     /// An fsync that another thread can run while this one writes, for syncing behind. A sink
     /// without one cannot sync behind.
-    fn syncer(&self) -> io::Result<SyncFn> {
+    fn syncer(&mut self) -> io::Result<SyncFn> {
         Err(io::Error::other("this sink cannot sync behind"))
     }
 }
 
 impl Sink for Journal {
-    fn syncer(&self) -> io::Result<SyncFn> {
+    fn syncer(&mut self) -> io::Result<SyncFn> {
         let file = self.file.try_clone()?;
-        Ok(Box::new(move || file.sync_data()))
+        let marker = self.marker.clone();
+        self.synced_behind = true;
+        Ok(Box::new(move || {
+            file.sync_data().inspect_err(|_| mark_unsynced(&marker))
+        }))
     }
 
     fn write_batch(&mut self, bytes: &[u8], sync: bool) -> io::Result<()> {
@@ -869,8 +912,14 @@ impl Sink for Journal {
             .ok_or(io::ErrorKind::InvalidInput)?;
         if end > self.capacity {
             let more = PREALLOCATED_BYTES.max(length);
-            self.capacity = preallocate(&self.file, self.capacity, more)
-                .map_err(|_| io::Error::other("the journal could not grow"))?;
+            // Syncing behind, the syncer's next `sync_data` makes the new size durable too, so a
+            // call waiting for this write does not wait for that fsync.
+            let grown = if self.synced_behind {
+                zero_fill(&self.file, self.capacity, more)
+            } else {
+                preallocate(&self.file, self.capacity, more)
+            };
+            self.capacity = grown.map_err(|_| io::Error::other("the journal could not grow"))?;
         }
         self.file.write_all_at(bytes, self.end)?;
         self.end = end;
@@ -1067,7 +1116,7 @@ struct Behind {
     failed: Arc<AtomicBool>,
 }
 
-fn spawn_sink<S: Sink>(sink: S, behind: bool) -> io::Result<(JournalHandle, JoinHandle<()>)> {
+fn spawn_sink<S: Sink>(mut sink: S, behind: bool) -> io::Result<(JournalHandle, JoinHandle<()>)> {
     let syncer = if behind {
         Some(spawn_syncer(sink.syncer()?)?)
     } else {
@@ -1895,6 +1944,46 @@ mod tests {
     }
 
     #[test]
+    fn syncing_behind_the_journal_grows_without_an_fsync_in_the_way() {
+        let dir = TempDir::new();
+        let (journal, _) = dir.open().unwrap();
+        let (handle, writer) = spawn_writer_syncing_behind(journal).unwrap();
+        let line_bytes = forwarded(EID, 1).to_line().unwrap().len();
+        let count = PREALLOCATED_BYTES / u64::try_from(line_bytes).unwrap() * 2;
+        for rid in 1..=count {
+            handle
+                .enqueue(&[reserve(EID, rid, "pay", "INV-1", 100)])
+                .ok();
+            handle.write_ahead(&[forwarded(EID, rid)]).unwrap();
+        }
+        handle.close(&stopped(KERNEL_A)).unwrap();
+        drop(handle);
+        writer.join().unwrap();
+        let (_, records) = dir.open().unwrap();
+        // Every forward and the stop are there, in order, past two growths.
+        let forwards = records
+            .iter()
+            .filter(|record| matches!(record, Record::Forwarded { .. }))
+            .count();
+        assert_eq!(forwards, usize::try_from(count).unwrap());
+        assert_eq!(records.last(), Some(&stopped(KERNEL_A)));
+    }
+
+    #[test]
+    fn a_failed_fsync_leaves_a_private_marker_beside_the_journal() {
+        let dir = TempDir::new();
+        let marker = unsynced_marker(&dir.journal());
+        assert_eq!(marker, dir.path.join("journal.jsonl.unsynced"));
+        mark_unsynced(&marker);
+        let metadata = fs::symlink_metadata(&marker).unwrap();
+        assert!(metadata.file_type().is_file());
+        assert_eq!(metadata.mode() & 0o7777, JOURNAL_MODE);
+        // A second failure leaves it as it is.
+        mark_unsynced(&marker);
+        assert!(fs::symlink_metadata(&marker).unwrap().file_type().is_file());
+    }
+
+    #[test]
     fn the_journal_grows_and_a_new_boot_writes_where_it_ended() {
         let dir = TempDir::new();
         let (journal, _) = dir.open().unwrap();
@@ -2116,7 +2205,7 @@ mod tests {
             Ok(())
         }
 
-        fn syncer(&self) -> io::Result<SyncFn> {
+        fn syncer(&mut self) -> io::Result<SyncFn> {
             let syncs = Arc::clone(&self.syncs);
             let fails = self.sync_fails;
             Ok(Box::new(move || {

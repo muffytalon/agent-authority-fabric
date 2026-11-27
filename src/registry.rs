@@ -11,6 +11,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Read};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, mpsc};
 use std::time::{Duration, Instant};
@@ -135,8 +136,9 @@ struct Inner {
     /// not mint is refused with no signature check, and with no crypto under this lock (T1,
     /// RV5 V6). State stays keyed by eid.
     by_token: BTreeMap<String, u128>,
-    /// Set while a run that may have lost journal records awaits `resume`: its boot id (R1).
-    unclean: Option<String>,
+    /// Set while a run that may have lost journal records awaits `resume`: its boot id, or why,
+    /// and the failed-fsync marker to remove, if there is one (R1).
+    unclean: Option<(String, Option<PathBuf>)>,
 }
 
 /// The PEP's episodes.
@@ -194,23 +196,33 @@ impl Registry {
     }
 
     /// Refuses every `start_episode` until [`Self::resume`]: the run on the kernel with boot id
-    /// `previous` may have lost its last journal records (R1). With no episode, no call runs.
-    pub fn hold_until_resumed(&self, previous: String) {
+    /// `previous` may have lost its last journal records, or a journal fsync failed and left
+    /// `marker` (R1). With no episode, no call runs.
+    pub fn hold_until_resumed(&self, previous: String, marker: Option<PathBuf>) {
         // A poisoned lock already refuses every start.
         if let Ok(mut inner) = self.inner.lock() {
-            inner.unclean = Some(previous);
+            inner.unclean = Some((previous, marker));
         }
     }
 
-    /// `resume` (R1): journals the operator's resume, fsynced, then lets episodes start. Does
-    /// nothing if nothing is held.
+    /// `resume` (R1): removes the failed-fsync marker, if any, journals the operator's resume,
+    /// fsynced, then lets episodes start. Does nothing if nothing is held.
     ///
     /// # Errors
     ///
-    /// Returns [`ControlError::Unavailable`] if the journal refuses the record; the hold stays.
+    /// Returns [`ControlError::Unavailable`] if the marker cannot be removed or the journal
+    /// refuses the record; the hold stays.
     pub fn resume(&self, _host: &HostAuthority) -> Result<(), ControlError> {
         let mut inner = self.lock()?;
-        if let Some(previous) = inner.unclean.clone() {
+        if let Some((previous, marker)) = inner.unclean.clone() {
+            if let Some(marker) = marker {
+                match std::fs::remove_file(&marker) {
+                    Err(error) if error.kind() != io::ErrorKind::NotFound => {
+                        return Err(ControlError::Unavailable);
+                    }
+                    _ => {}
+                }
+            }
             self.services
                 .journal
                 .commit(&[Record::Resumed { previous }])
@@ -574,7 +586,7 @@ mod tests {
 
     struct Fixture {
         registry: Arc<Registry>,
-        dir: std::path::PathBuf,
+        dir: PathBuf,
     }
 
     impl Drop for Fixture {
@@ -728,7 +740,7 @@ mod tests {
         let registry = &fixture.registry;
         // Nothing held: resume is a no-op that journals nothing.
         registry.resume(&host()).unwrap();
-        registry.hold_until_resumed("0c7a3f6e-1b2d-4e5f-8a9b-0c1d2e3f4a5b".to_owned());
+        registry.hold_until_resumed("0c7a3f6e-1b2d-4e5f-8a9b-0c1d2e3f4a5b".to_owned(), None);
         assert_eq!(registry.start(&host(), "a"), Err(ControlError::NeedsResume));
         registry.resume(&host()).unwrap();
         let a = registry.start(&host(), "a").unwrap();
@@ -739,6 +751,19 @@ mod tests {
             lines,
             [r#"{"previous":"0c7a3f6e-1b2d-4e5f-8a9b-0c1d2e3f4a5b","type":"resumed"}"#]
         );
+    }
+
+    #[test]
+    fn resume_removes_the_failed_fsync_marker() {
+        let fixture = fixture(2, 10, 1800);
+        let registry = &fixture.registry;
+        let marker = fixture.dir.join("journal.jsonl.unsynced");
+        std::fs::write(&marker, b"").unwrap();
+        registry.hold_until_resumed("unsynced".to_owned(), Some(marker.clone()));
+        assert_eq!(registry.start(&host(), "a"), Err(ControlError::NeedsResume));
+        registry.resume(&host()).unwrap();
+        assert!(!marker.exists());
+        registry.start(&host(), "a").unwrap();
     }
 
     #[test]

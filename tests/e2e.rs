@@ -1074,6 +1074,23 @@ fn a_run_that_may_have_lost_records_holds_episodes_until_resumed() {
     // And it stays resumed across a restart on this kernel.
     world.start_pep();
     world.start_episode("pay");
+    // A failed fsync's marker holds even a restart on the same kernel, until resume removes it.
+    let mut pep = world.pep.take().unwrap();
+    drop(pep.kill());
+    drop(pep.wait());
+    let marker = world.path("state/journal.jsonl.unsynced");
+    fs::write(&marker, b"").unwrap();
+    let boot = world.start_pep();
+    assert!(
+        boot.iter().any(|line| line.contains("fsync failed")),
+        "{boot:?}"
+    );
+    let refused = world.operator(r#"{"call":"start_episode","intent":"pay"}"#);
+    assert_eq!(text(&refused, "/error").as_deref(), Some("needs_resume"));
+    let resumed = world.operator(r#"{"call":"resume"}"#);
+    assert!(resumed.pointer("/result").is_some(), "{resumed:?}");
+    assert!(!marker.exists());
+    world.start_episode("pay");
 }
 
 /// RV5 D6: a tool's declines stop the intent, a restart does not reset them, and a decline does
