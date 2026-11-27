@@ -136,6 +136,24 @@ static CONNECTIONS: Pool = Pool::new("connection");
 /// The threads that watch for an agent's disconnect (P1), reused the same way.
 static WATCHERS: Pool = Pool::new("disconnect-watcher");
 
+/// Starts `count` connection threads now and keeps them ([`Pool::warm`]).
+///
+/// # Errors
+///
+/// The error of starting a thread.
+pub fn warm_connections(count: usize) -> io::Result<()> {
+    CONNECTIONS.warm(count)
+}
+
+/// Starts `count` disconnect watchers now and keeps them ([`Pool::warm`]).
+///
+/// # Errors
+///
+/// The error of starting a thread.
+pub fn warm_watchers(count: usize) -> io::Result<()> {
+    WATCHERS.warm(count)
+}
+
 /// How long the accept thread waits after a failed `accept`, so running out of file descriptors
 /// is no busy loop: the connection stays in the backlog until one is free.
 const ACCEPT_BACKOFF: Duration = Duration::from_millis(50);

@@ -9,12 +9,14 @@
 //!
 //! A task never waits for a thread: with none parked, the pool starts one. So every limit that
 //! counted threads still counts the same tasks, and a slow task never holds up another. A parked
-//! thread ends after [`Pool::KEEP`] without work.
+//! thread ends after [`Pool::KEEP`] without work, except the ones [`Pool::warm`] keeps: started
+//! at boot and never ended, so a burst after a stall finds threads waiting instead of starting
+//! dozens at once, when starting one costs most.
 
 use std::io;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{self, SyncSender};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::mpsc::{self, RecvTimeoutError, SyncSender};
 use std::thread;
 use std::time::Duration;
 
@@ -30,20 +32,50 @@ pub struct Pool {
     /// dropped its receiver, so the send fails and gives the task back.
     parked: Mutex<Vec<(u64, SyncSender<Task>)>>,
     next_id: AtomicU64,
+    /// How many parked threads never end ([`Self::warm`]).
+    floor: AtomicUsize,
+    /// How long a parked thread above the floor waits for a task before it ends.
+    keep: Duration,
 }
 
 impl Pool {
-    /// How long a parked thread waits for a task before it ends.
+    /// How long a parked thread waits for a task before it ends, unless it is kept warm.
     pub const KEEP: Duration = Duration::from_secs(10);
+    /// The most threads a pool is kept warm with.
+    pub const WARM_MAX: usize = 64;
 
     /// An empty pool whose threads are named `name`.
     #[must_use]
     pub const fn new(name: &'static str) -> Self {
+        Self::with_keep(name, Self::KEEP)
+    }
+
+    /// An empty pool whose idle threads above the floor end after `keep`.
+    #[must_use]
+    pub const fn with_keep(name: &'static str, keep: Duration) -> Self {
         Self {
             name,
             parked: Mutex::new(Vec::new()),
             next_id: AtomicU64::new(0),
+            floor: AtomicUsize::new(0),
+            keep,
         }
+    }
+
+    /// Starts `count` threads, at most [`Self::WARM_MAX`], that park at once, and from now on
+    /// keeps at least that many parked: a burst after a stall then finds threads waiting (G4).
+    /// Threads above the floor still end after [`Self::KEEP`] idle.
+    ///
+    /// # Errors
+    ///
+    /// The error of [`thread::Builder::spawn`] if a thread cannot start.
+    pub fn warm(&'static self, count: usize) -> io::Result<()> {
+        let count = count.min(Self::WARM_MAX);
+        self.floor.fetch_max(count, Ordering::SeqCst);
+        for _ in 0..count {
+            self.start(Box::new(|| {}))?;
+        }
+        Ok(())
     }
 
     /// Runs `task` now: on a parked thread, or on a new one if none is parked.
@@ -64,13 +96,19 @@ impl Pool {
                 Err(mpsc::SendError(returned)) => task = returned,
             }
         }
+        self.start(task)
+    }
+
+    /// Starts a new thread that runs `task`, then parks.
+    fn start(&'static self, task: Task) -> io::Result<()> {
         thread::Builder::new()
             .name(self.name.to_owned())
             .spawn(move || self.work(task))
             .map(drop)
     }
 
-    /// Runs `first`, then each task handed over, until none comes for [`Self::KEEP`].
+    /// Runs `first`, then each task handed over, until none comes for the pool's keep while
+    /// more threads than the floor are parked.
     fn work(&'static self, first: Task) {
         let mut task = first;
         loop {
@@ -81,15 +119,30 @@ impl Pool {
                 Ok(mut parked) => parked.push((id, inbox)),
                 Err(_) => return,
             }
-            let Ok(next) = tasks.recv_timeout(Self::KEEP) else {
-                // Unlist this thread. A sender that already took the inbox gets its task back
-                // when `tasks` drops on return.
-                if let Ok(mut parked) = self.parked.lock() {
-                    parked.retain(|(parked_id, _)| *parked_id != id);
+            match self.wait(&tasks, id) {
+                Some(next) => task = next,
+                None => return,
+            }
+        }
+    }
+
+    /// The next task for the parked thread `id`, or `None` once it should end: idle for the
+    /// pool's keep while above the floor. On the way out it unlists itself; a sender that
+    /// already took its inbox gets the task back when `tasks` drops.
+    fn wait(&self, tasks: &mpsc::Receiver<Task>, id: u64) -> Option<Task> {
+        loop {
+            match tasks.recv_timeout(self.keep) {
+                Ok(next) => return Some(next),
+                Err(RecvTimeoutError::Disconnected) => return None,
+                Err(RecvTimeoutError::Timeout) => {
+                    let mut parked = self.parked.lock().ok()?;
+                    if parked.len() > self.floor.load(Ordering::SeqCst) {
+                        parked.retain(|(parked_id, _)| *parked_id != id);
+                        return None;
+                    }
+                    // At the floor: stay warm.
                 }
-                return;
-            };
-            task = next;
+            }
         }
     }
 
@@ -156,6 +209,52 @@ mod tests {
         for _ in 0..10 {
             assert_eq!(finished.recv().unwrap(), 10);
         }
+    }
+
+    fn eventually(what: &str, done: impl Fn() -> bool) {
+        let until = Instant::now() + Duration::from_secs(5);
+        while !done() {
+            assert!(Instant::now() < until, "{what} never happened");
+            thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    #[test]
+    fn a_warm_pool_keeps_its_floor_and_sheds_the_rest() {
+        static POOL: Pool = Pool::with_keep("test-warm", Duration::from_millis(30));
+        POOL.warm(2).unwrap();
+        eventually("two warm threads", || POOL.parked() == 2);
+        // A burst of four at once: the two warm threads and two new ones.
+        let started = Arc::new(AtomicUsize::new(0));
+        let (release, released) = mpsc::channel::<()>();
+        let released = Arc::new(Mutex::new(released));
+        for _ in 0..4 {
+            let started = Arc::clone(&started);
+            let released = Arc::clone(&released);
+            POOL.spawn(move || {
+                started.fetch_add(1, Ordering::SeqCst);
+                let _ = released.lock().unwrap().recv();
+            })
+            .unwrap();
+        }
+        eventually("four running", || started.load(Ordering::SeqCst) == 4);
+        for _ in 0..4 {
+            release.send(()).unwrap();
+        }
+        eventually("four parked", || POOL.parked() == 4);
+        // Idle past the keep: back to the floor, and it stays there.
+        eventually("back to the floor", || POOL.parked() == 2);
+        thread::sleep(Duration::from_millis(150));
+        assert_eq!(POOL.parked(), 2);
+    }
+
+    #[test]
+    fn warming_is_capped() {
+        static POOL: Pool = Pool::with_keep("test-cap", Duration::from_millis(30));
+        POOL.warm(Pool::WARM_MAX + 10).unwrap();
+        eventually("the cap", || POOL.parked() == Pool::WARM_MAX);
+        thread::sleep(Duration::from_millis(100));
+        assert_eq!(POOL.parked(), Pool::WARM_MAX);
     }
 
     #[test]

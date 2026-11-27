@@ -48,6 +48,15 @@ use crate::upstream::LegTimer;
 /// The threads that carry forwarded calls upstream, reused rather than started per call (G4).
 static UPSTREAM_WORKERS: Pool = Pool::new("upstream");
 
+/// Starts `count` upstream workers now and keeps them ([`Pool::warm`]).
+///
+/// # Errors
+///
+/// The error of starting a thread.
+pub fn warm_upstream_workers(count: usize) -> io::Result<()> {
+    UPSTREAM_WORKERS.warm(count)
+}
+
 /// How long past the upstream timeout the actor waits for a worker's report.
 const LEG_MARGIN: Duration = Duration::from_secs(1);
 /// The denials of one episode that reach the decision log; later ones go to the noise file.

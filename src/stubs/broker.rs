@@ -293,6 +293,10 @@ pub fn serve(
     let pep = config.pep;
     let broker = Arc::new(Broker::open(config, boot_second)?);
     let bound = bind_safe_listener(&socket).map_err(|error| error.to_string())?;
+    // Threads for a burst, started now, as the PEP does (G4).
+    crate::serve::warm_connections(connections)
+        .and_then(|()| crate::upstream::warm_connectors(connections))
+        .map_err(|error| format!("warm threads: {error}"))?;
     ready();
     accept_loop_with(
         bound.listener(),

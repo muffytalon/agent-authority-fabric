@@ -37,7 +37,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use nix::sys::signal::{SigSet, Signal};
 
-use pep_sidecar::actor::Services;
+use pep_sidecar::actor::{self, Services};
 use pep_sidecar::config::{self, Config};
 use pep_sidecar::decision_log::DecisionLog;
 use pep_sidecar::engine::{
@@ -54,9 +54,11 @@ use pep_sidecar::lockfile::{MAX_ENVELOPE_BYTES, PinnedServer};
 use pep_sidecar::peercred::bind_safe_listener;
 use pep_sidecar::poll::{PollOutcome, Served, fetch, poll, scanned_payload};
 use pep_sidecar::registry::{Registry, RegistryConfig, connection_share, new_ulid};
-use pep_sidecar::serve::{AgentContext, ControlContext, accept_agents, accept_loop, serve_control};
+use pep_sidecar::serve::{
+    self, AgentContext, ControlContext, accept_agents, accept_loop, serve_control,
+};
 use pep_sidecar::tokens::{Es256Signer, os_entropy, unix_now};
-use pep_sidecar::upstream::{BrokerClient, MAX_PENDING_CONNECTS};
+use pep_sidecar::upstream::{self, BrokerClient, MAX_PENDING_CONNECTS};
 
 /// Largest config file read.
 const MAX_CONFIG_BYTES: u64 = 16 * 1024 * 1024;
@@ -337,6 +339,13 @@ fn run(path: &Path) -> Result<(), String> {
         })
         .map_err(|error| format!("reaper thread: {error}"))?;
 
+    // Threads for a burst, started now: starting dozens at once after a stall costs most (G4).
+    let warm = limits.connections;
+    serve::warm_connections(warm)
+        .and_then(|()| serve::warm_watchers(warm))
+        .and_then(|()| actor::warm_upstream_workers(warm))
+        .and_then(|()| upstream::warm_connectors(warm))
+        .map_err(|error| format!("warm threads: {error}"))?;
     let agent = bind_safe_listener(&config.agent.socket)
         .map_err(|error| format!("agent socket: {error}"))?;
     let call_timeout = millis(limits.step_up_timeout_ms)

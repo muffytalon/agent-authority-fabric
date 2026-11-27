@@ -343,6 +343,15 @@ where
 static PENDING_CONNECTS: AtomicUsize = AtomicUsize::new(0);
 /// The connect helpers' threads, reused rather than started per call (G4).
 static CONNECTORS: Pool = Pool::new("upstream-connect");
+
+/// Starts `count` connect helpers now and keeps them ([`Pool::warm`]).
+///
+/// # Errors
+///
+/// The error of starting a thread.
+pub fn warm_connectors(count: usize) -> io::Result<()> {
+    CONNECTORS.warm(count)
+}
 /// The most connects that may block at once. Each holds a file descriptor, so the PEP's budget
 /// counts them.
 pub const MAX_PENDING_CONNECTS: usize = 64;
