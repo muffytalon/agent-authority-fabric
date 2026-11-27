@@ -20,6 +20,7 @@ use crate::config::IntentConfig;
 use crate::control::{ControlError, PendingPayment};
 use crate::engine::{HostAuthority, Ledger, PepEngine, Shared, ToolPins, encode_ulid};
 use crate::jcs;
+use crate::journal::Record;
 use crate::tokens::{
     EpisodeClaims, EpisodeStates, Es256Signer, MAX_TOKEN_BYTES, admit_minted_episode,
     mint_episode_token,
@@ -134,6 +135,8 @@ struct Inner {
     /// not mint is refused with no signature check, and with no crypto under this lock (T1,
     /// RV5 V6). State stays keyed by eid.
     by_token: BTreeMap<String, u128>,
+    /// Set while a run that may have lost journal records awaits `resume`: its boot id (R1).
+    unclean: Option<String>,
 }
 
 /// The PEP's episodes.
@@ -181,12 +184,40 @@ impl Registry {
                 live: BTreeMap::new(),
                 busy: BTreeSet::new(),
                 by_token: BTreeMap::new(),
+                unclean: None,
             }),
         })
     }
 
     fn lock(&self) -> Result<MutexGuard<'_, Inner>, ControlError> {
         self.inner.lock().map_err(|_| ControlError::Unavailable)
+    }
+
+    /// Refuses every `start_episode` until [`Self::resume`]: the run on the kernel with boot id
+    /// `previous` may have lost its last journal records (R1). With no episode, no call runs.
+    pub fn hold_until_resumed(&self, previous: String) {
+        // A poisoned lock already refuses every start.
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.unclean = Some(previous);
+        }
+    }
+
+    /// `resume` (R1): journals the operator's resume, fsynced, then lets episodes start. Does
+    /// nothing if nothing is held.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControlError::Unavailable`] if the journal refuses the record; the hold stays.
+    pub fn resume(&self, _host: &HostAuthority) -> Result<(), ControlError> {
+        let mut inner = self.lock()?;
+        if let Some(previous) = inner.unclean.clone() {
+            self.services
+                .journal
+                .commit(&[Record::Resumed { previous }])
+                .map_err(|_| ControlError::Unavailable)?;
+            inner.unclean = None;
+        }
+        Ok(())
     }
 
     /// `start_episode` (E1): a fresh eid, an engine built from the intent's ledger, its actor,
@@ -210,6 +241,9 @@ impl Registry {
             .ok_or(ControlError::UnknownIntent)?;
         let now = (self.services.now)().map_err(|_| ControlError::Unavailable)?;
         let mut inner = self.lock()?;
+        if inner.unclean.is_some() {
+            return Err(ControlError::NeedsResume);
+        }
         if inner.busy.contains(intent_name) {
             return Err(ControlError::IntentBusy);
         }
@@ -686,6 +720,25 @@ mod tests {
         );
         registry.end(&host(), a.eid).unwrap();
         registry.end(&host(), b.eid).unwrap();
+    }
+
+    #[test]
+    fn a_held_registry_starts_no_episode_until_resumed() {
+        let fixture = fixture(2, 10, 1800);
+        let registry = &fixture.registry;
+        // Nothing held: resume is a no-op that journals nothing.
+        registry.resume(&host()).unwrap();
+        registry.hold_until_resumed("0c7a3f6e-1b2d-4e5f-8a9b-0c1d2e3f4a5b".to_owned());
+        assert_eq!(registry.start(&host(), "a"), Err(ControlError::NeedsResume));
+        registry.resume(&host()).unwrap();
+        let a = registry.start(&host(), "a").unwrap();
+        registry.end(&host(), a.eid).unwrap();
+        let journal = std::fs::read_to_string(fixture.dir.join("journal.jsonl")).unwrap();
+        let lines: Vec<&str> = journal.split('\0').next().unwrap().lines().collect();
+        assert_eq!(
+            lines,
+            [r#"{"previous":"0c7a3f6e-1b2d-4e5f-8a9b-0c1d2e3f4a5b","type":"resumed"}"#]
+        );
     }
 
     #[test]

@@ -619,12 +619,13 @@ impl Actor {
             return false;
         }
         if let Some(rid) = call.rid {
-            // P1: a payment's point of forwarding is the fsync of its forwarded record.
+            // P1: a payment's point of forwarding is the write of its forwarded record, which
+            // the journal's syncer fsyncs right behind (R1).
             let eid = self.eid();
             if self
                 .services
                 .journal
-                .commit(&[Record::Forwarded { eid, rid }])
+                .write_ahead(&[Record::Forwarded { eid, rid }])
                 .is_err()
             {
                 self.unforward(&call);

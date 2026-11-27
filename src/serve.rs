@@ -652,6 +652,7 @@ fn answer_control(body: &[u8], context: &ControlContext) -> control::ControlRepl
             .and_then(|started| control::started(started.eid, &started.token, started.exp)),
         ControlRequest::EndEpisode { eid } => registry.end(host, eid).map(|()| control::done()),
         ControlRequest::Pending => control::pending(&registry.pending(host)),
+        ControlRequest::Resume => registry.resume(host).map(|()| control::done()),
         ControlRequest::TrustedInput {
             eid,
             input_id,

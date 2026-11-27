@@ -6,7 +6,9 @@
 //! Boot, in order:
 //! 1. load the config ([`pep_sidecar::config`]) and the signed lockfile it names, verified
 //!    with its signers (L1), and claim the host's authority;
-//! 2. take the journal's lock, truncate a torn tail and replay it (R1);
+//! 2. take the journal's lock, truncate a torn tail and replay it (R1); read the kernel's boot
+//!    id, journal it, and hold every `start_episode` until the operator's `resume` if the last
+//!    run ended on another kernel without a clean stop ([`journal::unclean_stop`]);
 //! 3. restore the label store, the quarantines of the loaded lockfile, and the PEP-wide set of
 //!    entities with an unresolved payment;
 //! 4. generate this boot's Episode Token and Call Proof keys, and publish the Call Proof key
@@ -15,6 +17,9 @@
 //!    quarantines it, and a failure suspends it; then one poller thread per server repeats the
 //!    poll every `drift_poll_ms`, ±20%, so drift is found within T (L1);
 //! 6. serve the control socket, then, last, the agent socket.
+//!
+//! SIGTERM or SIGINT stops the PEP cleanly: the journal's last record becomes `stopped`, and the
+//! process exits 0. Any other end leaves no `stopped`, which only matters if the kernel goes too.
 //!
 //! Logs go to stderr, one line each, and never carry a token, proof, key or credential.
 
@@ -30,6 +35,7 @@ use std::time::Duration;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use nix::sys::signal::{SigSet, Signal};
 
 use pep_sidecar::actor::Services;
 use pep_sidecar::config::{self, Config};
@@ -40,7 +46,10 @@ use pep_sidecar::engine::{
 };
 use pep_sidecar::http::Caps;
 use pep_sidecar::jcs;
-use pep_sidecar::journal::{Journal, JournalHandle, JournaledLabels, Record, replay, spawn_writer};
+use pep_sidecar::journal::{
+    self, Journal, JournalHandle, JournaledLabels, Record, replay, spawn_writer,
+    spawn_writer_syncing_behind,
+};
 use pep_sidecar::lockfile::{MAX_ENVELOPE_BYTES, PinnedServer};
 use pep_sidecar::peercred::bind_safe_listener;
 use pep_sidecar::poll::{PollOutcome, Served, fetch, poll, scanned_payload};
@@ -108,7 +117,31 @@ fn millis(duration_ms: u64) -> Duration {
     Duration::from_millis(duration_ms)
 }
 
+/// Why the PEP stops.
+enum Ending {
+    /// A listener stopped accepting: a PEP that cannot be reached or controlled stops (fail
+    /// closed).
+    Failed(&'static str),
+    /// SIGTERM or SIGINT, after the journal's `stopped` record.
+    Signalled(Signal),
+}
+
+/// The signals that stop the PEP cleanly.
+fn stop_signals() -> SigSet {
+    let mut signals = SigSet::empty();
+    signals.add(Signal::SIGTERM);
+    signals.add(Signal::SIGINT);
+    signals
+}
+
 fn run(path: &Path) -> Result<(), String> {
+    // Blocked before any thread starts, so every thread inherits the mask, and the one thread
+    // that waits for them takes them: a PID 1 in a container has no default action to fall
+    // back on, so without this SIGTERM does nothing until SIGKILL.
+    stop_signals()
+        .thread_block()
+        .map_err(|error| format!("signal mask: {error}"))?;
+
     // 1. The config, and the host's authority.
     let config = load_config(path)?;
     check_fd_budget(&config)?;
@@ -130,8 +163,27 @@ fn run(path: &Path) -> Result<(), String> {
         records.len(),
         replayed.unresolved.len()
     ));
-    let (journal, _writer) =
-        spawn_writer(journal).map_err(|error| format!("journal writer: {error}"))?;
+    // With a boot id, `forwarded` and `taint` records go on once written, and a syncer fsyncs
+    // right behind them; a kernel lost before that fsync is caught at the next boot. Without
+    // one, every such record waits for its fsync (R1).
+    let boot_id = journal::boot_id();
+    let unclean = journal::unclean_stop(&records, boot_id.as_deref());
+    let (journal, _writer) = if boot_id.is_some() {
+        spawn_writer_syncing_behind(journal)
+    } else {
+        log("pep-sidecar: no kernel boot id: every forward waits for its fsync");
+        spawn_writer(journal)
+    }
+    .map_err(|error| format!("journal writer: {error}"))?;
+    if let Some(boot_id) = &boot_id {
+        journal
+            .commit(&[Record::Boot {
+                boot_id: boot_id.clone(),
+            }])
+            .map_err(|error| format!("journal: {error}"))?;
+    }
+    let (stopped, stop) = mpsc::channel::<Ending>();
+    spawn_signal_thread(journal.clone(), boot_id, stopped.clone())?;
 
     // 3. The PEP-wide state.
     let labels = JournaledLabels::restore(
@@ -232,6 +284,15 @@ fn run(path: &Path) -> Result<(), String> {
         shared,
         services,
     );
+    if let Some(previous) = unclean {
+        log(&format!(
+            "pep-sidecar: the run on kernel {previous} ended without a clean stop, so its last \
+             journal records may be lost; no episode starts until the operator checks its \
+             payments against the broker's log and its writes against the tools, then sends \
+             `resume`"
+        ));
+        registry.hold_until_resumed(previous);
+    }
     let read_timeout = millis(limits.read_timeout_ms);
 
     let control = bind_safe_listener(&config.operator.socket)
@@ -246,7 +307,6 @@ fn run(path: &Path) -> Result<(), String> {
     let control_limit = limits.control_connections;
     // Neither listener outlives the other: a PEP with no control socket has lost its kill
     // switch, so the whole process stops (fail closed) (RV5 V11).
-    let (stopped, stop) = mpsc::channel::<&'static str>();
     let control_stopped = stopped.clone();
     thread::Builder::new()
         .name("control".to_owned())
@@ -254,7 +314,7 @@ fn run(path: &Path) -> Result<(), String> {
             accept_loop(control.listener(), control_limit, move |stream| {
                 serve_control(stream, &control_context);
             });
-            let _ = control_stopped.send("the control socket stopped accepting");
+            let _ = control_stopped.send(Ending::Failed("the control socket stopped accepting"));
         })
         .map_err(|error| format!("control thread: {error}"))?;
 
@@ -303,13 +363,55 @@ fn run(path: &Path) -> Result<(), String> {
         .name("agent".to_owned())
         .spawn(move || {
             accept_agents(agent.listener(), connections, agent_context);
-            let _ = stopped.send("the agent socket stopped accepting");
+            let _ = stopped.send(Ending::Failed("the agent socket stopped accepting"));
         })
         .map_err(|error| format!("agent thread: {error}"))?;
-    Err(stop
-        .recv()
-        .unwrap_or("both sockets stopped accepting")
-        .to_owned())
+    match stop.recv() {
+        Ok(Ending::Signalled(signal)) => {
+            log(&format!(
+                "pep-sidecar: stopped cleanly on {}",
+                signal.as_str()
+            ));
+            Ok(())
+        }
+        Ok(Ending::Failed(why)) => Err(why.to_owned()),
+        Err(_) => Err("both sockets stopped accepting".to_owned()),
+    }
+}
+
+/// Waits for SIGTERM or SIGINT, then makes `stopped` the journal's last record, fsynced, and
+/// ends the run. Calls still in flight find the journal closed and are refused (fail closed);
+/// a payment already forwarded replays as unresolved, as after any stop.
+fn spawn_signal_thread(
+    journal: JournalHandle,
+    boot_id: Option<String>,
+    stopped: mpsc::Sender<Ending>,
+) -> Result<(), String> {
+    thread::Builder::new()
+        .name("signals".to_owned())
+        .spawn(move || {
+            let signal = match stop_signals().wait() {
+                Ok(signal) => signal,
+                Err(error) => {
+                    log(&format!("pep-sidecar: waiting for signals failed: {error}"));
+                    return;
+                }
+            };
+            let closed = match boot_id {
+                Some(boot_id) => journal.close(&Record::Stopped { boot_id }),
+                // Without a boot id every record was fsynced before its call went on.
+                None => journal.commit(&[]),
+            };
+            if let Err(error) = closed {
+                log(&format!(
+                    "pep-sidecar: the clean stop could not be journaled, so a next run on \
+                     another kernel will wait for `resume`: {error}"
+                ));
+            }
+            let _ = stopped.send(Ending::Signalled(signal));
+        })
+        .map(drop)
+        .map_err(|error| format!("signal thread: {error}"))
 }
 
 /// File descriptors the PEP needs beyond its connections: its listeners, locks, journal, logs,

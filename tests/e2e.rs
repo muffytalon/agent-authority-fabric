@@ -1004,6 +1004,78 @@ fn a_lost_journal_cannot_pay_an_invoice_twice() {
     assert!(tool_log.iter().all(|line| line.get("tool_us").is_some()));
 }
 
+/// R1: a forward waits only for its records' write, and a syncer fsyncs them right behind, so
+/// only a kernel that goes first can take them. SIGTERM stops the PEP cleanly, with `stopped` as
+/// the journal's last record; a restart on the same kernel needs nothing; and a run that ended on
+/// another kernel with no clean stop holds every episode until the operator's `resume`.
+#[test]
+fn a_run_that_may_have_lost_records_holds_episodes_until_resumed() {
+    let mut world = World::new(10_000, None).start();
+    let kernel = fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap();
+    let kernel = kernel.trim().to_owned();
+    let token = world.start_episode("pay");
+    world.call(1, "get_invoice", r#"{"invoice_id":"INV-1001"}"#, &token);
+    // A clean stop: exit 0, and `stopped` is the last record.
+    let mut pep = world.pep.take().unwrap();
+    let killed = Command::new("kill")
+        .args(["-TERM", &pep.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(killed.success());
+    assert!(pep.wait().unwrap().success(), "a clean stop exits 0");
+    let types = |world: &World| -> Vec<String> {
+        world
+            .lines("state/journal.jsonl")
+            .iter()
+            .map(|line| text(line, "/type").unwrap())
+            .collect()
+    };
+    let journal = world.lines("state/journal.jsonl");
+    assert_eq!(
+        text(&journal[0], "/boot_id").as_deref(),
+        Some(kernel.as_str())
+    );
+    assert_eq!(types(&world).last().map(String::as_str), Some("stopped"));
+    // As if that run's kernel were another: its clean stop still lets episodes start.
+    let rename = |world: &World, from: &str, to: &str| {
+        let path = world.path("state/journal.jsonl");
+        let bytes = fs::read(&path).unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(text.contains(from));
+        fs::write(&path, text.replace(from, to)).unwrap();
+    };
+    rename(&world, &kernel, "0c7a3f6e-1b2d-4e5f-8a9b-0c1d2e3f4a5b");
+    world.start_pep();
+    world.start_episode("pay");
+    // A crash on the same kernel: the page cache kept every write, so nothing is held.
+    world.start_pep();
+    world.start_episode("pay");
+    // A crash whose kernel went too: its last writes may be lost.
+    let mut pep = world.pep.take().unwrap();
+    drop(pep.kill());
+    drop(pep.wait());
+    rename(&world, &kernel, "9e8d7c6b-5a49-4382-a716-f5e4d3c2b1a0");
+    let boot = world.start_pep();
+    assert!(
+        boot.iter()
+            .any(|line| line.contains("without a clean stop")),
+        "{boot:?}"
+    );
+    let refused = world.operator(r#"{"call":"start_episode","intent":"pay"}"#);
+    assert_eq!(text(&refused, "/error").as_deref(), Some("needs_resume"));
+    // The hold survives a restart until the operator resumes.
+    world.start_pep();
+    let refused = world.operator(r#"{"call":"start_episode","intent":"pay"}"#);
+    assert_eq!(text(&refused, "/error").as_deref(), Some("needs_resume"));
+    let resumed = world.operator(r#"{"call":"resume"}"#);
+    assert!(resumed.pointer("/result").is_some(), "{resumed:?}");
+    world.start_episode("pay");
+    assert!(types(&world).iter().any(|kind| kind == "resumed"));
+    // And it stays resumed across a restart on this kernel.
+    world.start_pep();
+    world.start_episode("pay");
+}
+
 /// RV5 D6: a tool's declines stop the intent, a restart does not reset them, and a decline does
 /// not use the invoice up.
 #[test]

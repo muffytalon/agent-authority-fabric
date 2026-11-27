@@ -67,6 +67,9 @@ pub enum ControlRequest {
     Approve(Approval),
     /// Decline it.
     Decline(Approval),
+    /// Resume after a run that may have lost its last journal records (R1): the operator has
+    /// checked that run's payments against the broker's log, and its writes against the tools.
+    Resume,
 }
 
 /// Why a control request failed.
@@ -99,6 +102,9 @@ pub enum ControlError {
     /// The PEP could not carry it out, such as a failed journal write.
     #[error("unavailable")]
     Unavailable,
+    /// The last run may have lost journal records, so no episode starts until `resume` (R1).
+    #[error("the last run stopped uncleanly; resume first")]
+    NeedsResume,
 }
 
 impl ControlError {
@@ -115,6 +121,7 @@ impl ControlError {
             Self::Mismatch => "mismatch",
             Self::Refused => "refused",
             Self::Unavailable => "unavailable",
+            Self::NeedsResume => "needs_resume",
         }
     }
 }
@@ -158,6 +165,7 @@ pub fn parse(body: &[u8]) -> Result<ControlRequest, ControlError> {
             }
         }
         "pending" => ControlRequest::Pending,
+        "resume" => ControlRequest::Resume,
         "approve" | "decline" => {
             let approval = Approval {
                 eid: eid(&mut fields)?,
@@ -356,6 +364,7 @@ mod tests {
             request(r#"{"call":"pending"}"#),
             Ok(ControlRequest::Pending)
         );
+        assert_eq!(request(r#"{"call":"resume"}"#), Ok(ControlRequest::Resume));
         assert_eq!(
             request(&format!(
                 r#"{{"call":"trusted_input","eid":"{eid}","input_id":"u1","value":{{ "entity" : "rcpt_A", "amount_minor": 100 }},"conf":"internal"}}"#
@@ -391,6 +400,7 @@ mod tests {
         let eid = eid();
         assert_eq!(bad(r#"{"call":"restart"}"#), "call: unknown call");
         assert_eq!(bad(r#"{"call":"pending","x":1}"#), "x: unexpected field");
+        assert_eq!(bad(r#"{"call":"resume","x":1}"#), "x: unexpected field");
         assert_eq!(bad(r#"{"intent":"pay"}"#), "call: missing");
         assert_eq!(bad(r#"{"call":"start_episode"}"#), "intent: missing");
         assert_eq!(

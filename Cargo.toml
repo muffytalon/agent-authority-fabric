@@ -23,7 +23,7 @@ thiserror = "=2.0.21"                                                           
 unicode-normalization = "=0.1.26"                                                # 2026-10-16, Unicode 18.0.0
 
 [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
-nix = { version = "=0.31.3", default-features = false, features = ["socket", "user"] } # 2026-05-11
+nix = { version = "=0.31.3", default-features = false, features = ["signal", "socket", "user"] } # 2026-05-11; `signal` for the clean stop (R1)
 
 [lints.rust]
 unsafe_code = "forbid"

@@ -8,16 +8,22 @@
 //! - `ratchet`: an intent's F-09 level, whenever it rises;
 //! - `quarantine`: a server quarantined under a lockfile digest (RV4 #5).
 //!
+//! - `boot`, `stopped` and `resumed`: each run's kernel, its clean stop, and the operator's
+//!   resume after a run whose last records may be lost ([`unclean_stop`]).
+//!
 //! At boot, [`Journal::open`] takes the lock, truncates a torn tail (bytes after the last
-//! newline: an append whose fsync never completed, so its call was never forwarded), fsyncs,
+//! newline: an append whose write never completed, so its call was never forwarded), fsyncs,
 //! and parses every other line, any of which, if malformed, stops the PEP. [`replay`] then
 //! rebuilds each intent's [`Ledger`], the PEP-wide set of entities with an unresolved payment,
 //! the quarantines and the taint.
 //!
 //! At run time one writer thread ([`spawn_writer`]) appends for every episode. Appends that
-//! arrive together are written at once, with at most one fsync (group commit, RV3 A9). After
-//! any write or fsync error the journal refuses every later append, so the PEP fails closed:
-//! after a failed fsync the file's state is unknown.
+//! arrive together are written at once, with at most one fsync (group commit, RV3 A9). A call
+//! waits only for its `forwarded` and `taint` records to be written, not fsynced: a syncer
+//! thread fsyncs right behind them ([`spawn_writer_syncing_behind`]), so the disk's slow
+//! flushes stay off the call path, and a kernel lost before that fsync is caught by the next
+//! boot's [`unclean_stop`] (R1, G4). After any write or fsync error the journal refuses every
+//! later append, so the PEP fails closed: after a failed fsync the file's state is unknown.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions, Permissions};
@@ -25,6 +31,7 @@ use std::io::{self, Read, Write};
 use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::thread::{self, JoinHandle};
 
@@ -201,7 +208,8 @@ pub enum Record {
         /// Its F-07 idempotency key.
         idempotency_key: String,
     },
-    /// The reservation reached its point of forwarding (P1). Fsynced before the upstream write.
+    /// The reservation reached its point of forwarding (P1). Written before the upstream write,
+    /// and fsynced right behind it ([`JournalHandle::write_ahead`]).
     Forwarded {
         /// The episode.
         eid: u128,
@@ -217,7 +225,8 @@ pub enum Record {
         /// How.
         result: OutcomeKind,
     },
-    /// One call's F-08 entries. Fsynced before the call is forwarded.
+    /// One call's F-08 entries. Written before the call is forwarded, and fsynced right behind
+    /// it ([`JournalHandle::write_ahead`]).
     Taint {
         /// The writing episode.
         writer: u128,
@@ -239,6 +248,22 @@ pub enum Record {
         server_id: String,
         /// The loaded lockfile's digest.
         lockfile_digest: String,
+    },
+    /// The PEP started on the kernel with this boot id. Fsynced before it serves (R1).
+    Boot {
+        /// `/proc/sys/kernel/random/boot_id`.
+        boot_id: String,
+    },
+    /// The PEP stopped cleanly: the last record of its run, fsynced, so every record before it
+    /// is on disk whatever the kernel does next (R1).
+    Stopped {
+        /// The boot id of the kernel it ran on.
+        boot_id: String,
+    },
+    /// The operator resumed the PEP after a run that may have lost its last records (R1).
+    Resumed {
+        /// The boot id of the run that ended without a clean stop.
+        previous: String,
     },
 }
 
@@ -331,6 +356,13 @@ impl Record {
                 ("server_id", text(server_id.as_str())),
                 ("lockfile_digest", text(lockfile_digest.as_str())),
             ],
+            Self::Boot { boot_id } => vec![("type", text("boot")), ("boot_id", text(boot_id))],
+            Self::Stopped { boot_id } => {
+                vec![("type", text("stopped")), ("boot_id", text(boot_id))]
+            }
+            Self::Resumed { previous } => {
+                vec![("type", text("resumed")), ("previous", text(previous))]
+            }
         };
         object(members)
     }
@@ -383,6 +415,15 @@ impl Record {
             "quarantine" => Self::Quarantine {
                 server_id: record.str("server_id")?.to_owned(),
                 lockfile_digest: record.str("lockfile_digest")?.to_owned(),
+            },
+            "boot" => Self::Boot {
+                boot_id: record.str("boot_id")?.to_owned(),
+            },
+            "stopped" => Self::Stopped {
+                boot_id: record.str("boot_id")?.to_owned(),
+            },
+            "resumed" => Self::Resumed {
+                previous: record.str("previous")?.to_owned(),
             },
             _ => return None,
         };
@@ -587,6 +628,8 @@ pub fn replay(records: &[Record]) -> Result<Replay, JournalError> {
                     .quarantined
                     .insert((server_id.clone(), lockfile_digest.clone()));
             }
+            // Runs and their ends: [`unclean_stop`] reads them.
+            Record::Boot { .. } | Record::Stopped { .. } | Record::Resumed { .. } => {}
         }
     }
     let overflow = || JournalError::Inconsistent {
@@ -631,6 +674,78 @@ pub fn replay(records: &[Record]) -> Result<Replay, JournalError> {
     Ok(state)
 }
 
+/// Where Linux keeps the running kernel's boot id: a random UUID, new on every boot.
+const BOOT_ID_PATH: &str = "/proc/sys/kernel/random/boot_id";
+
+/// The running kernel's boot id, or `None` where there is none to read (macOS). Without one,
+/// the PEP cannot tell its own crash from the kernel's, so it fsyncs before every forward.
+#[must_use]
+pub fn boot_id() -> Option<String> {
+    let text = std::fs::read_to_string(BOOT_ID_PATH).ok()?;
+    let id = text.trim();
+    let uuid = id.len() == 36
+        && id.bytes().enumerate().all(|(index, byte)| match index {
+            8 | 13 | 18 | 23 => byte == b'-',
+            _ => byte.is_ascii_hexdigit(),
+        });
+    uuid.then(|| id.to_owned())
+}
+
+/// The boot id of a run whose last records may be lost, if the PEP must wait for the operator
+/// before it starts an episode (R1).
+///
+/// A record written with [`JournalHandle::write_ahead`] is in the kernel's page cache when its
+/// call goes on, and on disk a moment later: it survives the PEP's own crash, and is lost only
+/// if the kernel or the machine goes first. So a run's records are safe when the next run
+/// started on the same kernel, or when the run ended with [`Record::Stopped`]. Otherwise the
+/// next run waits for [`Record::Resumed`], and so does every run after it until one is written.
+/// Records before the first [`Record::Boot`] were fsynced before every forward, so they are
+/// safe. `boot_id` is this kernel's; with none, any run without a clean stop counts as lost.
+#[must_use]
+pub fn unclean_stop(records: &[Record], boot_id: Option<&str>) -> Option<String> {
+    // The latest run: its boot id, and whether its `stopped` is the last record so far.
+    let mut run: Option<(&str, bool)> = None;
+    let mut lost: Option<String> = None;
+    for record in records {
+        match record {
+            Record::Boot { boot_id: next } => {
+                if let Some((previous, stopped)) = run
+                    && !stopped
+                    && previous != next.as_str()
+                    && lost.is_none()
+                {
+                    lost = Some(previous.to_owned());
+                }
+                run = Some((next.as_str(), false));
+            }
+            Record::Stopped { boot_id: ended } => {
+                if let Some((id, stopped)) = run.as_mut() {
+                    *stopped = *id == ended.as_str();
+                }
+            }
+            Record::Resumed { .. } => {
+                lost = None;
+                if let Some((_, stopped)) = run.as_mut() {
+                    *stopped = false;
+                }
+            }
+            _ => {
+                if let Some((_, stopped)) = run.as_mut() {
+                    *stopped = false;
+                }
+            }
+        }
+    }
+    if let Some((previous, stopped)) = run
+        && !stopped
+        && boot_id != Some(previous)
+        && lost.is_none()
+    {
+        lost = Some(previous.to_owned());
+    }
+    lost
+}
+
 fn ledger<'a>(ledgers: &'a mut BTreeMap<String, Ledger>, intent: &str) -> &'a mut Ledger {
     ledgers
         .entry(intent.to_owned())
@@ -667,7 +782,8 @@ impl Journal {
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes)?;
         // The log ends at the first NUL, which no record holds: past it is preallocated space,
-        // or what is left of writes no fsync ever covered, and so nothing was forwarded on.
+        // or what is left of writes no fsync ever covered. Their calls never went on, unless
+        // the kernel went before the fsync behind them, which `unclean_stop` catches.
         let used = bytes
             .iter()
             .position(|&byte| byte == 0)
@@ -724,13 +840,27 @@ fn preallocate(file: &File, from: u64, bytes: u64) -> Result<u64, JournalError> 
     from.checked_add(bytes).ok_or(JournalError::Encoding)
 }
 
+/// An fsync of everything written so far, run by the syncer thread.
+type SyncFn = Box<dyn FnMut() -> io::Result<()> + Send>;
+
 /// Where the writer thread puts its batches: the journal, or a test double.
 trait Sink: Send + 'static {
     /// Writes `bytes` at the end, then fsyncs if `sync`.
     fn write_batch(&mut self, bytes: &[u8], sync: bool) -> io::Result<()>;
+
+    /// An fsync that another thread can run while this one writes, for syncing behind. A sink
+    /// without one cannot sync behind.
+    fn syncer(&self) -> io::Result<SyncFn> {
+        Err(io::Error::other("this sink cannot sync behind"))
+    }
 }
 
 impl Sink for Journal {
+    fn syncer(&self) -> io::Result<SyncFn> {
+        let file = self.file.try_clone()?;
+        Ok(Box::new(move || file.sync_data()))
+    }
+
     fn write_batch(&mut self, bytes: &[u8], sync: bool) -> io::Result<()> {
         let length = u64::try_from(bytes.len()).map_err(|_| io::ErrorKind::InvalidInput)?;
         let end = self
@@ -799,6 +929,8 @@ fn open_journal_file(path: &Path, euid: u32) -> Result<File, JournalError> {
 struct Append {
     lines: Vec<u8>,
     sync: bool,
+    /// The clean stop's record: nothing is written after it.
+    last: bool,
     /// Where to answer, if anyone is waiting.
     done: Option<SyncSender<Result<(), JournalError>>>,
 }
@@ -807,6 +939,8 @@ struct Append {
 #[derive(Debug, Clone)]
 pub struct JournalHandle {
     queue: SyncSender<Append>,
+    /// Whether a syncer thread fsyncs right behind each write ([`spawn_writer_syncing_behind`]).
+    behind: bool,
 }
 
 impl JournalHandle {
@@ -817,17 +951,40 @@ impl JournalHandle {
     ///
     /// Returns a [`JournalError`] if the journal failed, now or earlier.
     pub fn append(&self, records: &[Record]) -> Result<(), JournalError> {
-        self.send(records, false)
+        self.send(records, false, false)
     }
 
-    /// Appends `records` and waits until they are fsynced: for `forwarded`, `taint`,
-    /// `ratchet` and `quarantine`.
+    /// Appends `records` and waits until they are fsynced: for `ratchet`, `quarantine`, `boot`
+    /// and `resumed`.
     ///
     /// # Errors
     ///
     /// Returns a [`JournalError`] if the journal failed, now or earlier.
     pub fn commit(&self, records: &[Record]) -> Result<(), JournalError> {
-        self.send(records, true)
+        self.send(records, true, false)
+    }
+
+    /// Appends `records` for a call that goes on once they return: `forwarded` and `taint`
+    /// (R1). Under [`spawn_writer_syncing_behind`] it waits until they are written, so they are
+    /// in the kernel's page cache and survive the PEP's own crash, and the syncer thread fsyncs
+    /// them a moment later; a kernel that goes first is caught at the next boot
+    /// ([`unclean_stop`]). Otherwise it waits for the fsync, as [`Self::commit`] does.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`JournalError`] if the journal failed, now or earlier.
+    pub fn write_ahead(&self, records: &[Record]) -> Result<(), JournalError> {
+        self.send(records, !self.behind, false)
+    }
+
+    /// Writes and fsyncs `record`, the clean stop's, and refuses every append after it, so it
+    /// is the run's last record (R1).
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`JournalError`] if the journal failed, now or earlier.
+    pub fn close(&self, record: &Record) -> Result<(), JournalError> {
+        self.send(std::slice::from_ref(record), true, true)
     }
 
     /// Queues `records` and returns: for `reserve` and `outcome`, which nothing has to wait for.
@@ -848,11 +1005,12 @@ impl JournalHandle {
         self.push(Append {
             lines,
             sync: false,
+            last: false,
             done: None,
         })
     }
 
-    fn send(&self, records: &[Record], sync: bool) -> Result<(), JournalError> {
+    fn send(&self, records: &[Record], sync: bool, last: bool) -> Result<(), JournalError> {
         let mut lines = Vec::new();
         for record in records {
             lines.extend(record.to_line()?);
@@ -861,6 +1019,7 @@ impl JournalHandle {
         self.push(Append {
             lines,
             sync,
+            last,
             done: Some(done),
         })?;
         answer.recv().map_err(|_| JournalError::Stopped)?
@@ -876,66 +1035,162 @@ impl JournalHandle {
     }
 }
 
-/// Starts the writer thread that owns `journal`.
+/// Starts the writer thread that owns `journal`. Every [`JournalHandle::write_ahead`] waits for
+/// its fsync, as on a system with no boot id to tell the PEP's crash from the kernel's.
 ///
 /// # Errors
 ///
 /// Returns the error of spawning the thread.
 pub fn spawn_writer(journal: Journal) -> io::Result<(JournalHandle, JoinHandle<()>)> {
-    spawn_sink(journal)
+    spawn_sink(journal, false)
 }
 
-fn spawn_sink<S: Sink>(sink: S) -> io::Result<(JournalHandle, JoinHandle<()>)> {
+/// [`spawn_writer`], with a syncer thread that fsyncs right behind every write that did not
+/// fsync, so [`JournalHandle::write_ahead`] waits only for the write (R1). For a PEP that
+/// records its kernel's boot id, so that a kernel lost before an fsync is caught at the next
+/// boot ([`unclean_stop`]).
+///
+/// # Errors
+///
+/// Returns the error of spawning a thread or of opening the syncer's handle on the file.
+pub fn spawn_writer_syncing_behind(
+    journal: Journal,
+) -> io::Result<(JournalHandle, JoinHandle<()>)> {
+    spawn_sink(journal, true)
+}
+
+/// The writer's link to the syncer thread.
+struct Behind {
+    /// One pending kick at most: the syncer's next fsync starts after every write so far.
+    kick: SyncSender<()>,
+    /// Set by the syncer once an fsync fails; the writer then refuses every append.
+    failed: Arc<AtomicBool>,
+}
+
+fn spawn_sink<S: Sink>(sink: S, behind: bool) -> io::Result<(JournalHandle, JoinHandle<()>)> {
+    let syncer = if behind {
+        Some(spawn_syncer(sink.syncer()?)?)
+    } else {
+        None
+    };
     let (queue, appends) = mpsc::sync_channel(WRITER_QUEUE);
     let thread = thread::Builder::new()
         .name("journal-writer".to_owned())
-        .spawn(move || run_writer(sink, &appends))?;
-    Ok((JournalHandle { queue }, thread))
+        .spawn(move || run_writer(sink, &appends, syncer.as_ref()))?;
+    Ok((JournalHandle { queue, behind }, thread))
+}
+
+/// Starts the thread that runs `sync` after each kick, until the writer goes. A failed fsync
+/// leaves the file's state unknown, so it is never retried: the writer refuses every later
+/// append, and the PEP fails closed.
+fn spawn_syncer(mut sync: SyncFn) -> io::Result<Behind> {
+    let (kick, kicks) = mpsc::sync_channel::<()>(1);
+    let failed = Arc::new(AtomicBool::new(false));
+    let latch = Arc::clone(&failed);
+    thread::Builder::new()
+        .name("journal-syncer".to_owned())
+        .spawn(move || {
+            while kicks.recv().is_ok() {
+                if let Err(error) = sync() {
+                    latch.store(true, Ordering::SeqCst);
+                    drop(writeln!(
+                        io::stderr().lock(),
+                        "pep-sidecar: a journal fsync failed, refusing every later append; \
+                         treat this run as stopped uncleanly: {error}"
+                    ));
+                    return;
+                }
+            }
+        })?;
+    Ok(Behind { kick, failed })
+}
+
+/// Why the writer refuses appends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Refusing {
+    /// It writes them.
+    No,
+    /// A write or an fsync failed.
+    Failed,
+    /// The clean stop's record has been written.
+    Closed,
 }
 
 /// Writes every append waiting together in one write and at most one fsync, then answers
-/// them all. After an error, every later append gets [`JournalError::Failed`].
-fn run_writer<S: Sink>(mut sink: S, appends: &Receiver<Append>) {
-    let mut failed = false;
+/// them all, and kicks the syncer after a write that did not fsync. After an error, every
+/// later append gets [`JournalError::Failed`]; after the clean stop's record,
+/// [`JournalError::Stopped`].
+fn run_writer<S: Sink>(mut sink: S, appends: &Receiver<Append>, behind: Option<&Behind>) {
+    let mut refusing = Refusing::No;
     while let Ok(first) = appends.recv() {
         let mut batch = vec![first];
         batch.extend(appends.try_iter());
-        let result = if failed {
-            Err(JournalError::Failed)
-        } else {
-            let bytes: Vec<u8> = batch
-                .iter()
-                .flat_map(|append| append.lines.iter().copied())
-                .collect();
-            let sync = batch.iter().any(|append| append.sync);
-            sink.write_batch(&bytes, sync).map_err(JournalError::Io)
+        // Nothing is written after the clean stop's record.
+        let after = match batch.iter().position(|append| append.last) {
+            Some(at) => batch.split_off(at.checked_add(1).unwrap_or(at)),
+            None => Vec::new(),
         };
-        if let (false, Err(error)) = (failed, &result) {
-            // Once: the PEP keeps running, refusing what needs the journal, so say why.
-            drop(writeln!(
-                io::stderr().lock(),
-                "pep-sidecar: the journal failed, refusing every later append: {error}"
-            ));
+        if behind.is_some_and(|behind| behind.failed.load(Ordering::SeqCst))
+            && refusing == Refusing::No
+        {
+            refusing = Refusing::Failed;
         }
-        failed |= result.is_err();
+        let sync = batch.iter().any(|append| append.sync);
+        let result = match refusing {
+            Refusing::No => {
+                let bytes: Vec<u8> = batch
+                    .iter()
+                    .flat_map(|append| append.lines.iter().copied())
+                    .collect();
+                sink.write_batch(&bytes, sync).map_err(JournalError::Io)
+            }
+            Refusing::Failed => Err(JournalError::Failed),
+            Refusing::Closed => Err(JournalError::Stopped),
+        };
+        match &result {
+            Ok(()) => {
+                if !sync && let Some(behind) = behind {
+                    // A full channel already holds a kick, whose fsync starts after this write.
+                    let _ = behind.kick.try_send(());
+                }
+                if batch.iter().any(|append| append.last) {
+                    refusing = Refusing::Closed;
+                }
+            }
+            Err(error) if refusing == Refusing::No => {
+                // Once: the PEP keeps running, refusing what needs the journal, so say why.
+                drop(writeln!(
+                    io::stderr().lock(),
+                    "pep-sidecar: the journal failed, refusing every later append: {error}"
+                ));
+                refusing = Refusing::Failed;
+            }
+            Err(_) => {}
+        }
+        let answer = |ok: bool| match (ok, refusing) {
+            (true, _) => Ok(()),
+            (false, Refusing::Closed) => Err(JournalError::Stopped),
+            (false, _) => Err(JournalError::Failed),
+        };
         for append in batch {
-            let answer = match &result {
-                Ok(()) => Ok(()),
-                Err(_) => Err(JournalError::Failed),
-            };
             // A caller that stopped waiting, or never did, has nothing to learn.
             if let Some(done) = append.done {
-                drop(done.send(answer));
+                drop(done.send(answer(result.is_ok())));
+            }
+        }
+        for append in after {
+            if let Some(done) = append.done {
+                drop(done.send(answer(false)));
             }
         }
     }
 }
 
 /// The journal-backed [`LabelStore`] (R1): each call's entries are applied, which checks the
-/// store's capacity, and then go in one fsynced `taint` record, which `record_all` waits for.
-/// So a replay can never overflow the store, concurrent writers share an fsync, and a failed
-/// fsync leaves only extra taint in memory, which fails closed; the journal then refuses
-/// everything else anyway.
+/// store's capacity, and then go in one `taint` record, written ahead of the call
+/// ([`JournalHandle::write_ahead`]), which `record_all` waits for. So a replay can never
+/// overflow the store, and a failed write or fsync leaves only extra taint in memory, which
+/// fails closed; the journal then refuses everything else anyway.
 #[derive(Debug)]
 pub struct JournaledLabels {
     inner: InMemoryLabelStore,
@@ -980,7 +1235,7 @@ impl LabelStore for JournaledLabels {
             indexes: indexes.iter().map(JournaledIndex::from).collect(),
         };
         self.journal
-            .commit(&[record])
+            .write_ahead(&[record])
             .map_err(|_| StoreError::Unavailable)
     }
 
@@ -1113,7 +1368,34 @@ mod tests {
                 server_id: "a".to_owned(),
                 lockfile_digest: "sha-256:lock".to_owned(),
             },
+            boot(KERNEL_A),
+            stopped(KERNEL_A),
+            Record::Resumed {
+                previous: KERNEL_B.to_owned(),
+            },
         ]
+    }
+
+    const KERNEL_A: &str = "0c7a3f6e-1b2d-4e5f-8a9b-0c1d2e3f4a5b";
+    const KERNEL_B: &str = "9e8d7c6b-5a49-4382-a716-f5e4d3c2b1a0";
+    const KERNEL_C: &str = "11111111-2222-4333-8444-555555555555";
+
+    fn boot(boot_id: &str) -> Record {
+        Record::Boot {
+            boot_id: boot_id.to_owned(),
+        }
+    }
+
+    fn stopped(boot_id: &str) -> Record {
+        Record::Stopped {
+            boot_id: boot_id.to_owned(),
+        }
+    }
+
+    fn resumed(previous: &str) -> Record {
+        Record::Resumed {
+            previous: previous.to_owned(),
+        }
     }
 
     #[test]
@@ -1521,9 +1803,12 @@ mod tests {
         // After a failed fsync the file's state is unknown, so a sink that would accept the
         // next write must not get it.
         let calls = Arc::new(Mutex::new(Vec::new()));
-        let (handle, writer) = spawn_sink(FailsOnce {
-            calls: calls.clone(),
-        })
+        let (handle, writer) = spawn_sink(
+            FailsOnce {
+                calls: calls.clone(),
+            },
+            false,
+        )
         .unwrap();
         assert!(matches!(
             handle.commit(&[forwarded(EID, 1)]),
@@ -1748,5 +2033,258 @@ mod tests {
         assert_eq!(store.lookup(&location("k1")).unwrap(), Some(SECRET_WRITE));
         drop((store, handle));
         writer.join().unwrap();
+    }
+
+    #[test]
+    fn a_run_is_lost_only_if_its_kernel_went_without_a_clean_stop() {
+        let work = || forwarded(EID, 1);
+        let unclean = |records: &[Record], now: Option<&str>| unclean_stop(records, now);
+        // No runs recorded: a journal from before boot records fsynced every forward.
+        assert_eq!(unclean(&[], Some(KERNEL_A)), None);
+        assert_eq!(unclean(&[work()], Some(KERNEL_A)), None);
+        assert_eq!(unclean(&[work()], None), None);
+        // The same kernel: the page cache kept every write.
+        assert_eq!(unclean(&[boot(KERNEL_A), work()], Some(KERNEL_A)), None);
+        // Another kernel, no clean stop: the last writes may be gone.
+        assert_eq!(
+            unclean(&[boot(KERNEL_A), work()], Some(KERNEL_B)),
+            Some(KERNEL_A.to_owned())
+        );
+        // A clean stop fsynced everything before it.
+        assert_eq!(
+            unclean(&[boot(KERNEL_A), work(), stopped(KERNEL_A)], Some(KERNEL_B)),
+            None
+        );
+        // A record after the stop reopens the run; a stop names its own kernel.
+        assert_eq!(
+            unclean(&[boot(KERNEL_A), stopped(KERNEL_A), work()], Some(KERNEL_B)),
+            Some(KERNEL_A.to_owned())
+        );
+        assert_eq!(
+            unclean(&[boot(KERNEL_A), work(), stopped(KERNEL_B)], Some(KERNEL_B)),
+            Some(KERNEL_A.to_owned())
+        );
+        // The hold survives later runs, on any kernel, until a resume.
+        let held = [boot(KERNEL_A), work(), boot(KERNEL_B)];
+        assert_eq!(unclean(&held, Some(KERNEL_B)), Some(KERNEL_A.to_owned()));
+        let stopped_too = [boot(KERNEL_A), work(), boot(KERNEL_B), stopped(KERNEL_B)];
+        assert_eq!(
+            unclean(&stopped_too, Some(KERNEL_C)),
+            Some(KERNEL_A.to_owned())
+        );
+        let resumed_then = [boot(KERNEL_A), work(), boot(KERNEL_B), resumed(KERNEL_A)];
+        assert_eq!(unclean(&resumed_then, Some(KERNEL_B)), None);
+        // After the resume the new run is judged on its own end.
+        assert_eq!(
+            unclean(&resumed_then, Some(KERNEL_C)),
+            Some(KERNEL_B.to_owned())
+        );
+        let mut clean_end = resumed_then.to_vec();
+        clean_end.push(stopped(KERNEL_B));
+        assert_eq!(unclean(&clean_end, Some(KERNEL_C)), None);
+        // Without this kernel's boot id, only a clean stop is safe.
+        assert_eq!(
+            unclean(&[boot(KERNEL_A), work()], None),
+            Some(KERNEL_A.to_owned())
+        );
+        assert_eq!(unclean(&[boot(KERNEL_A), stopped(KERNEL_A)], None), None);
+    }
+
+    #[test]
+    fn the_kernel_boot_id_is_a_uuid_when_there_is_one() {
+        if let Some(id) = boot_id() {
+            assert_eq!(id.len(), 36);
+            assert_eq!(boot_id(), Some(id));
+        } else {
+            assert!(!Path::new(BOOT_ID_PATH).exists());
+        }
+    }
+
+    /// Records each batch and each fsync of the syncer, which can be made to fail.
+    struct Watched {
+        batches: Batches,
+        syncs: Arc<AtomicUsize>,
+        sync_fails: bool,
+    }
+
+    impl Sink for Watched {
+        fn write_batch(&mut self, bytes: &[u8], sync: bool) -> io::Result<()> {
+            self.batches
+                .lock()
+                .map_err(|_| io::Error::other("poisoned"))?
+                .push((bytes.len(), sync));
+            Ok(())
+        }
+
+        fn syncer(&self) -> io::Result<SyncFn> {
+            let syncs = Arc::clone(&self.syncs);
+            let fails = self.sync_fails;
+            Ok(Box::new(move || {
+                syncs.fetch_add(1, Ordering::SeqCst);
+                if fails {
+                    Err(io::Error::other("injected"))
+                } else {
+                    Ok(())
+                }
+            }))
+        }
+    }
+
+    /// Each batch's length and whether it fsynced.
+    type Batches = Arc<Mutex<Vec<(usize, bool)>>>;
+
+    fn watched(sync_fails: bool) -> (Watched, Batches, Arc<AtomicUsize>) {
+        let batches = Arc::new(Mutex::new(Vec::new()));
+        let syncs = Arc::new(AtomicUsize::new(0));
+        let sink = Watched {
+            batches: Arc::clone(&batches),
+            syncs: Arc::clone(&syncs),
+            sync_fails,
+        };
+        (sink, batches, syncs)
+    }
+
+    fn eventually(what: &str, done: impl Fn() -> bool) {
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !done() {
+            assert!(std::time::Instant::now() < until, "{what} never happened");
+            thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn a_write_ahead_goes_on_once_written_and_is_fsynced_behind() {
+        let (sink, batches, syncs) = watched(false);
+        let (handle, writer) = spawn_sink(sink, true).unwrap();
+        handle.write_ahead(&[forwarded(EID, 1)]).unwrap();
+        // Written without an fsync of its own...
+        assert!(!batches.lock().unwrap()[0].1);
+        // ...and fsynced right behind.
+        eventually("the fsync behind", || syncs.load(Ordering::SeqCst) >= 1);
+        // A commit still fsyncs before it returns.
+        handle
+            .commit(&[Record::Ratchet {
+                intent: "i".to_owned(),
+                conf: Confidentiality::Confidential,
+            }])
+            .unwrap();
+        assert!(batches.lock().unwrap().last().unwrap().1);
+        drop(handle);
+        writer.join().unwrap();
+    }
+
+    #[test]
+    fn without_syncing_behind_a_write_ahead_waits_for_its_fsync() {
+        let (sink, batches, syncs) = watched(false);
+        let (handle, writer) = spawn_sink(sink, false).unwrap();
+        handle.write_ahead(&[forwarded(EID, 1)]).unwrap();
+        assert_eq!(
+            *batches.lock().unwrap(),
+            [(forwarded(EID, 1).to_line().unwrap().len(), true)]
+        );
+        drop(handle);
+        writer.join().unwrap();
+        assert_eq!(syncs.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn a_failed_fsync_behind_fails_every_later_append() {
+        let (sink, _batches, syncs) = watched(true);
+        let (handle, writer) = spawn_sink(sink, true).unwrap();
+        // The record was written, so its call may have gone on; nothing after it is accepted.
+        handle.write_ahead(&[forwarded(EID, 1)]).unwrap();
+        eventually("the failed fsync", || syncs.load(Ordering::SeqCst) >= 1);
+        eventually("the refusal", || {
+            matches!(
+                handle.append(&[forwarded(EID, 2)]),
+                Err(JournalError::Failed)
+            )
+        });
+        assert!(matches!(
+            handle.write_ahead(&[forwarded(EID, 3)]),
+            Err(JournalError::Failed)
+        ));
+        drop(handle);
+        writer.join().unwrap();
+    }
+
+    #[test]
+    fn a_sink_that_cannot_sync_behind_is_refused() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        assert!(spawn_sink(FailsOnce { calls }, true).is_err());
+    }
+
+    #[test]
+    fn a_clean_stop_is_the_last_record_on_disk() {
+        let dir = TempDir::new();
+        let (journal, _) = dir.open().unwrap();
+        let (handle, writer) = spawn_writer_syncing_behind(journal).unwrap();
+        handle.commit(&[boot(KERNEL_A)]).unwrap();
+        handle
+            .enqueue(&[reserve(EID, 1, "pay", "INV-1", 100)])
+            .unwrap();
+        handle.write_ahead(&[forwarded(EID, 1)]).unwrap();
+        handle.close(&stopped(KERNEL_A)).unwrap();
+        // After the stop, nothing more is written.
+        assert!(matches!(
+            handle.write_ahead(&[forwarded(EID, 2)]),
+            Err(JournalError::Stopped)
+        ));
+        assert!(matches!(
+            handle.enqueue(&[outcome(EID, 1, OutcomeKind::Executed)]),
+            Ok(())
+        ));
+        drop(handle);
+        writer.join().unwrap();
+        let (_, records) = dir.open().unwrap();
+        assert_eq!(
+            records,
+            [
+                boot(KERNEL_A),
+                reserve(EID, 1, "pay", "INV-1", 100),
+                forwarded(EID, 1),
+                stopped(KERNEL_A)
+            ]
+        );
+        // So a next run on another kernel starts at once.
+        assert_eq!(unclean_stop(&records, Some(KERNEL_B)), None);
+        assert!(replay(&records).unwrap().unresolved.contains("INV-1"));
+    }
+
+    #[test]
+    fn appends_in_the_clean_stops_batch_after_it_are_refused() {
+        let (sink, batches, _) = watched(false);
+        let append = |record: &Record, sync: bool, last: bool| {
+            let (done, answer) = mpsc::sync_channel(1);
+            let lines = record.to_line().unwrap();
+            (
+                Append {
+                    lines,
+                    sync,
+                    last,
+                    done: Some(done),
+                },
+                answer,
+            )
+        };
+        // Queued before the writer runs, so all three arrive in one batch.
+        let (queue, appends) = mpsc::sync_channel(8);
+        let (before, before_answer) = append(&forwarded(EID, 1), false, false);
+        let (stop, stop_answer) = append(&stopped(KERNEL_A), true, true);
+        let (after, after_answer) = append(&forwarded(EID, 2), false, false);
+        for item in [before, stop, after] {
+            queue.send(item).unwrap();
+        }
+        drop(queue);
+        run_writer(sink, &appends, None);
+        assert!(before_answer.recv().unwrap().is_ok());
+        assert!(stop_answer.recv().unwrap().is_ok());
+        assert!(matches!(
+            after_answer.recv().unwrap(),
+            Err(JournalError::Stopped)
+        ));
+        let stop_bytes =
+            forwarded(EID, 1).to_line().unwrap().len() + stopped(KERNEL_A).to_line().unwrap().len();
+        assert_eq!(*batches.lock().unwrap(), [(stop_bytes, true)]);
     }
 }
