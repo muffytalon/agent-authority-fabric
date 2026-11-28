@@ -1,0 +1,308 @@
+"""Writes the Compose configs under config/ (WEEK2_PLAN §4) from one source.
+
+Usage: python3 compose/make-config.py   (from the repository root)
+
+- config/lockfile/pins.json: the lockfile v1 payload (L1), JCS-canonical, which the stub tool
+  servers serve from.
+- config/lockfile/lockfile.dsse.json: the same payload, signed (L1): what the PEP and the broker
+  load, each verifying it with the signer keys in its own config.
+- config/pep/config.json: the PEP's config, naming the signed lockfile and its signers, with
+  intents bound to its digest.
+- config/broker/config.json: the broker's own config (RV4 #12), with the same lockfile section.
+- config/tool-a/config.json, config/tool-b/config.json: the stub tool servers.
+
+Signing. The public signer keys are checked in, in config/signers/{release,security}.pub; their
+private halves never are. A payload that changed is signed with `pepctl lock sign`, first by the
+release key, then by the security key, from PEP_SIGNERS_DIR (~/.config/pep-gate1/signers, made
+with `pepctl keygen`). A payload that did not change keeps its signed lockfile, so this runs
+anywhere, CI included, without the keys. PEPCTL names the binary (default: the release build
+under CARGO_TARGET_DIR, else target/release/pepctl).
+
+Paths are the containers' (§4's mounts), and the uids are §4's: agent 20001, PEP 20002,
+broker 20003, operator 20004, tool-a 20005, tool-b 20008. The digest is JCS over ASCII
+data with integers only, which sorted, compact JSON reproduces.
+"""
+import base64, copy, hashlib, json, os, subprocess, sys, tempfile
+
+def canonical(value):
+    """JCS for this data: ASCII keys, safe integers and short decimal fractions, which sorted,
+    compact JSON reproduces; the PEP refuses a signed payload that is not exactly canonical."""
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+def digest(value):
+    raw = hashlib.sha256(canonical(value).encode()).digest()
+    return "sha-256:" + base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+DISCOVER = {"cacheScope": "public", "capabilities": {"tools": {}}, "resultType": "complete",
+            "supportedVersions": ["2026-07-28"], "ttlMs": 0}
+ROW = {"max_result_bytes": 1048576, "max_result_nodes": 8192}
+
+MAX_SAFE = 9007199254740991
+
+def strict_of(schema):
+    """The strict argument schema (L1, F-13) for an upstream inputSchema written here: the same
+    tree, without extension keywords, and with every integer bounded above at 2^53 - 1."""
+    strict = {key: copy.deepcopy(value) for key, value in schema.items() if not key.startswith("x-")}
+    if "properties" in strict:
+        strict["properties"] = {name: strict_of(child) for name, child in strict["properties"].items()}
+    if strict.get("type") == "integer":
+        strict.setdefault("maximum", MAX_SAFE)
+    return strict
+
+def tool(name, description, schema, policy, annotations=None):
+    definition = {"name": name, "description": description, "inputSchema": schema}
+    if annotations:
+        definition["annotations"] = annotations
+    return {name: {"definition": definition, "policy": dict(policy, strict_schema=strict_of(schema), **ROW)}}
+
+def obj(properties, required):
+    return {"type": "object", "properties": properties, "required": required, "additionalProperties": False}
+
+STRING = {"type": "string", "maxLength": 256}
+server_a = {}
+server_a.update(tool("get_invoice", "Look up an invoice.", obj({"invoice_id": STRING}, ["invoice_id"]), {
+    "effect": "read", "args": [{"pointer": "/invoice_id", "role": "store_key"}], "store_uri": "billing://invoices",
+    "sink_clearance": "secret", "output_label": {"conf": "internal", "integ": "trusted"},
+    "trusted_fields": ["/structuredContent/amount_due_minor", "/structuredContent/currency"]}))
+server_a.update(tool("pay_invoice", "Pay an invoice.", obj({"invoice_id": STRING, "amount": {"type": "integer", "minimum": 0},
+    "currency": {"type": "string", "minLength": 3, "maxLength": 3}}, ["invoice_id", "amount", "currency"]), {
+    "effect": "mutating_financial", "args": [{"pointer": "/invoice_id", "role": "entity", "kind": "invoice"},
+        {"pointer": "/amount", "role": "amount"}, {"pointer": "/currency", "role": "currency"}],
+    "sink_clearance": "internal", "output_label": {"conf": "internal", "integ": "untrusted_external"},
+    "amount_binding": {"lookup_tool": "get_invoice", "entity_arg_pointer": "/invoice_id", "lookup_entity_pointer": "/invoice_id",
+        "result_amount_pointer": "/structuredContent/amount_due_minor", "result_currency_pointer": "/structuredContent/currency"}}))
+server_b = {}
+server_b.update(tool("save_note", "Save a note.", obj({"key": STRING, "text": {"type": "string", "maxLength": 4096}}, ["key", "text"]), {
+    "effect": "mutating_internal", "args": [{"pointer": "/key", "role": "store_key"}, {"pointer": "/text", "role": "store_write"}],
+    "store_uri": "notes://agent", "sink_clearance": "secret", "output_label": {"conf": "internal", "integ": "untrusted_external"}}))
+server_b.update(tool("get_note", "Read a note.", obj({"key": STRING}, ["key"]), {
+    "effect": "read", "args": [{"pointer": "/key", "role": "store_key"}], "store_uri": "notes://agent",
+    "sink_clearance": "secret", "output_label": {"conf": "internal", "integ": "untrusted_external"}}))
+server_b.update(tool("search_notes", "Search the notes.", obj({"query": STRING}, ["query"]), {
+    "effect": "read", "args": [{"pointer": "/query", "role": "data"}], "sink_clearance": "secret",
+    "output_label": {"conf": "secret", "integ": "untrusted_agent_write"}, "reads_stores": ["notes://agent"]}))
+server_b.update(tool("fetch", "Fetch a URL.", obj({"url": STRING}, ["url"]), {
+    "effect": "read", "args": [{"pointer": "/url", "role": "sink_destination"}], "sink_clearance": "public",
+    "destinations": {"https://partner.example": "confidential"},
+    "output_label": {"conf": "internal", "integ": "untrusted_external"}}))
+
+pins = {"lockfile_version": 1, "release_epoch": 1,
+        "stores": {"billing://invoices": {"case_insensitive": True}, "notes://agent": {"case_insensitive": False}},
+        "servers": {
+            "a": {"endpoint": "tcp:tool-a:8080", "identity": "spiffe://corp.example/tools/a",
+                  "protocol_version": "2026-07-28", "discover": DISCOVER, "tools": server_a},
+            "b": {"endpoint": "tcp:tool-b:8080", "identity": "spiffe://corp.example/tools/b",
+                  "protocol_version": "2026-07-28", "discover": DISCOVER, "tools": server_b}}}
+
+def intent(kind, ids, uses, max_calls):
+    return {"release_epoch": 1, "lockfile_digest": digest(pins),
+            "limits": {"currency": "USD", "per_call_max_minor": 100000, "cumulative_max_minor": 500000,
+                       "max_calls": max_calls, "step_up_over_minor": 50000, "max_declines": 3},
+            "entities": {"kind": kind, "ids": ids, "per_entity_max_uses": uses}, "seq": "unconstrained"}
+
+def public_key(role):
+    with open(f"config/signers/{role}.pub") as f:
+        return f.read().strip()
+
+LOCKFILE_SECTION = {"path": "/etc/lockfile/lockfile.dsse.json", "min_accepted_epoch": 1,
+                    "signers": [{"role": role, "key": public_key(role)} for role in ("release", "security")],
+                    "thresholds": {"release": 1, "security": 1}}
+
+pep = {
+    "agent": {"uid": 20001, "gid": 20001, "socket": "/run/pep/agent.sock"},
+    "operator": {"uid": 20004, "gid": 20004, "socket": "/run/pep-ctl/ctl.sock"},
+    "broker": {"uid": 20003, "gid": 20003, "socket": "/run/broker/broker.sock"},
+    "pep": {"spiffe_id": "spiffe://corp.example/pep", "pubkey_dir": "/run/pep-pub"},
+    "lockfile": LOCKFILE_SECTION,
+    "journal": {"path": "/var/lib/pep/journal.jsonl", "lock": "/var/lib/pep/journal.lock"},
+    "log": {"path": "/var/log/pep/decisions.jsonl", "max_bytes": 67108864},
+    "limits": {"connections": 32, "control_connections": 4, "header_bytes": 16384, "body_bytes": 1048576,
+               "read_timeout_ms": 5000, "episode_idle_ms": 1800000, "episodes": 4, "call_burst": 20,
+               "call_rate_per_s": 10, "clock_skew_ms": 2000, "replay_cache_entries": 32768},
+    # compose/check.py makes seven payments across the pay intent. Two are on INV-5005, which
+    # an operator decline and then a step-up timeout each release; `calls` still counts them.
+    "intents": {"pay": intent("invoice", ["INV-1001", "INV-2002", "INV-3003", "INV-4004", "INV-5005"], 1, 8),
+                "notes": intent("recipient", ["rcpt_A"], 2, 5)}}
+broker = {
+    "socket": "/run/broker/broker.sock", "pep": {"uid": 20002, "gid": 20002},
+    "pep_key": "/run/pep-pub/call-proof.pub", "lockfile": LOCKFILE_SECTION,
+    "routes": {"a": {"endpoint": "tcp:tool-a:8080", "credential": "/run/credential-a"},
+               "b": {"endpoint": "tcp:tool-b:8080", "credential": "/run/credential-b"}},
+    "replay_cache_entries": 32768, "clock_skew_ms": 2000, "connections": 64,
+    "upstream_timeout_ms": 10000, "log": "/var/lib/broker/broker.jsonl"}
+invoices = {"INV-1001": {"amount_due_minor": 30000, "currency": "USD", "status": "executed"},
+            "INV-2002": {"amount_due_minor": 60000, "currency": "USD", "status": "executed"},
+            "INV-3003": {"amount_due_minor": 30000, "currency": "USD", "status": "declined"},
+            "INV-4004": {"amount_due_minor": 30000, "currency": "USD", "status": "pending"},
+            "INV-5005": {"amount_due_minor": 60000, "currency": "USD", "status": "executed"}}
+def tool_config(server):
+    return {"server_id": server, "listen": "tcp:0.0.0.0:8080", "verifier": "/run/credential.sha256",
+            "pins": "/etc/lockfile/pins.json", "store": "/var/lib/tool/dedupe.jsonl",
+            "log": "/var/lib/tool/tool.jsonl", "invoices": invoices}
+
+def write(path, value):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", newline="\n") as f:
+        f.write(json.dumps(value, indent=2, sort_keys=True) + "\n")
+    print("wrote", path)
+
+def pepctl():
+    if os.environ.get("PEPCTL"):
+        return os.environ["PEPCTL"]
+    target = os.environ.get("CARGO_TARGET_DIR", "target")
+    return os.path.join(target, "release", "pepctl")
+
+def signed_payload(path):
+    """The payload inside the signed lockfile at `path`, or None."""
+    try:
+        with open(path) as f:
+            envelope = json.load(f)
+        return base64.b64decode(envelope["payload"])
+    except (OSError, ValueError, KeyError):
+        return None
+
+def write_lockfile(directory, payload):
+    """`payload` as directory/pins.json, canonical, and signed as directory/lockfile.dsse.json."""
+    os.makedirs(directory, exist_ok=True)
+    text = canonical(payload).encode()
+    with open(f"{directory}/pins.json", "wb") as f:
+        f.write(text + b"\n")
+    print("wrote", f"{directory}/pins.json")
+    envelope = f"{directory}/lockfile.dsse.json"
+    if signed_payload(envelope) == text:
+        print("unchanged", envelope)
+        return
+    signers = os.path.expanduser(os.environ.get("PEP_SIGNERS_DIR", "~/.config/pep-gate1/signers"))
+    keys = [f"{signers}/{role}.key" for role in ("release", "security")]
+    if not all(os.path.exists(key) for key in keys):
+        sys.exit(f"{envelope}: the payload changed, and signing it needs {keys} (pepctl keygen)")
+    with tempfile.TemporaryDirectory() as work:
+        step = f"{work}/release.dsse.json"
+        subprocess.run([pepctl(), "lock", "sign", keys[0], f"{directory}/pins.json", step], check=True)
+        subprocess.run([pepctl(), "lock", "sign", keys[1], step, envelope], check=True)
+    if signed_payload(envelope) != text:
+        sys.exit(f"{envelope}: the signed payload is not the one written")
+    print("signed", envelope)
+
+write_lockfile("config/lockfile", pins)
+write("config/pep/config.json", pep)
+write("config/broker/config.json", broker)
+write("config/tool-a/config.json", tool_config("a"))
+write("config/tool-b/config.json", tool_config("b"))
+
+# --- config/kit: what compose/gate1.yaml mounts instead (step 9) ---
+#
+# The attacks need more than the step 8 flows: a free `memo`, a store an agent can write, a public
+# sink, and short deadlines. They also use fixtures up, because an invoice pays once across the
+# PEP and the ratchet never falls within an intent: so every attack takes invoices of its own,
+# and every attack that reads a secret takes an intent of its own.
+kit_a, kit_b = copy.deepcopy(server_a), copy.deepcopy(server_b)
+# Fixtures for step 10's rug pulls (§3): hints to flip (#13 to #15), an integer past 2^53 that
+# only an exact reader sees change (#23), and a fraction to respell as 0.50 (a negative).
+lookup = kit_a["get_invoice"]["definition"]
+lookup["annotations"] = {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False}
+lookup["inputSchema"]["x-max-invoice-number"] = 9007199254740993
+kit_b["search_notes"]["definition"]["inputSchema"]["x-score-floor"] = 0.5
+pay_tool = kit_a["pay_invoice"]
+pay_tool["definition"]["inputSchema"]["properties"]["memo"] = STRING
+pay_tool["policy"]["args"].append({"pointer": "/memo", "role": "data"})
+pay_tool["policy"]["strict_schema"] = strict_of(pay_tool["definition"]["inputSchema"])
+kit_a.update(tool("update_invoice", "Annotate an invoice.", obj({"invoice_id": STRING, "text": STRING}, ["invoice_id", "text"]), {
+    "effect": "mutating_internal", "args": [{"pointer": "/invoice_id", "role": "store_key"}, {"pointer": "/text", "role": "store_write"}],
+    "store_uri": "billing://invoices", "sink_clearance": "secret", "output_label": {"conf": "internal", "integ": "untrusted_external"}}))
+kit_b.update(tool("post_public", "Post to a public page.", obj({"text": STRING}, ["text"]), {
+    "effect": "external_sink", "args": [{"pointer": "/text", "role": "data"}], "sink_clearance": "public",
+    "output_label": {"conf": "public", "integ": "untrusted_external"}}))
+# #28: a payment on b whose amount is witnessed by a's lookup, so a can drift under it (RV4 #2).
+kit_b.update(tool("settle_invoice", "Settle an invoice from the notes ledger.", obj({"invoice_id": STRING,
+    "amount": {"type": "integer", "minimum": 0}, "currency": {"type": "string", "minLength": 3, "maxLength": 3}},
+    ["invoice_id", "amount", "currency"]), {
+    "effect": "mutating_financial", "args": [{"pointer": "/invoice_id", "role": "entity", "kind": "invoice"},
+        {"pointer": "/amount", "role": "amount"}, {"pointer": "/currency", "role": "currency"}],
+    "sink_clearance": "internal", "output_label": {"conf": "internal", "integ": "untrusted_external"},
+    "amount_binding": {"lookup_tool": "get_invoice", "entity_arg_pointer": "/invoice_id", "lookup_entity_pointer": "/invoice_id",
+        "result_amount_pointer": "/structuredContent/amount_due_minor", "result_currency_pointer": "/structuredContent/currency"}}))
+kit_pins = dict(pins, servers={
+    "a": dict(pins["servers"]["a"], tools=kit_a), "b": dict(pins["servers"]["b"], tools=kit_b)})
+
+KIT_PLAIN = [f"INV-K{n:03}" for n in range(1, 301)]
+KIT_DECLINED = [f"INV-D{n:03}" for n in range(1, 11)]
+KIT_PENDING = [f"INV-U{n:03}" for n in range(1, 11)]
+KIT_SLOW = [f"INV-S{n:03}" for n in range(1, 11)]
+KIT_ODD = ["INV-R-WRONG-ID", "INV-R-TWO", "INV-R-FORGED", "INV-R-TYPE", "INV-R-NOTYPE", "INV-R-INPUT"]
+KIT_STEP_UP = [f"INV-V{n:03}" for n in range(1, 11)]
+KIT_BIG = ["INV-B001"]
+KIT_SMALL = ["INV-M001", "INV-M002"]
+kit_ids = KIT_PLAIN + KIT_DECLINED + KIT_PENDING + KIT_SLOW + KIT_ODD + KIT_BIG + KIT_SMALL + KIT_STEP_UP
+def row(status="executed", amount=1000):
+    return {"amount_due_minor": amount, "currency": "USD", "status": status}
+kit_invoices = {invoice: row() for invoice in KIT_PLAIN + KIT_SLOW + KIT_SMALL}
+kit_invoices.update({invoice: row("declined") for invoice in KIT_DECLINED})
+kit_invoices.update({invoice: row("pending") for invoice in KIT_PENDING})
+kit_invoices.update({"INV-R-WRONG-ID": row(), "INV-R-TWO": row(), "INV-R-FORGED": row("declined"), "INV-B001": row(amount=150000),
+                     "INV-R-TYPE": row(), "INV-R-NOTYPE": row(), "INV-R-INPUT": row()})
+kit_invoices.update({invoice: row(amount=60000) for invoice in KIT_STEP_UP})
+kit_misbehave = {f"pay_invoice:{invoice}": "delay_ms:2200" for invoice in KIT_SLOW}
+kit_misbehave.update({"pay_invoice:INV-R-WRONG-ID": "wrong_id", "pay_invoice:INV-R-TWO": "two_responses",
+                      "pay_invoice:INV-R-FORGED": "forged_outcome", "get_invoice:INV-R-TYPE": "unknown_result",
+                      "get_invoice:INV-R-NOTYPE": "absent_result", "pay_invoice:INV-R-INPUT": "input_required"})
+
+def kit_intent(kind, ids, max_calls=500, per_call=100000, cumulative=50000000, declines=40, per_entity=1):
+    return {"release_epoch": 1, "lockfile_digest": digest(kit_pins),
+            "limits": {"currency": "USD", "per_call_max_minor": per_call, "cumulative_max_minor": cumulative,
+                       "max_calls": max_calls, "step_up_over_minor": 50000, "max_declines": declines},
+            "entities": {"kind": kind, "ids": ids, "per_entity_max_uses": per_entity}, "seq": "unconstrained"}
+
+KIT_SECRET_INTENTS = 8
+kit_intents = {"pay": kit_intent("invoice", kit_ids), "pay2": kit_intent("invoice", kit_ids),
+               "small": kit_intent("invoice", KIT_SMALL, per_call=1000, cumulative=1500),
+               "notes": kit_intent("recipient", ["rcpt_A"], per_entity=2),
+               "ordered": dict(kit_intent("invoice", KIT_PLAIN),
+                               seq={"transitions": [[None, "get_invoice"], ["get_invoice", "pay_invoice"]]})}
+kit_intents.update({f"secret-{n}": kit_intent("invoice", KIT_PLAIN) for n in range(1, KIT_SECRET_INTENTS + 1)})
+kit_pep = dict(pep, intents=kit_intents, limits=dict(
+    pep["limits"], connections=48, episodes=12, episode_idle_ms=12000, episode_lifetime_ms=25000,
+    upstream_timeout_ms=3000, step_up_timeout_ms=8000))
+kit_pep["lockfile"] = dict(pep["lockfile"])
+kit_broker = dict(broker, upstream_timeout_ms=3000)
+def kit_tool(server):
+    extra = {"invoices": kit_invoices, "record": "/var/lib/tool/requests.jsonl"}
+    if server == "a":
+        extra["misbehave"] = kit_misbehave
+        # compose/mutations.py names a rug pull in the flag file; empty, it serves the pins.
+        extra["drift"] = {"flag": "/var/lib/tool/drift"}
+    else:
+        # The kit touches an empty flag (C-ENG); compose/mutations.py names other changes. Two
+        # tools a page, so #24 changes a page after the first.
+        extra["drift"] = {"flag": "/var/lib/tool/drift", "change": "description"}
+        extra["page_size"] = 2
+    return dict(tool_config(server), **extra)
+
+write_lockfile("config/kit/lockfile", kit_pins)
+write("config/kit/pep/config.json", kit_pep)
+write("config/kit/broker/config.json", kit_broker)
+write("config/kit/tool-a/config.json", kit_tool("a"))
+write("config/kit/tool-b/config.json", kit_tool("b"))
+
+# --- config/load: G4's load (compose/load.yaml, O1) ---
+#
+# 10,500 calls at under 5 a second an episode take at least 42 episodes, and every payment needs an
+# invoice of its own. The pins are the release ones. The extra intents are for the head-of-line
+# run and the 1 MiB requests, which are measured apart.
+LOAD_EPISODES, LOAD_SPARE, LOAD_PAYMENTS = 44, 4, 50
+def load_id(episode, n):
+    return f"INV-L{episode:02}-{n:03}"
+load_intents = {f"load-{episode:02}": intent("invoice", [load_id(episode, n) for n in range(LOAD_PAYMENTS)], 1, LOAD_PAYMENTS)
+                for episode in range(LOAD_EPISODES + LOAD_SPARE)}
+for limits_holder in load_intents.values():
+    limits_holder["limits"]["cumulative_max_minor"] = 1000000
+load_invoices = {load_id(episode, n): {"amount_due_minor": 1000, "currency": "USD", "status": "executed"}
+                 for episode in range(LOAD_EPISODES + LOAD_SPARE) for n in range(LOAD_PAYMENTS)}
+load_pep = dict(pep, intents=load_intents, limits=dict(
+    pep["limits"], connections=192, episodes=LOAD_EPISODES + LOAD_SPARE, call_burst=20, call_rate_per_s=5))
+def load_tool(server):
+    return dict(tool_config(server), invoices=load_invoices)
+
+write("config/load/pep/config.json", load_pep)
+write("config/load/tool-a/config.json", load_tool("a"))
+write("config/load/tool-b/config.json", load_tool("b"))

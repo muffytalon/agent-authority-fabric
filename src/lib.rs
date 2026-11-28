@@ -3,12 +3,49 @@
 //!
 //! - [`jcs`] parses wire bytes with the JCS-strict-NFC profile and computes digests.
 //! - [`engine`] runs the nine-guard pipeline, the two-phase budget and the taint labels.
+//! - [`forward`] builds the only bytes the PEP sends upstream (F-16).
+//! - [`lockfile`] verifies the signed lockfile, and [`schema`] holds its strict argument schemas.
 //! - `peercred` (Linux and macOS) checks peer credentials and binds the socket safely.
+//! - [`tokens`] signs and verifies the Episode Token and the Call Proof, and keeps the replay
+//!   cache.
 //!
 //! The architecture is specified in `SPEC.md`; the Week 1 design is in `WEEK1_PLAN.md`.
 #![forbid(unsafe_code)]
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub mod actor;
+pub mod config;
+pub mod control;
+pub mod decision_log;
 pub mod engine;
+pub mod forward;
+pub mod http;
 pub mod jcs;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+pub mod journal;
+pub mod lockfile;
+pub mod mcp;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod peercred;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub mod poll;
+pub mod pool;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub mod registry;
+pub mod schema;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub mod serve;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub mod stubs;
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects
+)]
+mod testkit;
+pub mod tokens;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub mod upstream;

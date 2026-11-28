@@ -14,13 +14,16 @@ lenient-numbers = []
 # Versions verified on crates.io 2026-10-24.
 [dependencies]
 base64 = { version = "=0.23.1", default-features = false, features = ["alloc"] } # 2026-08-04
+# ES256 for JWS and DSSE (WEEK2_PLAN step 3). `default-features = false` keeps out `std`, which
+# would enable getrandom, and `pem`/`precomputed-tables`; `ecdsa` adds `arithmetic` and `sha256`.
+p256 = { version = "=0.14.0", default-features = false, features = ["ecdsa"] }   # 2026-07-03, MSRV 1.85
 ryu-js = { version = "=1.0.3", default-features = false }                        # 2026-07-10
 sha2 = { version = "=0.11.1", default-features = false }                         # 2026-10-12, MSRV 1.88
 thiserror = "=2.0.21"                                                            # 2026-09-23
 unicode-normalization = "=0.1.26"                                                # 2026-10-16, Unicode 18.0.0
 
 [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
-nix = { version = "=0.31.3", default-features = false, features = ["socket", "user"] } # 2026-05-11
+nix = { version = "=0.31.3", default-features = false, features = ["signal", "socket", "user"] } # 2026-05-11; `signal` for the clean stop (R1)
 
 [lints.rust]
 unsafe_code = "forbid"
@@ -58,3 +61,10 @@ mem_forget = "deny"
 # Approved pedantic opt-outs: jcs::JcsValue, peercred::PeerError; long guard/parser fns.
 module_name_repetitions = "allow"
 too_many_lines = "allow"
+
+# B1 (2026-11-05). With the R1 journal, a panic fails closed: the process ends, every token
+# dies with its per-boot key, and the journal keeps every budget. Overflow checks cover the
+# dependencies and binaries too; the library already denies unchecked arithmetic.
+[profile.release]
+panic = "abort"
+overflow-checks = true

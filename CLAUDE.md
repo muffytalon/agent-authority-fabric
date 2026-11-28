@@ -4,7 +4,7 @@
 `pep-sidecar` is an OS-isolated, stateful OAuth-native Policy Enforcement Point (PEP) sidecar for AI agent payments and tool execution, written in Rust `1.97.1` (Edition `2024`; `rust-version` is also `1.97.1`, so no older compiler is claimed or supported). Everything architectural is specified in `@SPEC.md`.
 ## 2. Mandatory Verification Loop (Run After Every Edit)
 `cargo` is not installed on Windows; run all `cargo` commands inside WSL2 (`wsl.exe`) with `CARGO_TARGET_DIR=$HOME/.cargo-target/pep-sidecar` and `RUSTFLAGS='-D warnings'`.
-Never declare a task complete until all six commands pass with zero warnings:
+Never declare a task complete until all eight commands pass with zero warnings:
 ```bash
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
@@ -12,6 +12,8 @@ cargo test -- --nocapture
 cargo clippy --all-targets --features lenient-numbers -- -D warnings && cargo test --features lenient-numbers
 cargo clippy --all-targets --target aarch64-apple-darwin -- -D warnings
 cargo deny check
+PEP_SECRETS_DIR=/nonexistent docker compose config --quiet
+cargo test --release --test rv5_attacks -- --ignored --nocapture --test-threads=1
 ```
 `cargo deny check` applies `deny.toml` (advisories, licences, bans, sources) and needs `cargo-deny` installed in WSL (`cargo install --locked cargo-deny`); its advisories check fetches the RustSec database. When a pin in `Cargo.toml` changes, also update `reports/Dependency unsafe record.md`.
 
@@ -44,13 +46,15 @@ Cargo.toml enforces [lints.rust] and [lints.clippy] with -D warnings. Do NOT wea
 
     No Default on Policy Types: Never derive or implement Default on Budget, Limits, or policy structs. Use explicit constructors like Budget::empty().
 
+    Binaries (print_stdout, print_stderr and exit = "deny"): Log with writeln! to a locked stderr handle and return std::process::ExitCode from main; print_stdout, print_stderr and exit stay denied. Never log raw tokens, proofs, keys or credentials.
+
 ## 4. Non-Negotiable Security Invariants (F-03 to F-16)
 
     Wire-Level JCS Parsing (F-03, F-04, F-05):
 
         serde_json silently drops duplicate keys, and while serde_json keeps 64-bit integers exact, I-JSON and JavaScript peers round integers outside [-(2^53 - 1), +(2^53 - 1)], causing peers to read different numbers. Always parse raw wire bytes via jcs::canonicalize / PepEngine::evaluate_raw(&[u8]) BEFORE any downstream processing.
 
-        Canonicalize "-0" to "0" per RFC 8785 §3.2.2.3; reject leading zeros ("00", "-01"), lone UTF-16 surrogates, and integers outside [-(2^53 - 1), +(2^53 - 1)] on requests and on values that authorize decisions (keep the lenient-numbers cargo feature for general RFC 8785 float formatting in tool results).
+        Canonicalize "-0" to "0" per RFC 8785 §3.2.2.3; reject leading zeros ("00", "-01"), lone UTF-16 surrogates, and integers outside [-(2^53 - 1), +(2^53 - 1)] on requests and on values that authorize decisions (the lenient-numbers cargo feature only widens the request profile to RFC 8785 fractions and exponents, still within that range; it does not affect tool results, which always use the result profile, and it is a test configuration).
 
         Normalize strings and keys to Unicode NFC before UTF-16 code-unit sorting and reject post-NFC duplicate keys.
 
@@ -64,11 +68,13 @@ Cargo.toml enforces [lints.rust] and [lints.clippy] with -D warnings. Do NOT wea
 
         Compute downstream payment idempotency keys as "pep-" + b64url(SHA-256(episode_id.to_be_bytes() || reservation_id.to_be_bytes() || action_digest.as_bytes())).
 
-    Two-Phase Budget & Ambiguous Aborts:
+    Two-Phase Budget & Ambiguous Aborts (F-10):
 
         AbortOutcome::DefinitelyNotExecuted releases the reservation and decrements reserved.
 
         AbortOutcome::Unknown (e.g., network timeout) transitions the reservation to ResState::NeedsReconcile and MUST keep the amount counted inside budget.reserved (fail closed).
+
+        Journal each payment reservation when it is made, and write its forwarded record and the call's F-08 taint records to the journal before the call is forwarded; a syncer thread fsyncs them right behind, and a failed fsync makes the journal refuse every later append and leaves a marker that holds the next start, as below. Fsync any F-09 ratchet rise before the reply that depends on it. Fsync a boot record with the kernel's boot id when the PEP starts, and on SIGTERM or SIGINT make a fsynced stopped record the run's last; a run that ended on another kernel without one may have lost records, so start no episode until the operator's resume. Where no boot id can be read, fsync the forwarded and taint records before the call is forwarded. At boot, truncate a torn tail under the journal lock; reservations forwarded with no outcome, or with outcome unknown, return as NeedsReconcile, keyed by their original (eid, rid), and count against their intent.
 
     Cross-Episode Taint & Causality Laundering (F-08, F-09):
 
@@ -80,9 +86,11 @@ Cargo.toml enforces [lints.rust] and [lints.clippy] with -D warnings. Do NOT wea
 
         Before unlinking an existing socket or calling UnixListener::bind(path), verify via symlink_metadata that the parent directory is a real directory owned by geteuid() with mode (mode & 0o027) == 0 (0750 or 2750 setgid, or tighter), and any existing file at path is a socket (is_socket()) owned by geteuid(). Set socket permissions to 0660, and verify after bind that the socket is owned by geteuid(), has mode 0660, and has a group (gid) equal to the parent directory's group.
 
+        Before unlinking or binding, take an exclusive File::try_lock on <socket>.lock, opened with O_NOFOLLOW | O_NONBLOCK (from nix::libc, through custom_flags), created if absent with create_new and then set to exactly 0600, and checked by fstat (regular file, mode 0600, owner euid, nlink 1). Hold it for the listener's lifetime, and never remove the lock file.
+
     Trusted Values & Host Authority (F-13):
 
-        Trusted values come only from record_trusted_input (which requires &HostAuthority) or from the signed trusted_fields of a tool pinned as Trusted, with no taint. Code reachable from the agent socket never receives HostAuthority and never calls approve_step_up. Undeclared arguments not present in the tool's pinned argument policy are rejected, at every depth. The one exception is a read-only tool that is not a sink, has no trusted_fields and declares only Data arguments: no guard reads its arguments, so it may take extra flags such as verbose (until the Week 2 lockfile pins full argument schemas).
+        Trusted values come only from record_trusted_input (which requires &HostAuthority) or from the signed trusted_fields of a tool pinned as Trusted, with no taint. Agent connection threads never hold HostAuthority; they send an episode's actor messages that cannot express approve, trusted input, end or abort. Inside the actor, only the host-message handler takes &HostAuthority; the agent-message handler's signature never does. approve_step_up, record_trusted_input, end_episode and resume run only for control-socket messages from the operator uid. No agent message changes a reservation: an agent disconnect releases one only before its point of forwarding, through release_unforwarded, which needs no HostAuthority and refuses a Forwarded reservation; after that point a reservation ends only through settle, behind HostAuthority, with the broker's explicit outcome or an upstream timeout. Undeclared arguments, those not in the tool's pinned argument policy, are rejected at every depth for every tool, and every call's arguments must satisfy the tool's pinned strict schema (L1), whose leaves are exactly the policy's argument pointers.
 
     Payment Amount Witness & Binding (F-14):
 
@@ -94,4 +102,4 @@ Cargo.toml enforces [lints.rust] and [lints.clippy] with -D warnings. Do NOT wea
 
     Canonical Forwarding (F-16):
 
-        Only canonical_request is sent downstream, never the agent's original wire bytes.
+        Only bytes built by forward::tools_call_request from the engine's canonical tool name and arguments, with a PEP-built _meta, are sent downstream; never the agent's wire bytes, id or _meta.

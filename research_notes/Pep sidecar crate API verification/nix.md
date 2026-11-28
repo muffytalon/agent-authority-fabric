@@ -8,7 +8,7 @@
 nix 0.31.3 is real and not yanked. It was published 2026-05-11T07:01:18Z, and it is still the latest stable and newest version of any kind as of 2026-10-27. Its `rust_version` is 1.69 (at most 1.88) and its edition is 2021. The `=0.31.3` pin resolves, and the `# 2026-05-11` comment in Cargo.toml is accurate.
 
 ### Cited Findings
-- Project pin: `nix = { version = "=0.31.3", default-features = false, features = ["socket", "user"] } # 2026-05-11`, under `[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]`. The project has `rust-version = "1.88"` and `edition = "2024"`. — [local Cargo.toml lines 4-5, 22-23](file:///C:/Users/mitam/OneDrive/Documents/Cryptographic%20Biscuits/agent-authority-fabric/Cargo.toml)
+- Project pin: `nix = { version = "=0.31.3", default-features = false, features = ["socket", "user"] } # 2026-05-11`, under `[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]`. The project has `rust-version = "1.88"` and `edition = "2024"`. — [local Cargo.toml lines 4-5, 22-23](../../Cargo.toml)
 - 0.31.3 version record: `num` "0.31.3", `created_at` "2026-05-11T07:01:18.650221Z", `updated_at` "2026-05-11T07:01:18.650221Z", `yanked` false, `yank_message` null, `rust_version` "1.69", `edition` "2021", `license` "MIT", `crate_size` 347476. — [crates.io API /crates/nix/0.31.3](https://crates.io/api/v1/crates/nix/0.31.3)
 - Crate record: `max_version` "0.31.3", `max_stable_version` "0.31.3", `newest_version` "0.31.3", `default_version` "0.31.3", `updated_at` "2026-05-11T07:01:18.650221Z", `repository` "https://github.com/nix-rust/nix". — [crates.io API /crates/nix](https://crates.io/api/v1/crates/nix)
 - Most recent versions, sorted by date (79 versions in total, `"total":79`). Each has `yanked` false unless marked otherwise. — [crates.io API versions?sort=date](https://crates.io/api/v1/crates/nix/versions?per_page=20&sort=date)
@@ -147,7 +147,7 @@ The Linux path matches the real API exactly. `getsockopt` takes `fd: &F` with `F
           self.0
       }
   ```
-- The project's Linux call site is `getsockopt(socket, sockopt::PeerCredentials)?`, where `socket: &F` and `F: AsFd`. It builds `PeerCred { uid: credentials.uid(), gid: credentials.gid(), pid: Some(credentials.pid()) }`, whose fields are `uid: u32, gid: u32, pid: Option<i32>`, and it calls `geteuid().as_raw()`. — [local src/peercred.rs lines 132-159, 219](file:///C:/Users/mitam/OneDrive/Documents/Cryptographic%20Biscuits/agent-authority-fabric/src/peercred.rs)
+- The project's Linux call site is `getsockopt(socket, sockopt::PeerCredentials)?`, where `socket: &F` and `F: AsFd`. It builds `PeerCred { uid: credentials.uid(), gid: credentials.gid(), pid: Some(credentials.pid()) }`, whose fields are `uid: u32, gid: u32, pid: Option<i32>`, and it calls `geteuid().as_raw()`. — [local src/peercred.rs lines 132-159, 219](../../src/peercred.rs)
 
 ### Inferences
 - `getsockopt(socket, …)` with `socket: &F` binds `fd: &F` directly, so no `.as_fd()` is needed.
@@ -213,7 +213,7 @@ docs.rs does not build nix for aarch64-apple-darwin; those per-target URLs retur
 - Related Apple-only sockopts, defined in the same file (each `#[cfg(apple_targets)]`, `libc::SOL_LOCAL`): `LocalPeerCred` (`libc::LOCAL_PEERCRED`, Val `super::XuCred`) and `LocalPeerToken` (`libc::LOCAL_PEERTOKEN`, Val `super::audit_token_t`). There is also a `#[cfg(freebsdlike)]` `LocalPeerCred` at level `0`. — [sockopt.rs @ v0.31.3](https://raw.githubusercontent.com/nix-rust/nix/v0.31.3/src/sys/socket/sockopt.rs)
 - `LocalPeerPid` was "Added ... to `nix::sys::socket::sockopt` for macOS" in 0.27.0. `LOCAL_PEERTOKEN` support was added in 0.30.0 (#2529). — [CHANGELOG.md](https://raw.githubusercontent.com/nix-rust/nix/master/CHANGELOG.md)
 - The `cfg` aliases `apple_targets` and `bsd` both include `macos`, where `macos` means `target_os = "macos"`. — [build.rs @ v0.31.3](https://raw.githubusercontent.com/nix-rust/nix/v0.31.3/build.rs)
-- The project's macOS call sites are `let (uid, gid) = nix::unistd::getpeereid(socket.as_fd())?;`, `let pid = getsockopt(socket, sockopt::LocalPeerPid)?;`, and then `PeerCred { uid: uid.as_raw(), gid: gid.as_raw(), pid: Some(pid) }`. — [local src/peercred.rs lines 161-170](file:///C:/Users/mitam/OneDrive/Documents/Cryptographic%20Biscuits/agent-authority-fabric/src/peercred.rs)
+- The project's macOS call sites are `let (uid, gid) = nix::unistd::getpeereid(socket.as_fd())?;`, `let pid = getsockopt(socket, sockopt::LocalPeerPid)?;`, and then `PeerCred { uid: uid.as_raw(), gid: gid.as_raw(), pid: Some(pid) }`. — [local src/peercred.rs lines 161-170](../../src/peercred.rs)
 
 ### Inferences
 - `getpeereid<F: AsFd>(fd: F)` accepts any `AsFd` by value, and `std::os::fd::BorrowedFd<'_>` implements `AsFd`, so `getpeereid(socket.as_fd())` compiles. Passing `socket` (a `&F`) would also work through std's `AsFd for &T` impl, but no change is needed.
@@ -308,7 +308,7 @@ The real name is `nix::sys::socket::sockopt::PeerPidfd`. It is Linux-only, gated
   unsafe { OwnedFd::from_raw_fd(self.val.assume_init() as RawFd) }
   ```
 - PR #2620, "Add sockopt::PeerPidfd (SO_PEERPIDFD) sockopt support to socket::sockopt", was written by swick and merged by SteveLauC on Apr 11, 2025. Its description says: "PIDs are inherently racy, leading to confused deputy problems… The pidfd mechanism solves this by using a FD to refer to a process which the kernel can keep proper track of… implements sockopt::PeerPidfd (SO_PEERPIDFD) returning an OwnedFd representing the process connected to the socket." — [GitHub PR #2620](https://github.com/nix-rust/nix/pull/2620)
-- The project's SPEC says the sidecar "Verifies peer identity via `SO_PEERCRED` + `SO_PEERPIDFD` (Linux) or `getpeereid` + `LOCAL_PEERPID` (macOS)." — [local SPEC.md line 6](file:///C:/Users/mitam/OneDrive/Documents/Cryptographic%20Biscuits/agent-authority-fabric/SPEC.md)
+- The project's SPEC says the sidecar "Verifies peer identity via `SO_PEERCRED` + `SO_PEERPIDFD` (Linux) or `getpeereid` + `LOCAL_PEERPID` (macOS)." — [local SPEC.md line 6](../../SPEC.md)
 - `Flock` (banner "Available on crate feature `fs` only."; method docs "Obtain a/an flock.", "Remove the lock and return the object wrapped within.", "Relock the file. This can upgrade or downgrade the lock type."; the doc examples use `FlockArg::LockExclusive` and `FlockArg::LockShared`) — [docs.rs struct.Flock](https://docs.rs/nix/0.31.3/nix/fcntl/struct.Flock.html)
   ```rust
   pub struct Flock<T: Flockable>(/* private fields */);

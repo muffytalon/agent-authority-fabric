@@ -1,0 +1,106 @@
+{
+  "agent": {
+    "gid": 20001,
+    "socket": "/run/pep/agent.sock",
+    "uid": 20001
+  },
+  "broker": {
+    "gid": 20003,
+    "socket": "/run/broker/broker.sock",
+    "uid": 20003
+  },
+  "intents": {
+    "notes": {
+      "entities": {
+        "ids": [
+          "rcpt_A"
+        ],
+        "kind": "recipient",
+        "per_entity_max_uses": 2
+      },
+      "limits": {
+        "cumulative_max_minor": 500000,
+        "currency": "USD",
+        "max_calls": 5,
+        "max_declines": 3,
+        "per_call_max_minor": 100000,
+        "step_up_over_minor": 50000
+      },
+      "lockfile_digest": "sha-256:yDqg0t9raRDCpOUcTwlgd4gspHIZdQbuXVKG1nyWGBw",
+      "release_epoch": 1,
+      "seq": "unconstrained"
+    },
+    "pay": {
+      "entities": {
+        "ids": [
+          "INV-1001",
+          "INV-2002",
+          "INV-3003",
+          "INV-4004",
+          "INV-5005"
+        ],
+        "kind": "invoice",
+        "per_entity_max_uses": 1
+      },
+      "limits": {
+        "cumulative_max_minor": 500000,
+        "currency": "USD",
+        "max_calls": 8,
+        "max_declines": 3,
+        "per_call_max_minor": 100000,
+        "step_up_over_minor": 50000
+      },
+      "lockfile_digest": "sha-256:yDqg0t9raRDCpOUcTwlgd4gspHIZdQbuXVKG1nyWGBw",
+      "release_epoch": 1,
+      "seq": "unconstrained"
+    }
+  },
+  "journal": {
+    "lock": "/var/lib/pep/journal.lock",
+    "path": "/var/lib/pep/journal.jsonl"
+  },
+  "limits": {
+    "body_bytes": 1048576,
+    "call_burst": 20,
+    "call_rate_per_s": 10,
+    "clock_skew_ms": 2000,
+    "connections": 32,
+    "control_connections": 4,
+    "episode_idle_ms": 1800000,
+    "episodes": 4,
+    "header_bytes": 16384,
+    "read_timeout_ms": 5000,
+    "replay_cache_entries": 32768
+  },
+  "lockfile": {
+    "min_accepted_epoch": 1,
+    "path": "/etc/lockfile/lockfile.dsse.json",
+    "signers": [
+      {
+        "key": "BFaUoo58sGIwMAa3Dne2y6ekxNbFB5aGXTLs_n6XucjeNJ-ETeFa9215OUFZuSrmnSC9irBIrkXAKO6ui-I78UU",
+        "role": "release"
+      },
+      {
+        "key": "BMJNpgMvQ4mqPv_D4eqjvHZq7V5FkWVyloYK3Cso8nq_SyYEdm8s1F4qBRltU1qhVDJ7x-o8rGPM5Ybdm1KbgyM",
+        "role": "security"
+      }
+    ],
+    "thresholds": {
+      "release": 1,
+      "security": 1
+    }
+  },
+  "log": {
+    "max_bytes": 67108864,
+    "path": "/var/log/pep/decisions.jsonl"
+  },
+  "operator": {
+    "gid": 20004,
+    "socket": "/run/pep-ctl/ctl.sock",
+    "uid": 20004
+  },
+  "pep": {
+    "pubkey_dir": "/run/pep-pub",
+    "spiffe_id": "spiffe://corp.example/pep"
+  }
+}

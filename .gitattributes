@@ -1,0 +1,9 @@
+# WEEK2_PLAN step 8: files the containers and shells read stay LF on every checkout.
+*.sh            text eol=lf
+Dockerfile*     text eol=lf
+compose.yaml    text eol=lf
+*.nft           text eol=lf
+seccomp*.json   text eol=lf
+# SPEC.md and CLAUDE.md keep their CRLF bytes exactly: no conversion either way.
+SPEC.md   -text
+CLAUDE.md -text

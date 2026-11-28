@@ -1,0 +1,6 @@
+negotiated: 2026-07-28
+tools/list: ['get_invoice']
+tools/call: invoice INV-1 isError: False
+listen acknowledged, honored: {}
+listen ended gracefully; events: []
+client closed cleanly

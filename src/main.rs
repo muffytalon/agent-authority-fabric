@@ -1,0 +1,706 @@
+//! The `pep-sidecar` binary (`WEEK2_PLAN` §2a): `pep-sidecar CONFIG`, its healthcheck
+//! `pep-sidecar --check CONFIG`, and `pep-sidecar lock-scan CONFIG DRAFT` (L1), which writes to
+//! stdout the payload of `DRAFT` with every server's discover result and definitions as the
+//! broker serves them now; it binds no socket and holds no host authority.
+//!
+//! Boot, in order:
+//! 1. load the config ([`pep_sidecar::config`]) and the signed lockfile it names, verified
+//!    with its signers (L1), and claim the host's authority;
+//! 2. take the journal's lock, truncate a torn tail and replay it (R1); read the kernel's boot
+//!    id, journal it, and hold every `start_episode` until the operator's `resume` if the last
+//!    run ended on another kernel without a clean stop ([`journal::unclean_stop`]);
+//! 3. restore the label store, the quarantines of the loaded lockfile, and the PEP-wide set of
+//!    entities with an unresolved payment;
+//! 4. generate this boot's Episode Token and Call Proof keys, and publish the Call Proof key
+//!    for the broker;
+//! 5. poll every server once through the broker (RV4 #5): a match serves it, a difference
+//!    quarantines it, and a failure suspends it; then one poller thread per server repeats the
+//!    poll every `drift_poll_ms`, ±20%, so drift is found within T (L1);
+//! 6. serve the control socket, then, last, the agent socket.
+//!
+//! SIGTERM or SIGINT stops the PEP cleanly: the journal's last record becomes `stopped`, and the
+//! process exits 0. Any other end leaves no `stopped`, which only matters if the kernel goes too.
+//!
+//! Logs go to stderr, one line each, and never carry a token, proof, key or credential.
+
+use std::collections::BTreeMap;
+use std::fs;
+use std::io::{self, Write};
+use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
+use std::process::ExitCode;
+use std::sync::{Arc, Mutex, mpsc};
+use std::thread;
+use std::time::Duration;
+
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use nix::sys::signal::{SigSet, Signal};
+
+use pep_sidecar::actor::{self, Services};
+use pep_sidecar::config::{self, Config};
+use pep_sidecar::decision_log::DecisionLog;
+use pep_sidecar::engine::{
+    EntityClaims, EntityKind, HostAuthority, MAX_IN_FLIGHT, ServerState, ServerStates, Shared,
+    UnresolvedEntities, encode_ulid,
+};
+use pep_sidecar::http::Caps;
+use pep_sidecar::jcs;
+use pep_sidecar::journal::{
+    self, Journal, JournalHandle, JournaledLabels, Record, replay, spawn_writer,
+    spawn_writer_syncing_behind,
+};
+use pep_sidecar::lockfile::{MAX_ENVELOPE_BYTES, PinnedServer};
+use pep_sidecar::peercred::bind_safe_listener;
+use pep_sidecar::poll::{PollOutcome, Served, fetch, poll, scanned_payload};
+use pep_sidecar::registry::{Registry, RegistryConfig, connection_share, new_ulid};
+use pep_sidecar::serve::{
+    self, AgentContext, ControlContext, accept_agents, accept_loop, serve_control,
+};
+use pep_sidecar::tokens::{Es256Signer, os_entropy, unix_now};
+use pep_sidecar::upstream::{self, BrokerClient, MAX_PENDING_CONNECTS};
+
+/// Largest config file read.
+const MAX_CONFIG_BYTES: u64 = 16 * 1024 * 1024;
+/// Entries the PEP-wide label store holds.
+const LABEL_CAPACITY: usize = 1 << 20;
+/// The file, in `pep.pubkey_dir`, holding the Call Proof public key: unpadded base64url of
+/// its uncompressed SEC1 point, then a newline.
+const CALL_PROOF_KEY_FILE: &str = "call-proof.pub";
+/// How often idle and expired episodes are ended.
+const REAP_EVERY: Duration = Duration::from_secs(30);
+/// Margin on top of the step-up wait and the upstream leg for a call's answer.
+const CALL_MARGIN: Duration = Duration::from_secs(5);
+
+fn main() -> ExitCode {
+    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    let (check, path) = match args.as_slice() {
+        [path] => (false, path),
+        [flag, path] if flag == "--check" => (true, path),
+        [command, config, draft] if command == "lock-scan" => {
+            return match lock_scan(Path::new(config), Path::new(draft)) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => {
+                    log(&format!("pep-sidecar lock-scan: {error}"));
+                    ExitCode::FAILURE
+                }
+            };
+        }
+        _ => {
+            log("usage: pep-sidecar [--check] CONFIG | pep-sidecar lock-scan CONFIG DRAFT");
+            return ExitCode::from(2);
+        }
+    };
+    if check {
+        // A container healthcheck: is the server accepting connections?
+        return if check_ready(Path::new(path)) {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::FAILURE
+        };
+    }
+    match run(Path::new(path)) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            log(&format!("pep-sidecar: {error}"));
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// One line to stderr.
+fn log(message: &str) {
+    let stderr = io::stderr();
+    let mut lock = stderr.lock();
+    drop(writeln!(lock, "{message}"));
+}
+
+fn millis(duration_ms: u64) -> Duration {
+    Duration::from_millis(duration_ms)
+}
+
+/// Why the PEP stops.
+enum Ending {
+    /// A listener stopped accepting: a PEP that cannot be reached or controlled stops (fail
+    /// closed).
+    Failed(&'static str),
+    /// SIGTERM or SIGINT, after the journal's `stopped` record.
+    Signalled(Signal),
+}
+
+/// The signals that stop the PEP cleanly.
+fn stop_signals() -> SigSet {
+    let mut signals = SigSet::empty();
+    signals.add(Signal::SIGTERM);
+    signals.add(Signal::SIGINT);
+    signals
+}
+
+fn run(path: &Path) -> Result<(), String> {
+    // Blocked before any thread starts, so every thread inherits the mask, and the one thread
+    // that waits for them takes them: a PID 1 in a container has no default action to fall
+    // back on, so without this SIGTERM does nothing until SIGKILL.
+    stop_signals()
+        .thread_block()
+        .map_err(|error| format!("signal mask: {error}"))?;
+
+    // 1. The config, and the host's authority.
+    let config = load_config(path)?;
+    check_fd_budget(&config)?;
+    if config.agent.uid == config.operator.uid {
+        // Tests run this way. In production it makes the control socket's peer check empty.
+        log("pep-sidecar: warning: the agent and the operator share a uid");
+    }
+    let host = Arc::new(
+        HostAuthority::claim()
+            .ok_or_else(|| "the host authority was already claimed".to_owned())?,
+    );
+
+    // 2. The journal.
+    let (journal, records) = Journal::open(&config.journal.path, &config.journal.lock)
+        .map_err(|error| format!("journal: {error}"))?;
+    let replayed = replay(&records).map_err(|error| format!("journal: {error}"))?;
+    log(&format!(
+        "pep-sidecar: journal replayed: {} records, {} unresolved entities",
+        records.len(),
+        replayed.unresolved.len()
+    ));
+    // With a boot id, `forwarded` and `taint` records go on once written, and a syncer fsyncs
+    // right behind them; a kernel lost before that fsync is caught at the next boot. Without
+    // one, every such record waits for its fsync (R1).
+    let boot_id = journal::boot_id();
+    let unclean = journal::unclean_stop(&records, boot_id.as_deref());
+    let (journal, _writer) = if boot_id.is_some() {
+        spawn_writer_syncing_behind(journal)
+    } else {
+        log("pep-sidecar: no kernel boot id: every forward waits for its fsync");
+        spawn_writer(journal)
+    }
+    .map_err(|error| format!("journal writer: {error}"))?;
+    if let Some(boot_id) = &boot_id {
+        journal
+            .commit(&[Record::Boot {
+                boot_id: boot_id.clone(),
+            }])
+            .map_err(|error| format!("journal: {error}"))?;
+    }
+    let (stopped, stop) = mpsc::channel::<Ending>();
+    spawn_signal_thread(journal.clone(), boot_id, stopped.clone())?;
+
+    // 3. The PEP-wide state.
+    let labels = JournaledLabels::restore(
+        LABEL_CAPACITY,
+        journal.clone(),
+        &replayed.taint,
+        &config.pins.pins.stores,
+    )
+    .map_err(|error| format!("label store: {error}"))?;
+    let servers = Arc::new(ServerStates::empty());
+    for (server_id, digest) in &replayed.quarantined {
+        if *digest == config.pins.digest {
+            servers
+                .quarantine(server_id)
+                .map_err(|error| format!("server states: {error}"))?;
+        }
+    }
+    let unresolved = Arc::new(UnresolvedEntities::empty());
+    for entity in &replayed.unresolved {
+        unresolved
+            .insert(entity)
+            .map_err(|error| format!("unresolved set: {error}"))?;
+    }
+    // The invoices earlier boots paid or left unresolved (RV5 V1). An intent the config no longer
+    // names may have been an invoice intent, so it counts (fail closed).
+    let claims = Arc::new(EntityClaims::empty());
+    for (intent, ledger) in &replayed.ledgers {
+        let recipients = config
+            .intents
+            .get(intent)
+            .is_some_and(|known| known.intent.entities.ids.kind() == EntityKind::Recipient);
+        if !recipients {
+            for (entity, uses) in &ledger.entity_uses {
+                claims
+                    .restore(entity, *uses)
+                    .map_err(|error| format!("invoice claims: {error}"))?;
+            }
+        }
+    }
+    let shared = Shared {
+        labels,
+        servers: servers.clone(),
+        unresolved,
+        claims,
+    };
+
+    // 4. This boot's keys.
+    let mut entropy = os_entropy().map_err(|error| format!("entropy: {error}"))?;
+    let proof_key =
+        Es256Signer::generate(&mut entropy).map_err(|error| format!("keys: {error}"))?;
+    let episode_key =
+        Es256Signer::generate(&mut entropy).map_err(|error| format!("keys: {error}"))?;
+    publish_key(&config, &proof_key)?;
+
+    // 5. One poll of every server before the agent socket binds (RV4 #5).
+    let broker = Arc::new(BrokerClient::new(
+        config.broker.socket.clone(),
+        config.broker.uid,
+        config.broker.gid,
+        jcs::MAX_DEFINITION_BYTES,
+    ));
+    first_polls(&config, &broker, &servers, &journal, &mut entropy)?;
+    spawn_pollers(&config, &broker, &servers, &journal)?;
+
+    // 6. Serve.
+    let decisions = Arc::new(
+        DecisionLog::open(&config.log.path, config.log.max_bytes)
+            .map_err(|error| format!("decision log {}: {error}", config.log.path.display()))?,
+    );
+    let limits = &config.limits;
+    let services = Arc::new(Services {
+        host: host.clone(),
+        journal,
+        proof_key,
+        entropy: Mutex::new(Box::new(entropy)),
+        upstream: broker,
+        pins: config.pins.pins.clone(),
+        step_up_timeout: millis(limits.step_up_timeout_ms),
+        upstream_timeout: millis(limits.upstream_timeout_ms),
+        now: unix_now,
+        log: decisions.clone(),
+    });
+    let registry = Registry::new(
+        RegistryConfig {
+            intents: config.intents.clone(),
+            pins: config.pins.pins.clone(),
+            agent_uid: config.agent.uid,
+            episodes: limits.episodes,
+            connection_share: connection_share(limits.connections, limits.episodes),
+            call_burst: limits.call_burst,
+            call_rate_per_s: limits.call_rate_per_s,
+            idle_secs: limits.episode_idle_ms.checked_div(1000).unwrap_or(0),
+            lifetime_secs: limits.episode_lifetime_ms.checked_div(1000).unwrap_or(0),
+            skew_secs: limits.clock_skew_ms.checked_div(1000).unwrap_or(0),
+        },
+        episode_key,
+        replayed.ledgers.into_iter().collect::<BTreeMap<_, _>>(),
+        shared,
+        services,
+    );
+    let marker = journal::unsynced_marker(&config.journal.path);
+    // A symlink counts as the marker too: fail closed.
+    let unsynced = fs::symlink_metadata(&marker).is_ok();
+    let why = match (unclean, unsynced) {
+        (Some(previous), _) => Some((
+            format!("the run on kernel {previous} ended without a clean stop"),
+            previous,
+        )),
+        (None, true) => Some((
+            "a journal fsync failed in an earlier run".to_owned(),
+            "unsynced".to_owned(),
+        )),
+        (None, false) => None,
+    };
+    if let Some((why, previous)) = why {
+        log(&format!(
+            "pep-sidecar: {why}, so its last journal records may be lost; no episode starts \
+             until the operator checks its payments against the broker's log and its writes \
+             against the tools, then sends `resume`"
+        ));
+        registry.hold_until_resumed(previous, unsynced.then_some(marker));
+    }
+    let read_timeout = millis(limits.read_timeout_ms);
+
+    let control = bind_safe_listener(&config.operator.socket)
+        .map_err(|error| format!("control socket: {error}"))?;
+    let control_context = ControlContext {
+        registry: registry.clone(),
+        host: host.clone(),
+        peer: config.operator.clone(),
+        read_timeout,
+        log: decisions.clone(),
+    };
+    let control_limit = limits.control_connections;
+    // Neither listener outlives the other: a PEP with no control socket has lost its kill
+    // switch, so the whole process stops (fail closed) (RV5 V11).
+    let control_stopped = stopped.clone();
+    thread::Builder::new()
+        .name("control".to_owned())
+        .spawn(move || {
+            accept_loop(control.listener(), control_limit, move |stream| {
+                serve_control(stream, &control_context);
+            });
+            let _ = control_stopped.send(Ending::Failed("the control socket stopped accepting"));
+        })
+        .map_err(|error| format!("control thread: {error}"))?;
+
+    let reaper = registry.clone();
+    let reaper_host = host.clone();
+    thread::Builder::new()
+        .name("reaper".to_owned())
+        .spawn(move || {
+            loop {
+                thread::sleep(REAP_EVERY);
+                if let Ok(now) = unix_now() {
+                    for eid in reaper.reap(&reaper_host, now) {
+                        log(&format!(
+                            "pep-sidecar: episode {} ended idle",
+                            encode_ulid(eid)
+                        ));
+                    }
+                }
+            }
+        })
+        .map_err(|error| format!("reaper thread: {error}"))?;
+
+    // Threads for a burst, started now: starting dozens at once after a stall costs most (G4).
+    let warm = limits.connections;
+    serve::warm_connections(warm)
+        .and_then(|()| serve::warm_watchers(warm))
+        .and_then(|()| actor::warm_upstream_workers(warm))
+        .and_then(|()| upstream::warm_connectors(warm))
+        .map_err(|error| format!("warm threads: {error}"))?;
+    let agent = bind_safe_listener(&config.agent.socket)
+        .map_err(|error| format!("agent socket: {error}"))?;
+    let call_timeout = millis(limits.step_up_timeout_ms)
+        .checked_add(millis(limits.upstream_timeout_ms))
+        .and_then(|total| total.checked_add(CALL_MARGIN))
+        .ok_or_else(|| "call timeout overflows".to_owned())?;
+    let agent_context = AgentContext {
+        registry,
+        lockfile: Arc::new(config.pins.clone()),
+        servers,
+        peer: config.agent.clone(),
+        read_timeout,
+        caps: Caps {
+            head_bytes: limits.header_bytes,
+            body_bytes: limits.body_bytes,
+        },
+        call_timeout,
+        now: unix_now,
+        log: decisions,
+    };
+    log("pep-sidecar: serving");
+    let connections = limits.connections;
+    thread::Builder::new()
+        .name("agent".to_owned())
+        .spawn(move || {
+            accept_agents(agent.listener(), connections, agent_context);
+            let _ = stopped.send(Ending::Failed("the agent socket stopped accepting"));
+        })
+        .map_err(|error| format!("agent thread: {error}"))?;
+    match stop.recv() {
+        Ok(Ending::Signalled(signal)) => {
+            log(&format!(
+                "pep-sidecar: stopped cleanly on {}",
+                signal.as_str()
+            ));
+            Ok(())
+        }
+        Ok(Ending::Failed(why)) => Err(why.to_owned()),
+        Err(_) => Err("both sockets stopped accepting".to_owned()),
+    }
+}
+
+/// Waits for SIGTERM or SIGINT, then makes `stopped` the journal's last record, fsynced, and
+/// ends the run. Calls still in flight find the journal closed and are refused (fail closed);
+/// a payment already forwarded replays as unresolved, as after any stop.
+fn spawn_signal_thread(
+    journal: JournalHandle,
+    boot_id: Option<String>,
+    stopped: mpsc::Sender<Ending>,
+) -> Result<(), String> {
+    thread::Builder::new()
+        .name("signals".to_owned())
+        .spawn(move || {
+            let signal = match stop_signals().wait() {
+                Ok(signal) => signal,
+                Err(error) => {
+                    log(&format!("pep-sidecar: waiting for signals failed: {error}"));
+                    return;
+                }
+            };
+            let closed = match boot_id {
+                Some(boot_id) => journal.close(&Record::Stopped { boot_id }),
+                // Without a boot id every record was fsynced before its call went on.
+                None => journal.commit(&[]),
+            };
+            let ending = match closed {
+                Ok(()) => Ending::Signalled(signal),
+                Err(error) => {
+                    log(&format!(
+                        "pep-sidecar: the clean stop could not be journaled, so a next run on \
+                         another kernel will wait for `resume`: {error}"
+                    ));
+                    Ending::Failed("the clean stop could not be journaled")
+                }
+            };
+            let _ = stopped.send(ending);
+        })
+        .map(drop)
+        .map_err(|error| format!("signal thread: {error}"))
+}
+
+/// File descriptors the PEP needs beyond its connections: its listeners, locks, journal, logs,
+/// and those of a request being checked.
+const FD_MARGIN: u64 = 64;
+
+/// Refuses to start with a `limits` section the process's `RLIMIT_NOFILE` cannot hold: four per
+/// agent connection (twice `limits.connections` can be open while ended handlers exit, each with
+/// its socket and one clone, the pool's or the disconnect watcher's), two per control connection,
+/// one per upstream leg, and the connects that may still be blocked after their legs ended. Past
+/// that the PEP keeps running, but a call that cannot open its upstream connection fails. Where
+/// `/proc` has no limits file, there is nothing to check.
+fn check_fd_budget(config: &Config) -> Result<(), String> {
+    let Ok(limits) = fs::read_to_string("/proc/self/limits") else {
+        return Ok(());
+    };
+    let soft = limits
+        .lines()
+        .find_map(|line| line.strip_prefix("Max open files"))
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|soft| soft.parse::<u64>().ok());
+    let Some(soft) = soft else {
+        // "unlimited", or no such line.
+        return Ok(());
+    };
+    let as_u64 = |value: usize| u64::try_from(value).unwrap_or(u64::MAX);
+    let limit = &config.limits;
+    let legs = as_u64(limit.episodes).saturating_mul(as_u64(MAX_IN_FLIGHT));
+    let needed = as_u64(limit.connections)
+        .saturating_mul(4)
+        .saturating_add(as_u64(limit.control_connections).saturating_mul(2))
+        .saturating_add(legs)
+        .saturating_add(as_u64(MAX_PENDING_CONNECTS))
+        .saturating_add(FD_MARGIN);
+    if soft < needed {
+        return Err(format!(
+            "RLIMIT_NOFILE is {soft}, and these limits need {needed}: raise it (Compose `ulimits`), or lower limits.connections or limits.episodes"
+        ));
+    }
+    Ok(())
+}
+
+/// A file's bytes, if it is no larger than `cap`.
+fn read_capped(path: &Path, cap: u64) -> Result<Vec<u8>, String> {
+    let size = fs::metadata(path)
+        .map_err(|error| format!("{}: {error}", path.display()))?
+        .len();
+    if size > cap {
+        return Err(format!("{}: larger than {cap} bytes", path.display()));
+    }
+    fs::read(path).map_err(|error| format!("{}: {error}", path.display()))
+}
+
+fn load_config(path: &Path) -> Result<Config, String> {
+    let bytes = read_capped(path, MAX_CONFIG_BYTES).map_err(|error| format!("config {error}"))?;
+    let envelope_cap = u64::try_from(MAX_ENVELOPE_BYTES).unwrap_or(u64::MAX);
+    config::load(&bytes, &|lockfile| read_capped(lockfile, envelope_cap).ok())
+        .map_err(|error| format!("config {}: {error}", path.display()))
+}
+
+/// `lock-scan CONFIG DRAFT` (L1): fetches every server the draft names through the broker the
+/// config names, with no Call Proof, and writes the filled payload to stdout. Only the config's
+/// `broker` and `limits` sections are read, so it runs before any lockfile is signed.
+fn lock_scan(config_path: &Path, draft_path: &Path) -> Result<(), String> {
+    let settings = config::scan_settings(&read_capped(config_path, MAX_CONFIG_BYTES)?)
+        .map_err(|error| format!("config {}: {error}", config_path.display()))?;
+    let draft_cap = u64::try_from(jcs::MAX_DEFINITION_BYTES).unwrap_or(u64::MAX);
+    let draft = jcs::parse_with(
+        &read_capped(draft_path, draft_cap)?,
+        &jcs::ParseOptions::definition(),
+    )
+    .map_err(|error| format!("draft {}: {error}", draft_path.display()))?
+    .value;
+    let broker = BrokerClient::new(
+        settings.broker.socket.clone(),
+        settings.broker.uid,
+        settings.broker.gid,
+        jcs::MAX_DEFINITION_BYTES,
+    );
+    let mut entropy = os_entropy().map_err(|error| format!("entropy: {error}"))?;
+    let mut next_id = || {
+        let now = unix_now().ok()?.checked_mul(1000)?;
+        new_ulid(&mut entropy, now).ok().map(encode_ulid)
+    };
+    let deadline = millis(settings.drift_poll_deadline_ms);
+    let mut served: BTreeMap<String, Served> = BTreeMap::new();
+    let servers = draft
+        .get("servers")
+        .and_then(jcs::JcsValue::as_object)
+        .ok_or("the draft has no servers object")?;
+    for (server_id, _) in servers.entries() {
+        let now = fetch(&broker, server_id.as_str(), &mut next_id, deadline)
+            .map_err(|_| format!("server {}: the scan did not complete", server_id.as_str()))?;
+        served.insert(server_id.as_str().to_owned(), now);
+    }
+    let payload = scanned_payload(&draft, &served)?;
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+    out.write_all(&payload)
+        .and_then(|()| out.write_all(b"\n"))
+        .and_then(|()| out.flush())
+        .map_err(|error| format!("stdout: {error}"))
+}
+
+/// Writes the Call Proof public key for the broker, which re-reads it per connection: to a
+/// temporary file, then renamed into place, readable by all.
+fn publish_key(config: &Config, key: &Es256Signer) -> Result<(), String> {
+    let directory = &config.pep.pubkey_dir;
+    let target = directory.join(CALL_PROOF_KEY_FILE);
+    let temporary = directory.join(format!(".{CALL_PROOF_KEY_FILE}.new"));
+    let text = format!(
+        "{}\n",
+        URL_SAFE_NO_PAD.encode(key.verifier().to_sec1_uncompressed())
+    );
+    let write = || -> io::Result<()> {
+        fs::write(&temporary, text.as_bytes())?;
+        fs::set_permissions(&temporary, fs::Permissions::from_mode(0o644))?;
+        fs::rename(&temporary, &target)
+    };
+    write().map_err(|error| format!("call proof key {}: {error}", target.display()))
+}
+
+/// Polls every server not already quarantined, once, and sets its state.
+fn first_polls(
+    config: &Config,
+    broker: &BrokerClient,
+    servers: &ServerStates,
+    journal: &JournalHandle,
+    entropy: &mut fs::File,
+) -> Result<(), String> {
+    let deadline = millis(config.limits.drift_poll_deadline_ms);
+    let mut next_id = || {
+        let now = unix_now().ok()?.checked_mul(1000)?;
+        new_ulid(entropy, now).ok().map(encode_ulid)
+    };
+    for (server_id, pinned) in &config.pins.servers {
+        if servers.state(server_id) == ServerState::Quarantined {
+            log(&format!(
+                "pep-sidecar: server {server_id}: quarantined (journal)"
+            ));
+            continue;
+        }
+        let outcome = poll(broker, server_id, pinned, &mut next_id, deadline);
+        let applied = match outcome {
+            PollOutcome::Matches => servers.set_serving(server_id),
+            PollOutcome::Failed => servers.suspend(server_id),
+            PollOutcome::Differs => {
+                // Durable before anything depends on it (RV4 #5).
+                journal
+                    .commit(&[Record::Quarantine {
+                        server_id: server_id.clone(),
+                        lockfile_digest: config.pins.digest.clone(),
+                    }])
+                    .map_err(|error| format!("journal: {error}"))?;
+                servers.quarantine(server_id)
+            }
+        };
+        applied.map_err(|error| format!("server states: {error}"))?;
+        log(&format!("pep-sidecar: server {server_id}: {outcome:?}"));
+    }
+    Ok(())
+}
+
+/// The fraction of `drift_poll_ms` a poller's wait may move by, either way (L1: ±20%).
+const JITTER_DIVISOR: u64 = 5;
+
+/// `interval`, moved by up to a fifth either way, from two bytes of `entropy`; `interval` itself
+/// if they cannot be read. The wait never affects a decision, only when the next poll runs.
+fn jittered(interval: u64, entropy: &mut fs::File) -> Duration {
+    use std::io::Read as _;
+    let mut bytes = [0_u8; 2];
+    if entropy.read_exact(&mut bytes).is_err() {
+        return millis(interval);
+    }
+    let span = interval.checked_div(JITTER_DIVISOR).unwrap_or(0);
+    let width = span.saturating_mul(2).saturating_add(1);
+    let offset = u64::from(u16::from_be_bytes(bytes))
+        .checked_rem(width)
+        .unwrap_or(0);
+    millis(interval.saturating_sub(span).saturating_add(offset))
+}
+
+/// One poller thread per server (L1, RV4 #9), each with its own connection, so one slow server
+/// cannot delay another's detection past T. A difference quarantines the server in memory at
+/// once, then is journaled, fsynced (RV4 #5); if that write fails the quarantine still holds
+/// for this boot, and the next boot polls the server again. A quarantined server is never polled again: only
+/// a lockfile with a different digest lifts it, and that means a restart.
+fn spawn_pollers(
+    config: &Config,
+    broker: &Arc<BrokerClient>,
+    servers: &Arc<ServerStates>,
+    journal: &JournalHandle,
+) -> Result<(), String> {
+    let interval = config.limits.drift_poll_ms;
+    let deadline = millis(config.limits.drift_poll_deadline_ms);
+    for (server_id, pinned) in &config.pins.servers {
+        let server_id = server_id.clone();
+        let pinned: PinnedServer = pinned.clone();
+        let broker = broker.clone();
+        let servers = servers.clone();
+        let journal = journal.clone();
+        let digest = config.pins.digest.clone();
+        let name = format!("poll-{server_id}");
+        thread::Builder::new()
+            .name(name)
+            .spawn(move || {
+                let Ok(mut entropy) = os_entropy() else {
+                    // With no entropy there are no request ids, so no polls: fail closed.
+                    // A poisoned lock already reads as quarantined.
+                    let _ = servers.suspend(&server_id);
+                    log(&format!(
+                        "pep-sidecar: server {server_id}: no entropy, suspended for good"
+                    ));
+                    return;
+                };
+                let mut last = servers.state(&server_id);
+                loop {
+                    thread::sleep(jittered(interval, &mut entropy));
+                    if servers.state(&server_id) == ServerState::Quarantined {
+                        return;
+                    }
+                    let mut next_id = || {
+                        let now = unix_now().ok()?.checked_mul(1000)?;
+                        new_ulid(&mut entropy, now).ok().map(encode_ulid)
+                    };
+                    let outcome = poll(&*broker, &server_id, &pinned, &mut next_id, deadline);
+                    let applied = match outcome {
+                        PollOutcome::Matches => servers.set_serving(&server_id),
+                        PollOutcome::Failed => servers.suspend(&server_id),
+                        PollOutcome::Differs => {
+                            // Refused at once, so no call is forwarded to it after detection
+                            // (G2), then made durable (RV4 #5). A crash between the two only
+                            // means the next boot polls it again.
+                            let applied = servers.quarantine(&server_id);
+                            let record = Record::Quarantine {
+                                server_id: server_id.clone(),
+                                lockfile_digest: digest.clone(),
+                            };
+                            if let Err(error) = journal.commit(&[record]) {
+                                log(&format!(
+                                    "pep-sidecar: server {server_id}: quarantine not journaled: {error}"
+                                ));
+                            }
+                            applied
+                        }
+                    };
+                    if let Err(error) = applied {
+                        log(&format!("pep-sidecar: server {server_id}: {error}"));
+                    }
+                    let now = servers.state(&server_id);
+                    if now != last {
+                        log(&format!("pep-sidecar: server {server_id}: {outcome:?}, {now:?}"));
+                        last = now;
+                    }
+                }
+            })
+            .map_err(|error| format!("poller thread: {error}"))?;
+    }
+    Ok(())
+}
+
+/// Whether the agent socket named in the config at `path` accepts a connection.
+fn check_ready(path: &Path) -> bool {
+    load_config(path)
+        .is_ok_and(|config| std::os::unix::net::UnixStream::connect(&config.agent.socket).is_ok())
+}

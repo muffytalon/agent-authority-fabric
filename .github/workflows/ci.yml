@@ -1,9 +1,13 @@
 # The CLAUDE.md §2 verification loop, run on GitHub.
 #
-# - `verify` runs the six commands exactly as CLAUDE.md §2 writes them, with the same
+# - `verify` runs the first seven commands exactly as CLAUDE.md §2 writes them, with the same
 #   RUSTFLAGS, on the toolchain rust-toolchain.toml pins.
 # - `ignored-tests` runs the three #[ignore] peercred tests. Two need root, which
 #   GitHub-hosted runners give through passwordless sudo.
+# - `attacks` runs the eighth, RV5's attack suite, in a job of its own because it takes
+#   minutes, then the fuzz suite for longer than the short run in `verify`.
+# - `compose` builds every image and runs compose/check.py, then the Gate 1 kit in
+#   compose/kit.py, which adds the test images, with throwaway credentials.
 # - The weekly run catches new RustSec advisories against an unchanged Cargo.lock.
 #
 # Actions are pinned to full commit SHAs, with the release tag in the trailing comment.
@@ -71,6 +75,9 @@ jobs:
       - name: 3. cargo test
         run: cargo test -- --nocapture
 
+      - name: "§3's checks that need a Rust test: each must run and pass"
+        run: python3 compose/checks.py --cargo
+
       - name: 4. lenient-numbers clippy and test
         run: cargo clippy --all-targets --features lenient-numbers -- -D warnings && cargo test --features lenient-numbers
 
@@ -80,8 +87,29 @@ jobs:
       - name: 6. cargo deny check
         run: cargo deny check
 
+      - name: "7. docker compose config (WEEK2_PLAN §6, RV4 #16)"
+        # `config` only interpolates; PEP_SECRETS_DIR is unset in CI, so a dummy value stands in.
+        run: PEP_SECRETS_DIR=/nonexistent docker compose config --quiet
+
+      - name: "G5: no getrandom on any target (fail-closed)"
+        # `cargo tree -i getrandom` exits 101 when nothing matches, so inverting its status would
+        # also pass when cargo itself fails. Instead, list the whole tree and fail if that fails,
+        # then fail on any getrandom line (WEEK2_PLAN step 3). deny.toml also bans the crate.
+        shell: bash
+        run: |
+          set -euo pipefail
+          tree="$RUNNER_TEMP/cargo-tree.txt"
+          cargo tree --locked --target all --all-features --prefix none > "$tree"
+          if grep '^getrandom v' "$tree"; then
+            echo "::error::getrandom is in the dependency tree"
+            exit 1
+          fi
+          echo "No getrandom in $(wc -l < "$tree") tree lines"
+
   ignored-tests:
-    name: Ignored peercred tests (root)
+    # Q1 (WEEK2_PLAN step 4): peer identity is checked on the runner's own kernel, which is
+    # newer than the development machine's. The tests branch on the kernel version and log it.
+    name: Peer identity on the runner's kernel, and the root-only tests
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -92,13 +120,108 @@ jobs:
       - name: Install the pinned toolchain (rust-toolchain.toml)
         run: rustup toolchain install
 
-      - name: Run the #[ignore] tests as root
-        # parent_owner_mismatch_rejected and socket_group_must_match_parent need root;
-        # full_backlog_counts_as_live opens about 4,100 sockets, hence the fd limit.
+      - name: Record the runner's kernel
+        run: |
+          uname -r
+          echo "Runner kernel: \`$(uname -r)\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: peercred tests on this kernel, as the runner user
+        # require_peer_on_this_kernel expects SO_PEERPIDFD on Linux 6.5 and later and a
+        # rejection before it; reaped_peer_rejected expects a stale pidfd (Pid -1).
+        # A block scalar: in a plain one, the ": " after `peercred:` would start a YAML mapping.
+        run: |
+          cargo test --locked --lib peercred:: -- --nocapture
+
+      - name: "Run the #[ignore] tests as root"
+        # parent_owner_mismatch_rejected, socket_group_must_match_parent and
+        # lock_file_owned_by_other_uid_refused need root; cross_namespace_peer_alive_with_pid_zero
+        # needs unshare's user, PID and mount namespaces, which the runner allows only to root.
+        # The helper tests do nothing when run on their own.
         run: |
           sudo env "PATH=$PATH" \
             "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" \
             "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" \
             "RUSTFLAGS=$RUSTFLAGS" \
             "CARGO_TERM_COLOR=$CARGO_TERM_COLOR" \
-            bash -c 'ulimit -n 8192 && cargo test --locked -- --ignored'
+            cargo test --locked --lib -- --ignored --nocapture
+
+  attacks:
+    # CLAUDE.md §2's eighth command, and a longer fuzz, in release, because several attacks
+    # measure. Each attack starts its own PEP, broker and tools, so they run one at a time.
+    name: Attack and fuzz suites
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install the pinned toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
+
+      - name: Attacks
+        run: cargo test --locked --release --test rv5_attacks -- --ignored --nocapture --test-threads=1
+
+      - name: Fuzz, 30 seconds a target
+        env:
+          RV5_FUZZ_SECS: "30"
+        run: cargo test --locked --release --test rv5_fuzz -- --nocapture
+
+  compose:
+    # WEEK2_PLAN step 8: builds every image and runs compose/check.py on the runner's engine and
+    # kernel: volume owners and modes, C-POSTURE, every flow of tests/e2e.rs, pep-log across a
+    # restart and a kill, and the oracle's join. The credentials are throwaway, made for this
+    # run with §4's snippet, and sudo gives them §4's owners. They guard nothing but the stubs.
+    name: Compose topology, posture and flows
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: The configs and the signed lockfiles match their generator
+        # make-config.py signs only a payload that changed, so with no signer keys here it fails
+        # on any change the checked-in envelopes do not cover.
+        run: python3 compose/make-config.py && git diff --exit-code -- config/
+
+      - name: Record the engine and the kernel
+        run: |
+          docker version --format 'Docker {{.Server.Version}}'
+          docker compose version
+          uname -r
+          echo "Docker \`$(docker version --format '{{.Server.Version}}')\`, kernel \`$(uname -r)\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Create throwaway credentials (WEEK2_PLAN §4)
+        run: |
+          secrets="$RUNNER_TEMP/pep-secrets"
+          install -d -m 0700 "$secrets"
+          cd "$secrets"
+          for pair in a:20005 b:20008; do
+            server=${pair%%:*} uid=${pair##*:}
+            ( umask 077
+              head -c 32 /dev/urandom | base64 -w0 > "broker-credential-$server"
+              sha256sum "broker-credential-$server" | cut -d' ' -f1 | tr -d '\n' > "broker-credential-$server.sha256" )
+            sudo chown 20003:20003 "broker-credential-$server"
+            sudo chown "$uid:$uid" "broker-credential-$server.sha256"
+            sudo chmod 0400 "broker-credential-$server" "broker-credential-$server.sha256"
+          done
+          echo "PEP_SECRETS_DIR=$secrets" >> "$GITHUB_ENV"
+
+      - name: compose/check.py
+        # Its output is the proof of C-POSTURE's checks, read by compose/checks.py below. A named
+        # shell turns on pipefail, so tee cannot hide a failure.
+        shell: bash
+        run: python3 compose/check.py | tee "$RUNNER_TEMP/check.log"
+
+      - name: compose/kit.py
+        run: python3 compose/kit.py
+
+      - name: "compose/checks.py: §3's checks on the live stack"
+        run: python3 compose/checks.py --check-log "$RUNNER_TEMP/check.log"
+
+      - name: compose/conformance.py
+        run: python3 compose/conformance.py
+
+      - name: "compose/mutations.py: G2's rug pulls, each found by the drift poller within T"
+        run: python3 compose/mutations.py

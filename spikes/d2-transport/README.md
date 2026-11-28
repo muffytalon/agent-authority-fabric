@@ -11,6 +11,10 @@ Evidence for decision D2 in `WEEK2_PLAN.md` (agent-facing transport), closed on 
   - a client-wide `Pep-Episode` header reaches every request, the SDK's own `server/discover` probe and `subscriptions/listen` included;
   - `_meta["dev.pep-sidecar/episode"]` can be set on `tools/list` and `tools/call`, and survives next to the SDK's own `_meta` keys;
   - neither SDK takes caller `_meta` on `subscriptions/listen`, so the header is the only carrier there.
+- **The SDKs' own `tools/list` needs the token in a header** (added after RV4 #11, from the token-enforcing runs):
+  - the Python SDK lists a tool it has not listed in this session right after calling it, and both SDKs re-list after a -32020, each with no caller `_meta`;
+  - with the token only in `_meta`, Python reports `PEP_DENIED` for a call that has already executed, and its -32020 retry fails; TypeScript reports the denied re-list through `onerror` and resends anyway;
+  - with the token also sent client-wide as `Pep-Episode`, which M1 now accepts alone on `tools/list`, every call succeeds in both SDKs.
 - **How each SDK takes M1's `subscriptions/listen` reply:** acknowledgement then completion closes gracefully; a `notifications/cancelled` before the completion reads as an unexpected close.
 - **How the TypeScript SDK reacts** to a 202 or a 400 for its own `notifications/cancelled`, and to a client-side timeout.
 - **The conditions D2 puts on agents:**
@@ -19,8 +23,8 @@ Evidence for decision D2 in `WEEK2_PLAN.md` (agent-facing transport), closed on 
 
 ## What it does not prove
 - **`pep_standin.py` is a stand-in, not the PEP.**
-  - It answers as M1's router specifies, and logs M1's header and `_meta` checks without enforcing them.
-  - It has no tokens, engine, lockfile or peer checks.
+  - It answers as M1's router specifies, and logs M1's header and `_meta` checks without enforcing them, except in its `enforce` variant, which applies M1's token rule to a fixed test token.
+  - It verifies no signatures, and has no engine, lockfile or peer checks.
   - It is built on Python's `http.server`, so it says nothing about the hand-rolled parser in `src/http.rs`.
 - **Nothing ran in Compose.** Client and stand-in ran under the same uid, with the socket in a work directory, not `/run/pep`.
 - **Only these SDK versions were run.** A later release may change a default, such as the TypeScript SDK's `versionNegotiation`.
@@ -133,6 +137,17 @@ Copied from `WEEK2_PLAN.md`, Appendix A.
 | The client closes an open subscription itself | It POSTs `notifications/cancelled` `{"requestId": "listen:0"}` with `MCP-Protocol-Version` but no `Mcp-Method`. Answered with 202: clean. Answered with 400: `onerror` fires ("Error POSTing to endpoint"), but `close()` resolves, `closed` is `'local'`, and later calls work |
 | Node's built-in `fetch` with the undici 8.12.3 `Agent` | Failed. The cause chain is `TypeError: fetch failed <- UND_ERR_INVALID_ARG: invalid onRequestStart method`. Node 24.22.2 bundles undici 7.30.1 |
 
+**Token-enforcing runs (2026-11-04, RV4 #11).** The stand-in's `enforce` variant applies M1's amended token rule: `tools/call` needs the token in `_meta`; `tools/list` takes it in `_meta` or as a `Pep-Episode` header alone; a header that differs from `_meta` gets 400/-32020; a missing token gets `PEP_DENIED` (-31403). Its `stale` tool answers -32020 once. Each client makes three calls, each from a fresh client that has listed nothing: `get_invoice`, `get_invoice` again (a client recreated mid-episode), and `stale`.
+
+| Run | Outcome |
+|---|---|
+| `py-enforce-meta-only` (token in `_meta` only) | Both `get_invoice` calls executed, then the SDK's own `tools/list` (from `validate_tool_result`) carried no token and was denied, so `call_tool` raised `MCPError: PEP_DENIED` for calls that had executed. The `stale` call's -32020 re-list was denied too, so it raised `Header mismatch` and never executed. This reproduces RV4 #11 |
+| `py-enforce-header` (also a client-wide `Pep-Episode`) | The SDK's `tools/list` was admitted on the header alone, and all three calls succeeded, the -32020 re-list and resend included |
+| `ts-enforce-meta-only` | `callTool` does not list first, so `get_invoice` succeeded. The -32020 re-list carried no token and was denied; the SDK reported it through `onerror` (`-31403 PEP_DENIED`) and resent anyway, so `stale` executed |
+| `ts-enforce-header` | All three succeeded; the -32020 re-list was admitted on the header alone |
+
+The SDK sources agree: Python's `ClientSession.validate_tool_result` calls `list_tools()` when the tool is not cached, and `Client._relist_tool` calls `list_tools(cursor=…, cache_mode="refresh")`, both without `meta`; TypeScript's `callTool` calls `listTools(void 0, …)` on -32020 whenever the connection is modern and not in a browser.
+
 ## Provenance
 - **The recorded runs** (Appendix A) were made on 2026-11-03, between 07:05 and 07:14 UTC, in a session scratchpad under `/tmp`.
 - **That scratchpad was deleted** when WSL restarted at 11:27 UTC, before it was copied here. The original JSONL logs, the virtualenv and `node_modules` went with it.
@@ -145,3 +160,18 @@ Copied from `WEEK2_PLAN.md`, Appendix A.
   - The "unknown message ID" error in `ts-main-cancelled-202` proved intermittent: it was missing from one run and present in the next. `run.sh` no longer requires it. The stable outcome, `closed: remote`, is still checked.
 - **`results/` is the output of `run.sh`** on 2026-11-03 at 12:49 UTC. All 11 runs reproduced their outcomes.
 - **One line is new since the recorded runs.** The Python `cancelled` client also logs "Error parsing SSE message" (an `anyio.BrokenResourceError`) before it raises `SubscriptionLost`. The recorded run kept only the last 15 lines of its output, so whether that line appeared then is unknown.
+
+## Real PEP runs (2026-11-05, step 7)
+
+`real_pep.py BIN_DIR [WORK]` repeats the token-enforcing scenarios against the real `pep-sidecar`, with the stub broker and a stub tool server, instead of the stand-in. The SDK environments come from `run.sh`'s work directory. Each scenario gets a fresh episode from the scripted operator. The harness writes the Episode Token to the client's stdin (E1): the clients read it there when `PEP_TOKEN_FROM_STDIN=1`, and `PEP_REAL=1` skips the stand-in's `stale` tool. The transcripts are in `results/real-*.txt`, with the token replaced.
+
+| SDK | Scenario | Result |
+|---|---|---|
+| Python 2.3.0 | `token` | discover, list, call and listen all succeed; listen closes gracefully |
+| Python 2.3.0 | `enforce-header` | the unlisted call and the recreated client's call succeed |
+| Python 2.3.0 | `enforce-meta-only` | both calls execute, then the SDK's own `tools/list`, which carries no token, is denied, so it raises `PEP_DENIED` (RV4 #11, as against the stand-in) |
+| TypeScript 2.4.0 | `token` | list, call and listen succeed; listen closes as `graceful` |
+| TypeScript 2.4.0 | `enforce-header` | both calls succeed |
+| TypeScript 2.4.0 | `enforce-meta-only` | both calls succeed: `callTool` does not list first |
+
+The results match the stand-in's, so the harness rule stands: set the token as a client-wide `Pep-Episode` header as well as in `_meta`.

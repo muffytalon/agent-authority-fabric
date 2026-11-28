@@ -4,5 +4,5 @@
 channel = "1.97.1"
 profile = "minimal"
 components = ["clippy", "rustfmt"]
-# macOS cross-lint of peercred from Linux.
-targets = ["aarch64-apple-darwin"]
+# macOS cross-lint of peercred from Linux; static musl for the trusted images (B1).
+targets = ["aarch64-apple-darwin", "x86_64-unknown-linux-musl"]

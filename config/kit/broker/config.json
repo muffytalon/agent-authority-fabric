@@ -1,0 +1,41 @@
+{
+  "clock_skew_ms": 2000,
+  "connections": 64,
+  "lockfile": {
+    "min_accepted_epoch": 1,
+    "path": "/etc/lockfile/lockfile.dsse.json",
+    "signers": [
+      {
+        "key": "BFaUoo58sGIwMAa3Dne2y6ekxNbFB5aGXTLs_n6XucjeNJ-ETeFa9215OUFZuSrmnSC9irBIrkXAKO6ui-I78UU",
+        "role": "release"
+      },
+      {
+        "key": "BMJNpgMvQ4mqPv_D4eqjvHZq7V5FkWVyloYK3Cso8nq_SyYEdm8s1F4qBRltU1qhVDJ7x-o8rGPM5Ybdm1KbgyM",
+        "role": "security"
+      }
+    ],
+    "thresholds": {
+      "release": 1,
+      "security": 1
+    }
+  },
+  "log": "/var/lib/broker/broker.jsonl",
+  "pep": {
+    "gid": 20002,
+    "uid": 20002
+  },
+  "pep_key": "/run/pep-pub/call-proof.pub",
+  "replay_cache_entries": 32768,
+  "routes": {
+    "a": {
+      "credential": "/run/credential-a",
+      "endpoint": "tcp:tool-a:8080"
+    },
+    "b": {
+      "credential": "/run/credential-b",
+      "endpoint": "tcp:tool-b:8080"
+    }
+  },
+  "socket": "/run/broker/broker.sock",
+  "upstream_timeout_ms": 3000
+}

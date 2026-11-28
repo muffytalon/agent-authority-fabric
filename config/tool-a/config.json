@@ -1,0 +1,35 @@
+{
+  "invoices": {
+    "INV-1001": {
+      "amount_due_minor": 30000,
+      "currency": "USD",
+      "status": "executed"
+    },
+    "INV-2002": {
+      "amount_due_minor": 60000,
+      "currency": "USD",
+      "status": "executed"
+    },
+    "INV-3003": {
+      "amount_due_minor": 30000,
+      "currency": "USD",
+      "status": "declined"
+    },
+    "INV-4004": {
+      "amount_due_minor": 30000,
+      "currency": "USD",
+      "status": "pending"
+    },
+    "INV-5005": {
+      "amount_due_minor": 60000,
+      "currency": "USD",
+      "status": "executed"
+    }
+  },
+  "listen": "tcp:0.0.0.0:8080",
+  "log": "/var/lib/tool/tool.jsonl",
+  "pins": "/etc/lockfile/pins.json",
+  "server_id": "a",
+  "store": "/var/lib/tool/dedupe.jsonl",
+  "verifier": "/run/credential.sha256"
+}

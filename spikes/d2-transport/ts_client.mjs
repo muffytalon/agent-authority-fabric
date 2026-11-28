@@ -9,7 +9,11 @@ const viaUndici = (url, init) => undiciFetch(url, { ...init, dispatcher: agent }
 const viaGlobal = (url, init) => globalThis.fetch(url, { ...init, dispatcher: agent });
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const pin = { versionNegotiation: { mode: { pin: '2026-07-28' } } };
-const TOKEN = 'eyJ.spike.token';                     // a placeholder; the stand-in never verifies it
+import { readFileSync } from 'node:fs';
+// A placeholder the stand-in never verifies. Against the real PEP (real_pep.py) the harness writes a
+// real Episode Token to stdin, as it would for an agent (E1); the environment only says where to read it.
+const TOKEN = process.env.PEP_TOKEN_FROM_STDIN === '1' ? readFileSync(0, 'utf8').split('\n')[0].trim() : 'eyJ.spike.token';
+const REAL = process.env.PEP_REAL === '1';            // the real PEP has no `stale` tool
 
 function makeClient(options, fetchFn, transportOptions = {}) {
   const client = new Client({ name: 'pep-d2-spike', version: '0.0.1' }, options);
@@ -51,6 +55,22 @@ async function main() {
     const sub = await client.listen({ toolsListChanged: true });
     console.log('listen closed:', await Promise.race([sub.closed, sleep(5000).then(() => 'still open after 5 s')]));
     await client.close();
+    console.log('client closed cleanly');
+    return;
+  }
+  if (scenario === 'enforce-header' || scenario === 'enforce-meta-only') {   // RV4 #11, against the stand-in's `enforce`
+    const headers = scenario === 'enforce-header' ? { requestInit: { headers: { 'Pep-Episode': TOKEN } } } : {};
+    const meta = { 'dev.pep-sidecar/episode': TOKEN };
+    const call = async (label, name, invoice) => {      // a fresh client each time: nothing listed yet
+      const { client, transport } = makeClient(pin, viaUndici, headers);
+      await client.connect(transport);
+      try { const r = await client.callTool({ name, arguments: { invoice_id: invoice }, _meta: meta }); console.log(`${label}: ${r.content[0].text} isError: ${r.isError}`); }
+      catch (e) { console.log(`${label} failed:`, e?.code ?? e?.name, String(e?.message).slice(0, 120)); }
+      await client.close();
+    };
+    await call('unlisted call', 'get_invoice', 'INV-1');
+    await call('call from a recreated client', 'get_invoice', 'INV-2');
+    if (!REAL) await call('stale call (-32020, then re-list and resend)', 'stale', 'INV-3');
     console.log('client closed cleanly');
     return;
   }

@@ -1,0 +1,8 @@
+{
+  "name": "pep-sidecar-conformance",
+  "private": true,
+  "description": "The official MCP conformance suite, pinned, for compose/conformance.py.",
+  "dependencies": {
+    "@modelcontextprotocol/conformance": "0.2.0-alpha.12"
+  }
+}

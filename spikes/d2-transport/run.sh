@@ -146,9 +146,32 @@ run ts-clientclose-hold-400 hold 400 \
   "sub.close() resolved" "closed: local" "call after close: invoice INV-3" "client closed cleanly" \
   -- "${TS[@]}" clientclose
 
+# Added after RV4 #11: the stand-in enforces the Episode Token rule (M1, amended). Each client calls
+# without listing first, from a recreated client, and through the -32020 re-list path.
+run py-enforce-header enforce 202 \
+  "unlisted call: invoice INV-1 isError: False" "call from a recreated client: invoice INV-2 isError: False" \
+  "stale call (-32020, then re-list and resend): invoice INV-3 isError: False" \
+  "allow (Pep-Episode header alone)" "[executed] stale" "client closed cleanly" "!PEP_DENIED" \
+  -- "${PY[@]}" enforce-header
+run py-enforce-meta-only enforce 202 \
+  "unlisted call raised: MCPError: PEP_DENIED" "call from a recreated client raised: MCPError: PEP_DENIED" \
+  "[executed] get_invoice" "PEP_DENIED: no token in _meta or Pep-Episode" \
+  "stale call (-32020, then re-list and resend) raised: MCPError: Header mismatch" "![executed] stale" \
+  -- "${PY[@]}" enforce-meta-only
+run ts-enforce-header enforce 202 \
+  "unlisted call: invoice INV-1 isError: false" "call from a recreated client: invoice INV-2 isError: false" \
+  "stale call (-32020, then re-list and resend): invoice INV-3 isError: false" \
+  "allow (Pep-Episode header alone)" "[executed] stale" "client closed cleanly" "!PEP_DENIED" "!client.onerror" \
+  -- "${TS[@]}" enforce-header
+run ts-enforce-meta-only enforce 202 \
+  "unlisted call: invoice INV-1 isError: false" "client.onerror: -31403 PEP_DENIED" \
+  "PEP_DENIED: no token in _meta or Pep-Episode" \
+  "stale call (-32020, then re-list and resend): invoice INV-3 isError: false" "[executed] stale" \
+  -- "${TS[@]}" enforce-meta-only
+
 echo
 if ((${#FAILED[@]})); then
   echo "DIFFERS from the recorded outcome: ${FAILED[*]}"
   exit 1
 fi
-echo "All 11 runs reproduce the recorded outcomes. Logs and client output: $WORK/results/"
+echo "All 15 runs reproduce the recorded outcomes. Logs and client output: $WORK/results/"

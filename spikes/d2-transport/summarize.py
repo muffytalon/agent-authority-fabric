@@ -14,4 +14,7 @@ for l in open(sys.argv[1]):
         print(f"   {e['method']} {tag}{extra}{token}")
     elif k == "m1-check": print(f"      M1 check on {e['method']}: {e['problems']}")
     elif k == "http": print(f"   {e['verb']} (legacy) -> 405")
+    elif k == "enforce": print(f"      [enforce] {e['method']} id={e['id']}: {e['verdict']}")
+    elif k == "executed": print(f"      [executed] {e['tool']} id={e['id']}")
+    elif k == "stale-32020": print(f"      [stale] first call id={e['id']} -> 400/-32020")
     else: print(f"   [{k}] {e.get('method', '')} {e.get('id', '')} {e.get('variant', '')}")
