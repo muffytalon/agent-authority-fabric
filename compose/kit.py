@@ -19,7 +19,7 @@ The controls run first. A sandbox that blocks nothing because the probe is broke
 that reads the wrong files, would otherwise look exactly like a clean result. `--only`, which may repeat, runs the
 tests whose name holds TEXT. Exits 0 only if everything held. Tokens never reach the output.
 """
-import base64, json, os, re, subprocess, sys, time
+import base64, io, json, os, re, subprocess, sys, tarfile, time
 
 import check
 from check import dc, expect, fetch, in_background, journal_results, lines, pointer, run
@@ -56,7 +56,7 @@ SOCK_STREAM, SOCK_RAW = 1, 3
 SWEEP_ROWS = 4 * 64 * 3   # routes × families × types in net-probe.c
 P256_ORDER = 0xffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551
 PER_CLASS = 46            # G3: 22 classes in Compose, so at least 1,012 attempts
-PLANNED_ATTACKS = 61      # §3
+PLANNED_ATTACKS = 63      # §3
 
 
 with open(os.path.join(check.ROOT, "config/kit/pep/config.json")) as config_file:
@@ -963,6 +963,91 @@ def out_taint(window):
     reply = fresh.pay(invoice)
     if not denied(reply):
         return f"the payment was {reply}"
+
+
+# R1 (c): the PEP's records go on once written and are fsynced right behind, so only a kernel
+# lost before that fsync could take one. A run that ended on another kernel with no clean stop,
+# or a failed fsync's marker, must hold every new episode until the operator's `resume`.
+PEP_STATE = "/var/lib/pep"
+JOURNAL_FILE = PEP_STATE + "/journal.jsonl"
+UNSYNCED = JOURNAL_FILE + ".unsynced"
+ANOTHER_KERNEL = "0c7a3f6e-1b2d-4e5f-8a9b-0c1d2e3f4a5b"
+
+
+def pep_container():
+    """The PEP's container, stopped or not."""
+    return dc("ps", "-a", "-q", "pep").stdout.strip()
+
+
+def pep_file(path):
+    """A file's bytes from the PEP's state volume, even while the PEP is stopped; None if absent."""
+    out = subprocess.run(["docker", "cp", f"{pep_container()}:{path}", "-"], capture_output=True, cwd=check.ROOT)
+    if out.returncode != 0:
+        return None
+    with tarfile.open(fileobj=io.BytesIO(out.stdout)) as archive:
+        return archive.extractfile(archive.next()).read()
+
+
+def put_pep_file(path, data):
+    """Writes `data` at `path` on the stopped PEP's state volume as the PEP's own 0600 file, which
+    is what the journal's checks require of it."""
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w") as archive:
+        info = tarfile.TarInfo(os.path.basename(path))
+        info.size, info.mode, info.uid, info.gid = len(data), 0o600, 20002, 20002
+        archive.addfile(info, io.BytesIO(data))
+    out = subprocess.run(["docker", "cp", "-a", "-", f"{pep_container()}:{os.path.dirname(path)}"],
+                         input=buffer.getvalue(), capture_output=True, cwd=check.ROOT)
+    if out.returncode != 0:
+        raise SystemExit(f"docker cp into the PEP's volume: {out.stderr.decode(errors='replace').strip()}")
+
+
+def start_pep_again():
+    dc("up", "-d", "--wait", "--wait-timeout", "120", "--no-deps", "pep")
+
+
+def held_until_resumed(window):
+    """`start_episode` refused with needs_resume until the operator's `resume`, then it starts."""
+    refused = operator({"call": "start_episode", "intent": "pay"})
+    if pointer(refused, "/error") != "needs_resume":
+        eid = pointer(refused, "/result/eid")
+        if eid:   # end it, so later attacks find the intent free
+            operator({"call": "end_episode", "eid": eid})
+        return f"an episode started while it should be held: {pointer(refused, '/error') or 'it started'}"
+    resumed = operator({"call": "resume"})
+    if pointer(resumed, "/result") is None:
+        return f"resume failed: {check.redact(resumed)[:160]}"
+    window.agent("pay")   # starts now, and is ended with the window
+    return None
+
+
+@attack("C-OUT", "a run that ended on another kernel without a clean stop holds episodes until resume",
+        expected="any")
+def out_unclean_kernel(window):
+    run(["docker", "kill", pep_container()])   # no clean stop: no `stopped` record
+    journal = pep_file(JOURNAL_FILE)
+    boots = [json.loads(line)["boot_id"] for line in journal.split(b"\0", 1)[0].decode().splitlines()
+             if line.startswith('{"boot_id"')]
+    if not boots:
+        start_pep_again()
+        return "the journal records no boot"
+    # As if that run's kernel were another: same length, so the line stays canonical.
+    put_pep_file(JOURNAL_FILE, journal.replace(boots[-1].encode(), ANOTHER_KERNEL.encode()))
+    start_pep_again()
+    return held_until_resumed(window)
+
+
+@attack("C-OUT", "a failed fsync's marker holds episodes until resume, on the same kernel", expected="any")
+def out_unsynced_marker(window):
+    run(["docker", "kill", pep_container()])
+    put_pep_file(UNSYNCED, b"")
+    start_pep_again()
+    problem = held_until_resumed(window)
+    if problem:
+        return problem
+    if pep_file(UNSYNCED) is not None:
+        return "resume left the marker"
+    return None
 
 
 @attack("C-OUT", "Secret data, a new episode of the intent, then a Public sink", reason="ConfidentialityViolation")

@@ -42,7 +42,7 @@ REPORT = "reports/Gate1 sabotage report.md"
 TAG = ":sabotage"
 PROJECT = "pep-sabotage"
 GROUPS = ("C-ENG", "C-OUT")
-ALL_ATTACKS = 28
+ALL_ATTACKS = 30          # C-ENG 19 and C-OUT 11 (§3)
 RESULT = re.compile(r"^(ok  |FAIL) ((?:C-ENG|C-OUT) .+?) \[(.+?)\](?:: (.*))?$")
 STATE = "reports/gate1-logs/sabotage.state.json"
 BASELINE_LIMIT_S = 2400   # the whole of C-ENG and C-OUT, about 10 minutes
@@ -196,6 +196,9 @@ SWITCHES = {
     "rate_limit": [("src/registry.rs",
                     "        if !take(\n            &mut live.bucket,\n",
                     f"        if !{off('rate_limit')} && !take(\n            &mut live.bucket,\n")],
+    "hold": [("src/registry.rs",
+              "        if inner.unclean.is_some() {\n            return Err(ControlError::NeedsResume);\n",
+              f"        if inner.unclean.is_some() && !{off('hold')} {{\n            return Err(ControlError::NeedsResume);\n")],
     "control_routed": [("src/mcp.rs",
                         '            "subscriptions/listen" => Some(Self::Listen),\n            _ => None,\n',
                         f'            "subscriptions/listen" => Some(Self::Listen),\n'
@@ -240,6 +243,8 @@ TAINT = OUT + "an agent write before a restart is still tainted after it"
 RATCHET = OUT + "Secret data, a new episode of the intent, then a Public sink"
 BURST = OUT + "a burst over the bucket is refused and issues no Call Proof"
 CONTAINERS = OUT + "another intent's episode, in a fresh container, holds neither data nor helper"
+UNCLEAN_KERNEL = OUT + "a run that ended on another kernel without a clean stop holds episodes until resume"
+UNSYNCED_MARKER = OUT + "a failed fsync's marker holds episodes until resume, on the same kernel"
 
 # Label, the switches on together, and the attacks that should now fail.
 RUNS = [
@@ -267,6 +272,7 @@ RUNS = [
     ("Replay forgets taint", ["taint_replayed"], [TAINT]),
     ("No rate limit", ["rate_limit"], [BURST]),
     ("Agents share /tmp", ["shared_tmp"], [CONTAINERS]),
+    ("The unclean-stop hold ignored", ["hold"], [UNCLEAN_KERNEL, UNSYNCED_MARKER]),
 ]
 
 SABOTAGE_MODULE = """//! Sabotage only: this file exists in a temporary copy of the tree, never in the repository.

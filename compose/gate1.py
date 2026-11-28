@@ -6,7 +6,7 @@ Usage, from the root of the WSL-side clone:
 The suites run one after another, so nothing overlaps the latency runs, each as its own Compose
 project on the release images, from empty volumes, and each writes its log beside the report:
 
-- G1 and G3: compose/kit.py, the 61 attacks of §3 judged by the oracle, and the replay classes;
+- G1 and G3: compose/kit.py, the 63 attacks of §3 judged by the oracle, and the replay classes;
 - G2: compose/mutations.py, the 28 rug pulls, each found by the drift poller within T;
 - G4: compose/latency.py, PEP_LOAD_RUNS runs (--runs, 10 by default) of O1's open-loop load;
 - G5: `cargo deny check`, and in `cargo tree --target all`, exactly one crypto-bigint, at least
